@@ -26,6 +26,12 @@ ln -s /absolute/path/to/AIConfig/skill/design ~/.codex/skills/design
 
 Restart Codex after changing global instructions or installed skills. The design skill will then be selected automatically for matching interface work, or it can be requested explicitly with `$design`.
 
+Also configure some of my favourite addons:
+
+codex plugin marketplace add DietrichGebert/ponytail
+codex plugin add ponytail@ponytail
+
+
 ## Use with other coding agents
 
 Point the agent's global instruction file at `PROMPT.md`, or copy its contents when the agent does not support imported instruction files. Skill support and installation locations vary by agent, so treat each directory under `skill/` as a self-contained package and follow that agent's skill-loading convention.
