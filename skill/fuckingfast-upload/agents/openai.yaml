@@ -1,0 +1,4 @@
+interface:
+  display_name: "FuckingFast Upload"
+  short_description: "Upload and manage files on FuckingFast"
+  default_prompt: "Use $fuckingfast-upload to upload this file and return its verified download link."

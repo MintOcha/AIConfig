@@ -4,6 +4,8 @@
 - When sudo or other elevated privileges are required, never run privileged commands directly. Write every required privileged command into one executable shell script under `/tmp`, then tell the user to run that script with a single command.
 - The privileged script must validate its targets, stop on errors, and include all privileged steps needed to finish the operation so the user is not asked to run several sudo commands.
 - Do not use subagents for subtasks that are relevant to the main task.
+- After one unsuccessful attempt to fix an issue, search for relevant documentation or known issues before trying another speculative fix. Use DuckDuckGo first. If DuckDuckGo is unavailable or insufficient, fall back to Brave Search, then Tavily.
+
 
 # Rules on code
 1. Unnecessary code/most elegant solution rule: Make minimal, high-confidence changes. If you can identify a more elegant solution, DO NOT KEEP wrapper functions. If you ever identify inconsistencies or the same features or similar features defined in more than 1 file OR a file does more than what it's supposed to and secretly manages something, address it! Your KPI is least amt of code written to get a task done WITHOUT affecting functionality. Treat net code growth as a constraint when adding features. 
@@ -18,7 +20,3 @@
 
 
 IMMEDIATELY patch, fix and verify it has been fixed if ANY of these rules have been violated (this includes finding past violations. If the rule says do not manually implement and you see past manual implementations, attempt to resolve.). Raise this to the user - I have caught a rule violation at ... DO NOT delay the patch. MENTION EXPLICITLY which rule number (i.e. I have found a violation of rule 4... it has been patched and addressed already.)
-
-## Research fallback
-
-After one unsuccessful attempt to fix an issue, search for relevant documentation or known issues before trying another speculative fix. Use DuckDuckGo first. If DuckDuckGo is unavailable or insufficient, fall back to Brave Search, then Tavily.
