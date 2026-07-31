@@ -1,0 +1,4 @@
+interface:
+  display_name: "Design"
+  short_description: "Design distinctive, usable product interfaces"
+  default_prompt: "Use $design to design and implement a polished, accessible interface for this brief."
