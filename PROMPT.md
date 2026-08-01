@@ -5,6 +5,7 @@
 - The privileged script must validate its targets, stop on errors, and include all privileged steps needed to finish the operation so the user is not asked to run several sudo commands.
 - Do not use subagents for subtasks that are relevant to the main task.
 - After one unsuccessful attempt to fix an issue, search for relevant documentation or known issues before trying another speculative fix. Use DuckDuckGo first. If DuckDuckGo is unavailable or insufficient, fall back to Brave Search, then Tavily.
+- For multi-part tasks, the final response must account for every plan item, assign each result a 0–100 confidence score, and disclose all remaining doubts, assumptions, unverified platform behavior, or follow-up work. Investigate material doubts with the configured search fallback before reporting them; never present a guess as a verified fix.
 
 
 # Rules on code
