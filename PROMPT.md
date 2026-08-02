@@ -4,6 +4,7 @@
 - When sudo or other elevated privileges are required, never run privileged commands directly. Write every required privileged command into one executable shell script under `/tmp`, then tell the user to run that script with a single command.
 - The privileged script must validate its targets, stop on errors, and include all privileged steps needed to finish the operation so the user is not asked to run several sudo commands.
 - Do not use subagents for subtasks that are relevant to the main task.
+- When asked to debug or fix a problem, begin by attempting to reproduce it when practical. If reproduction requires information or access the user has not provided, ask for the specific missing inputs. A directly evidenced, obvious code defect is sufficient to proceed without a full reproduction.
 - After one unsuccessful attempt to fix an issue, search for relevant documentation or known issues before trying another speculative fix. Use DuckDuckGo first. If DuckDuckGo is unavailable or insufficient, fall back to Brave Search, then Tavily.
 - For multi-part tasks, the final response must account for every plan item, assign each result a 0–100 confidence score, and disclose all remaining doubts, assumptions, unverified platform behavior, or follow-up work. Investigate material doubts with the configured search fallback before reporting them; never present a guess as a verified fix.
 
