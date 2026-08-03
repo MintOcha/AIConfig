@@ -23,8 +23,16 @@ For visually led work, use `$design` to establish the audience, experience, hier
 - `scripts/kinetic_subtitles.py`: burn word-timed, active-word-highlighted captions from JSON. Read `references/subtitle-timings.md` for the schema.
 - `scripts/motion_graphics.py`: composite JSON-driven waves, deterministic dots/sparkles, animated rectangles, circles, and route lines. Read `references/motion-graphics.md` before adapting an effect.
 - `scripts/prepare_hdr_sdr.sh`: create a 10-bit Rec.709 ProRes mezzanine from HLG/BT.2020 footage with a Hable tone map.
-- `scripts/compress_video.sh`: make a resolution-preserving, quality-based sharing copy with `libx264`, `libsvtav1`, or the saved Intel `av1_qsv` profile.
+- `scripts/compress_video.sh`: make a resolution-preserving, quality-based sharing copy. Its default `auto` mode probes and prefers the saved Intel AV1 QSV profile (`global_quality 30`, `preset slow`, look-ahead depth 80, AAC 64 kbps), then falls back to slow quality-based H.264 only when that exact hardware profile cannot run. Explicit `libx264`, `libsvtav1`, and `av1_qsv` modes remain available.
 - `scripts/verify_video.sh`: print delivery metadata and fully decode video and audio to catch corruption.
+
+For ordinary compression, run the default command without choosing an encoder:
+
+```bash
+scripts/compress_video.sh INPUT OUTPUT
+```
+
+Only pass the optional encoder argument when the user has a special codec, compatibility, or delivery requirement. Do not tune the saved quality profile by default.
 
 Python tools require OpenCV, Pillow, and NumPy. If unavailable, create a project-local environment with `uv venv` and install `opencv-python-headless pillow numpy`; do not mutate the system Python environment.
 
