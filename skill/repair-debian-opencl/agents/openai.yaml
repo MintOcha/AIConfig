@@ -1,0 +1,4 @@
+interface:
+  display_name: "Repair Debian OpenCL"
+  short_description: "Repair APT and configure Intel OpenCL"
+  default_prompt: "Use $repair-debian-opencl to repair Debian package corruption and configure Intel OpenCL safely."
