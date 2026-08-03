@@ -39,12 +39,22 @@ Launch the setup menu:
 ./scripts/install-mcps.sh
 ```
 
+Use `./scripts/install-mcps.sh --dry-run` to exercise the menus without
+changing Codex configuration.
+
 The first menu installs MCPs, the shared prompt, skills, or all three. MCPs
 are discovered from [`mcp.toml`](mcp.toml), so adding another entry only
 requires editing that file. Skills are discovered from `skill/*/SKILL.md` and
 grouped through [`skills.toml`](skills.toml), which keeps large skill catalogs
-manageable. API keys are requested in hidden input and are never stored in
-this repository.
+manageable. If an MCP URL contains a `{PLACEHOLDER}`, the menu offers to
+paste its credential through hidden input or skip that MCP. Credentials are
+substituted only for the `codex mcp add` call and are never stored here.
+
+The shared `PROMPT.md` is always available. Add more Markdown files under
+[`prompts/`](prompts/) to make them selectable, then describe them in
+[`prompts.toml`](prompts.toml) to provide useful labels and descriptions. Use
+`--codex-home PATH` for a separate Codex installation, and `--dry-run` to
+preview every operation without changing the target.
 
 The installer uses the latest `duckduckgo-mcp-server` package available through
 `uvx`, enables its browser extra, and selects the curl backend for a
