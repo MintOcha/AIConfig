@@ -1,0 +1,4 @@
+interface:
+  display_name: "Compress Video"
+  short_description: "Quality-based AV1 video compression"
+  default_prompt: "Use $compress-video to create a smaller quality-based copy of this video without changing its resolution."
