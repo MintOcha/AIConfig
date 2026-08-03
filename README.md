@@ -31,6 +31,25 @@ Also configure some of my favourite addons:
 codex plugin marketplace add DietrichGebert/ponytail
 codex plugin add ponytail@ponytail
 
+## Setup agents
+
+Launch the setup menu:
+
+```bash
+./scripts/install-mcps.sh
+```
+
+The first menu installs MCPs, the shared prompt, skills, or all three. MCPs
+are discovered from [`mcp.toml`](mcp.toml), so adding another entry only
+requires editing that file. Skills are discovered from `skill/*/SKILL.md` and
+grouped through [`skills.toml`](skills.toml), which keeps large skill catalogs
+manageable. API keys are requested in hidden input and are never stored in
+this repository.
+
+The installer uses the latest `duckduckgo-mcp-server` package available through
+`uvx`, enables its browser extra, and selects the curl backend for a
+browser-like TLS fingerprint. DuckDuckGo search does not require an API key.
+
 
 ## Use with other coding agents
 
@@ -44,4 +63,3 @@ Review the prompt before enabling it: these rules are intentionally opinionated 
 - Keep machine-specific paths out of tracked files except in clearly marked examples.
 - Edit prompts and skills here rather than editing installed symlinks.
 - Keep additions focused; this repository is for broadly useful agent behavior, not project-specific implementation notes.
-

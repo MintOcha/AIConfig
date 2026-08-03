@@ -1,0 +1,20 @@
+# Portable MCP catalog for the setup menu.
+#
+# Keep credentials out of this file. For remote MCPs, put the environment
+# variable name in api_key_env and use its {ENV_VAR} placeholder in url.
+
+[mcp.duckduckgo]
+label = "DuckDuckGo search"
+category = "search"
+description = "Free web search and page fetching; no API key required"
+transport = "stdio"
+command = "uvx"
+args = ["--refresh", "--from", "duckduckgo-mcp-server[browser]", "duckduckgo-mcp-server", "--search-backend", "curl"]
+
+[mcp.tavily]
+label = "Tavily search"
+category = "search"
+description = "Web search and research through Tavily"
+transport = "url"
+url = "https://mcp.tavily.com/mcp/?tavilyApiKey={TAVILY_API_KEY}"
+api_key_env = "TAVILY_API_KEY"
