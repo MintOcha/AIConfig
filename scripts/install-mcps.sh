@@ -249,7 +249,6 @@ install_mcps() {
 }
 
 prompt_entries() {
-  printf 'shared\tShared prompt\t%s\n' "$repo_root/PROMPT.md"
   for prompt_path in "$prompts_dir"/*.md; do
     [[ -f "$prompt_path" ]] || continue
     [[ "$(basename "$prompt_path")" == "README.md" ]] && continue
@@ -278,7 +277,7 @@ select_prompt_source() {
   local -a entries
   mapfile -t entries < <(prompt_entries)
   printf '\n%s%s%s\n' "$bold" 'Choose a prompt' "$reset"
-  printf '%s\n' 'PROMPT.md is the shared default. Add .md files under prompts/ for more choices.'
+  printf '%s\n' 'Prompts are discovered from prompts/ and described by prompts.toml.'
 
   local index=1 entry prompt_id label prompt_path description
   for entry in "${entries[@]}"; do

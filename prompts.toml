@@ -1,5 +1,5 @@
 # Prompt metadata for the setup menu. Prompt files are discovered from
-# PROMPT.md and prompts/*.md; this file only controls their labels/descriptions.
+# prompts/*.md; this file only controls their labels/descriptions.
 
 [prompts.shared]
 label = "Shared prompt"
