@@ -1,6 +1,6 @@
 # Prompt metadata for the setup menu. Prompt files are discovered from
 # prompts/*.md; this file only controls their labels/descriptions.
 
-[prompts.shared]
-label = "Shared prompt"
-description = "Opinionated coding preferences and safety guardrails"
+[prompts.coding-rules]
+label = "Coding rules"
+description = "Lightweight Ponytail-style coding rules and workflow checks"
