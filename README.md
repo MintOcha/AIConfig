@@ -36,14 +36,15 @@ codex plugin add ponytail@ponytail
 Launch the setup menu:
 
 ```bash
-./scripts/install-mcps.sh
+./scripts/install.sh
 ```
 
-Use `./scripts/install-mcps.sh --dry-run` to exercise the menus without
+Use `./scripts/install.sh --dry-run` to exercise the menus without
 changing Codex configuration.
 
-The first menu installs MCPs, the shared prompt, skills, or all three. MCPs
-are discovered from [`mcp.toml`](mcp.toml), so adding another entry only
+The main menu installs MCPs, the shared prompt, or skills as independent
+choices. Installing a prompt or skill never reinstalls MCPs or touches their
+credentials. MCPs are discovered from [`mcp.toml`](mcp.toml), so adding another entry only
 requires editing that file. Skills are discovered from `skill/*/SKILL.md` and
 grouped through [`skills.toml`](skills.toml), which keeps large skill catalogs
 manageable. If an MCP URL contains a `{PLACEHOLDER}`, the menu offers to

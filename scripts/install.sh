@@ -47,7 +47,7 @@ failure() { printf '%sx%s %s\n' "$red" "$reset" "$1" >&2; }
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/install-mcps.sh
+Usage: ./scripts/install.sh
 
 Launch the interactive setup menu. MCP choices are discovered from mcp.toml,
 skill groups from skills.toml, and prompt metadata from prompts.toml. Secrets
@@ -478,12 +478,6 @@ install_skills() {
   done
 }
 
-install_all() {
-  install_prompt
-  install_skills
-  install_mcps
-}
-
 menu() {
   while true; do
     draw_header
@@ -491,18 +485,16 @@ menu() {
     printf '%s\n' '  1) Install MCPs        Select from the catalog'
     printf '%s\n' '  2) Install a prompt    Choose the global instruction set'
     printf '%s\n' '  3) Install skills      Choose a group or individual skills'
-    printf '%s\n' '  4) Install everything  Run all three setup flows'
-    printf '%s\n' '  5) Exit'
-    printf '%s' 'Select an option [1-5]: '
+    printf '%s\n' '  4) Exit'
+    printf '%s' 'Select an option [1-4]: '
     read -r choice || return 0
 
     case "$choice" in
       1) install_mcps || true ;;
       2) install_prompt || true ;;
       3) install_skills || true ;;
-      4) install_all || true ;;
-      5) return 0 ;;
-      *) warning 'Please choose 1, 2, 3, 4, or 5.' ;;
+      4) return 0 ;;
+      *) warning 'Please choose 1, 2, 3, or 4.' ;;
     esac
   done
 }
