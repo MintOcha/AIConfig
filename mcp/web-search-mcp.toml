@@ -10,6 +10,8 @@ duckduckgo_cooldown_seconds = 60.0
 request_timeout_seconds = 30
 
 [providers.brave]
+command = "npx"
+args = ["-y", "@brave/brave-search-mcp-server@2.1.0"]
 api_keys = []
 
 [providers.tavily]

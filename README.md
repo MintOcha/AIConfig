@@ -61,8 +61,8 @@ The search entry installs one local FastMCP server, `web-search`, run by `uv`
 from this repository. Its machine-local configuration is created at
 `~/.codex/web-search-mcp.toml` (or under the `--codex-home` directory). Add
 Brave and Tavily keys to the two `api_keys` lists there; each list supports
-multiple keys and is round-robin. No keys are placed in `mcp.toml` or in the
-Codex command.
+multiple keys and is round-robin. Brave searches are delegated to Brave's
+official MCP server. No keys are placed in `mcp.toml` or in the Codex command.
 
 The server exposes three intent-level tools: `web_search`, `fetch_content`, and
 `tavily_research`. They do not expose provider selection, provider-specific

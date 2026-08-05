@@ -23,7 +23,6 @@ import tomllib
 from fastmcp import Client, FastMCP
 from fastmcp.client.transports import StdioTransport
 
-BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 SEARCH_PROVIDERS = ("duckduckgo", "brave", "tavily")
 
 
@@ -41,12 +40,6 @@ class BraveCooldown(RuntimeError):
         super().__init__("Brave is cooling down")
 
 
-class BraveRateLimited(ProviderRequestError):
-    def __init__(self, delay_seconds: float) -> None:
-        self.delay_seconds = delay_seconds
-        super().__init__("Brave rate limited the request")
-
-
 class DuckDuckGoUnavailable(ProviderRequestError):
     pass
 
@@ -55,18 +48,14 @@ class DuckDuckGoUnavailable(ProviderRequestError):
 class RouterConfig:
     duckduckgo_command: str
     duckduckgo_args: tuple[str, ...]
+    brave_command: str
+    brave_args: tuple[str, ...]
     brave_keys: tuple[str, ...]
     tavily_keys: tuple[str, ...]
     tavily_endpoint: str
     brave_cooldown_seconds: float
     duckduckgo_cooldown_seconds: float
     request_timeout_seconds: float
-
-
-@dataclass(frozen=True)
-class KeyLease:
-    index: int
-    value: str
 
 
 class BearerAuth(httpx.Auth):
@@ -113,7 +102,7 @@ class BraveKeys:
     def configured(self) -> bool:
         return bool(self._keys)
 
-    async def acquire(self, wait: bool) -> KeyLease:
+    async def acquire(self, wait: bool) -> str:
         if not self._keys:
             raise ConfigurationError("No Brave API keys are configured")
 
@@ -125,19 +114,12 @@ class BraveKeys:
                     if self._available_at[index] <= now:
                         self._available_at[index] = now + self._cooldown_seconds
                         self._next_index = (index + 1) % len(self._keys)
-                        return KeyLease(index=index, value=self._keys[index])
+                        return self._keys[index]
                 delay_seconds = max(0.0, min(self._available_at) - now)
 
             if not wait:
                 raise BraveCooldown(delay_seconds)
             await asyncio.sleep(delay_seconds)
-
-    async def defer(self, lease: KeyLease, delay_seconds: float) -> None:
-        async with self._lock:
-            self._available_at[lease.index] = max(
-                self._available_at[lease.index], time.monotonic() + delay_seconds
-            )
-
 
 class CooldownGate:
     def __init__(self, cooldown_seconds: float) -> None:
@@ -172,13 +154,20 @@ def _number(data: dict[str, Any], key: str, default: float) -> float:
     return float(value)
 
 
-def _command(provider: dict[str, Any]) -> tuple[str, tuple[str, ...]]:
-    command = provider.get("command", "uvx")
-    args = provider.get("args", ["duckduckgo-mcp-server==0.6.1"])
+def _command(
+    provider: dict[str, Any],
+    provider_name: str,
+    default_command: str,
+    default_args: list[str],
+) -> tuple[str, tuple[str, ...]]:
+    command = provider.get("command", default_command)
+    args = provider.get("args", default_args)
     if not isinstance(command, str) or not command.strip():
-        raise ConfigurationError("providers.duckduckgo.command must be a string")
+        raise ConfigurationError(f"providers.{provider_name}.command must be a string")
     if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
-        raise ConfigurationError("providers.duckduckgo.args must be a list of strings")
+        raise ConfigurationError(
+            f"providers.{provider_name}.args must be a list of strings"
+        )
     return command.strip(), tuple(args)
 
 
@@ -204,7 +193,18 @@ def load_config(path: Path) -> RouterConfig:
     if not all(isinstance(provider, dict) for provider in (duckduckgo, brave, tavily)):
         raise ConfigurationError("each configured provider must be a table")
 
-    duckduckgo_command, duckduckgo_args = _command(duckduckgo)
+    duckduckgo_command, duckduckgo_args = _command(
+        duckduckgo,
+        "duckduckgo",
+        "uvx",
+        ["duckduckgo-mcp-server==0.6.1"],
+    )
+    brave_command, brave_args = _command(
+        brave,
+        "brave",
+        "npx",
+        ["-y", "@brave/brave-search-mcp-server@2.1.0"],
+    )
 
     endpoint = tavily.get("endpoint", "https://mcp.tavily.com/mcp/")
     if not isinstance(endpoint, str) or not endpoint.startswith(
@@ -215,6 +215,8 @@ def load_config(path: Path) -> RouterConfig:
     return RouterConfig(
         duckduckgo_command=duckduckgo_command,
         duckduckgo_args=duckduckgo_args,
+        brave_command=brave_command,
+        brave_args=brave_args,
         brave_keys=_api_keys(brave, "brave"),
         tavily_keys=_api_keys(tavily, "tavily"),
         tavily_endpoint=endpoint,
@@ -224,17 +226,6 @@ def load_config(path: Path) -> RouterConfig:
         ),
         request_timeout_seconds=_number(search, "request_timeout_seconds", 30.0),
     )
-
-
-def _retry_after(response: httpx.Response) -> float:
-    for header in ("Retry-After", "X-RateLimit-Reset"):
-        try:
-            delay = float(response.headers[header])
-        except (KeyError, ValueError):
-            continue
-        if delay > 0:
-            return delay
-    return 1.0
 
 
 def _tool_result_data(result: Any) -> Any:
@@ -247,13 +238,20 @@ def _tool_result_data(result: Any) -> Any:
             return value
 
     content = getattr(result, "content", None)
-    if isinstance(content, list) and len(content) == 1:
-        text = getattr(content[0], "text", None)
-        if isinstance(text, str):
+    if isinstance(content, list):
+        payloads = []
+        for item in content:
+            text = getattr(item, "text", None)
+            if not isinstance(text, str):
+                continue
             try:
-                return json.loads(text)
+                payloads.append(json.loads(text))
             except json.JSONDecodeError:
-                return text
+                payloads.append(text)
+        if len(payloads) == 1:
+            return payloads[0]
+        if payloads:
+            return payloads
     return result
 
 
@@ -374,8 +372,8 @@ class SearchRouter:
         self,
         config: RouterConfig,
         *,
-        http_client_factory: Callable[..., httpx.AsyncClient] = httpx.AsyncClient,
         tavily_client_factory: Callable[..., Client] = Client,
+        brave_client_factory: Callable[..., Client] = Client,
         duckduckgo_client_factory: Callable[..., Client] = Client,
     ) -> None:
         self.config = config
@@ -384,8 +382,8 @@ class SearchRouter:
         self._duckduckgo_gate = CooldownGate(config.duckduckgo_cooldown_seconds)
         self._next_provider_index = 0
         self._provider_lock = asyncio.Lock()
-        self._http_client_factory = http_client_factory
         self._tavily_client_factory = tavily_client_factory
+        self._brave_client_factory = brave_client_factory
         self._duckduckgo_client_factory = duckduckgo_client_factory
 
     def _duckduckgo_client(self) -> Client:
@@ -403,39 +401,36 @@ class SearchRouter:
         max_results: int,
         wait_for_cooldown: bool,
     ) -> list[dict[str, str]]:
-        lease = await self._brave_keys.acquire(wait=wait_for_cooldown)
+        api_key = await self._brave_keys.acquire(wait=wait_for_cooldown)
+        transport = StdioTransport(
+            command=self.config.brave_command,
+            args=list(self.config.brave_args),
+            env={
+                "BRAVE_API_KEY": api_key,
+                "BRAVE_MCP_ENABLED_TOOLS": "brave_web_search",
+            },
+            keep_alive=False,
+        )
         try:
-            async with self._http_client_factory(
-                timeout=self.config.request_timeout_seconds
+            async with self._brave_client_factory(
+                transport, timeout=self.config.request_timeout_seconds
             ) as client:
-                response = await client.get(
-                    BRAVE_SEARCH_URL,
-                    params={"q": query, "count": max_results},
-                    headers={
-                        "Accept": "application/json",
-                        "X-Subscription-Token": lease.value,
-                    },
+                payload = _tool_result_data(
+                    await client.call_tool(
+                        "brave_web_search",
+                        {"query": query, "count": max_results},
+                    )
                 )
-        except httpx.HTTPError as error:
-            raise ProviderRequestError("Brave search request failed") from error
-
-        if response.status_code == 429:
-            delay_seconds = _retry_after(response)
-            await self._brave_keys.defer(lease, delay_seconds)
-            raise BraveRateLimited(delay_seconds)
-
-        try:
-            response.raise_for_status()
             results = _normalize_search_results(
-                response.json(), url_field="url", snippet_field="description"
+                payload, url_field="url", snippet_field="description"
             )
             if not results:
                 raise ProviderRequestError("Brave returned no usable results")
             return results
-        except (httpx.HTTPError, ValueError) as error:
-            raise ProviderRequestError(
-                f"Brave search failed with HTTP {response.status_code}"
-            ) from error
+        except Exception as error:
+            if isinstance(error, ProviderRequestError):
+                raise
+            raise ProviderRequestError("Brave MCP search failed") from error
 
     async def _search_duckduckgo(
         self, query: str, max_results: int
@@ -544,7 +539,6 @@ class SearchRouter:
                 return await self._search_tavily(query, max_results)
             except (
                 BraveCooldown,
-                BraveRateLimited,
                 ConfigurationError,
                 DuckDuckGoUnavailable,
                 ProviderRequestError,

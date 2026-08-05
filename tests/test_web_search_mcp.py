@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "mcp"))
@@ -22,6 +23,8 @@ def router_config(
     return RouterConfig(
         duckduckgo_command="uvx",
         duckduckgo_args=("duckduckgo-mcp-server==0.6.1",),
+        brave_command="npx",
+        brave_args=("-y", "@brave/brave-search-mcp-server@2.1.0"),
         brave_keys=brave_keys,
         tavily_keys=tavily_keys,
         tavily_endpoint="https://mcp.tavily.com/mcp/",
@@ -61,29 +64,10 @@ class FakeTavilyFactory:
         return FakeTavilyClient(self.calls, self.outcomes, auth.api_key)
 
 
-class FakeBraveResponse:
-    status_code = 200
-
-    def raise_for_status(self) -> None:
-        return None
-
-    def json(self):
-        return {
-            "web": {
-                "results": [
-                    {
-                        "title": "FastMCP",
-                        "url": "https://gofastmcp.com",
-                        "description": "Documentation",
-                    }
-                ]
-            }
-        }
-
-
 class FakeBraveClient:
-    def __init__(self, request) -> None:
+    def __init__(self, request, transport) -> None:
         self.request = request
+        self.transport = transport
 
     async def __aenter__(self):
         return self
@@ -91,9 +75,42 @@ class FakeBraveClient:
     async def __aexit__(self, *_args):
         return None
 
-    async def get(self, url, *, params, headers):
-        self.request.update(url=url, params=params, headers=headers)
-        return FakeBraveResponse()
+    async def call_tool(self, name, arguments):
+        self.request.update(
+            name=name,
+            arguments=arguments,
+            command=self.transport.command,
+            args=self.transport.args,
+            env=self.transport.env,
+        )
+        return SimpleNamespace(
+            is_error=False,
+            structured_content=None,
+            data=None,
+            content=[
+                SimpleNamespace(
+                    text=(
+                        '{"title":"FastMCP","url":"https://gofastmcp.com",'
+                        '"description":"Documentation"}'
+                    )
+                ),
+                SimpleNamespace(
+                    text=(
+                        '{"title":"MCP","url":"https://modelcontextprotocol.io",'
+                        '"description":"Protocol"}'
+                    )
+                ),
+            ],
+        )
+
+
+class FakeBraveFactory:
+    def __init__(self, request) -> None:
+        self.request = request
+
+    def __call__(self, transport, *, timeout):
+        self.request["timeout"] = timeout
+        return FakeBraveClient(self.request, transport)
 
 
 class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
@@ -134,7 +151,7 @@ class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
         request = {}
         router = SearchRouter(
             router_config(brave_keys=("brave",)),
-            http_client_factory=lambda **_kwargs: FakeBraveClient(request),
+            brave_client_factory=FakeBraveFactory(request),
         )
         router._search_duckduckgo = AsyncMock(
             side_effect=DuckDuckGoUnavailable("empty")
@@ -142,7 +159,13 @@ class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         result = await router.search("fastmcp", 5)
 
-        self.assertEqual(request["params"], {"q": "fastmcp", "count": 5})
+        self.assertEqual(request["name"], "brave_web_search")
+        self.assertEqual(request["arguments"], {"query": "fastmcp", "count": 5})
+        self.assertEqual(request["command"], "npx")
+        self.assertEqual(
+            request["args"], ["-y", "@brave/brave-search-mcp-server@2.1.0"]
+        )
+        self.assertEqual(request["env"]["BRAVE_API_KEY"], "brave")
         self.assertEqual(
             result,
             [
@@ -150,7 +173,12 @@ class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
                     "title": "FastMCP",
                     "url": "https://gofastmcp.com",
                     "snippet": "Documentation",
-                }
+                },
+                {
+                    "title": "MCP",
+                    "url": "https://modelcontextprotocol.io",
+                    "snippet": "Protocol",
+                },
             ],
         )
 
