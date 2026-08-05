@@ -1,0 +1,4 @@
+interface:
+  display_name: "GP Paper 2 MIC Coach"
+  short_description: "Diagnose H1 GP Paper 2 answers with MIC"
+  default_prompt: "Use $gp-paper2-mic to mark, diagnose, and improve my H1 GP Paper 2 answer using Meaning, Intensity and Context."
