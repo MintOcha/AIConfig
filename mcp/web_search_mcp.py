@@ -2,7 +2,6 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "ddgs==9.14.4",
 #   "fastmcp==3.4.5",
 #   "httpx==0.28.1",
 # ]
@@ -11,8 +10,8 @@
 import argparse
 import asyncio
 import json
+import re
 import time
-import tomllib
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,8 +19,9 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
-from ddgs import DDGS
+import tomllib
 from fastmcp import Client, FastMCP
+from fastmcp.client.transports import StdioTransport
 
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 SEARCH_PROVIDERS = ("duckduckgo", "brave", "tavily")
@@ -53,6 +53,8 @@ class DuckDuckGoUnavailable(ProviderRequestError):
 
 @dataclass(frozen=True)
 class RouterConfig:
+    duckduckgo_command: str
+    duckduckgo_args: tuple[str, ...]
     brave_keys: tuple[str, ...]
     tavily_keys: tuple[str, ...]
     tavily_endpoint: str
@@ -170,6 +172,16 @@ def _number(data: dict[str, Any], key: str, default: float) -> float:
     return float(value)
 
 
+def _command(provider: dict[str, Any]) -> tuple[str, tuple[str, ...]]:
+    command = provider.get("command", "uvx")
+    args = provider.get("args", ["duckduckgo-mcp-server==0.6.1"])
+    if not isinstance(command, str) or not command.strip():
+        raise ConfigurationError("providers.duckduckgo.command must be a string")
+    if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+        raise ConfigurationError("providers.duckduckgo.args must be a list of strings")
+    return command.strip(), tuple(args)
+
+
 def load_config(path: Path) -> RouterConfig:
     try:
         with path.open("rb") as stream:
@@ -186,10 +198,13 @@ def load_config(path: Path) -> RouterConfig:
             "Configuration requires [search] and [providers] tables"
         )
 
+    duckduckgo = providers.get("duckduckgo", {})
     brave = providers.get("brave", {})
     tavily = providers.get("tavily", {})
-    if not isinstance(brave, dict) or not isinstance(tavily, dict):
-        raise ConfigurationError("providers.brave and providers.tavily must be tables")
+    if not all(isinstance(provider, dict) for provider in (duckduckgo, brave, tavily)):
+        raise ConfigurationError("each configured provider must be a table")
+
+    duckduckgo_command, duckduckgo_args = _command(duckduckgo)
 
     endpoint = tavily.get("endpoint", "https://mcp.tavily.com/mcp/")
     if not isinstance(endpoint, str) or not endpoint.startswith(
@@ -198,6 +213,8 @@ def load_config(path: Path) -> RouterConfig:
         raise ConfigurationError("providers.tavily.endpoint must be an HTTP(S) URL")
 
     return RouterConfig(
+        duckduckgo_command=duckduckgo_command,
+        duckduckgo_args=duckduckgo_args,
         brave_keys=_api_keys(brave, "brave"),
         tavily_keys=_api_keys(tavily, "tavily"),
         tavily_endpoint=endpoint,
@@ -220,18 +237,11 @@ def _retry_after(response: httpx.Response) -> float:
     return 1.0
 
 
-def _duckduckgo_search(
-    query: str, max_results: int, timeout: float
-) -> list[dict[str, Any]]:
-    with DDGS(timeout=timeout) as client:
-        return client.text(query, max_results=max_results, backend="duckduckgo")
-
-
 def _tool_result_data(result: Any) -> Any:
     if getattr(result, "is_error", False):
-        raise ProviderRequestError("Tavily returned a tool error")
+        raise ProviderRequestError("Provider returned a tool error")
 
-    for attribute in ("data", "structured_content"):
+    for attribute in ("structured_content", "data"):
         value = getattr(result, attribute, None)
         if value is not None:
             return value
@@ -245,6 +255,46 @@ def _tool_result_data(result: Any) -> Any:
             except json.JSONDecodeError:
                 return text
     return result
+
+
+def _result_text(payload: Any) -> str | None:
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, dict):
+        result = payload.get("result")
+        if isinstance(result, str):
+            return result
+    result = getattr(payload, "result", None)
+    if isinstance(result, str):
+        return result
+    return None
+
+
+_DUCKDUCKGO_RESULT = re.compile(
+    r"(?:^|\n\n)\d+\. (?P<title>.*?)\n\s+URL: (?P<url>.*?)"
+    r"\n\s+Summary: (?P<snippet>.*?)(?=\n\n\d+\. |\Z)",
+    re.DOTALL,
+)
+
+
+def _normalize_duckduckgo_results(payload: Any) -> list[dict[str, str]]:
+    normalized = _normalize_search_results(
+        payload, url_field="url", snippet_field="description"
+    )
+    if normalized:
+        return normalized
+
+    text = _result_text(payload)
+    if text is None:
+        return []
+    return [
+        {
+            "title": match.group("title").strip(),
+            "url": match.group("url").strip(),
+            "snippet": match.group("snippet").strip(),
+        }
+        for match in _DUCKDUCKGO_RESULT.finditer(text)
+    ]
 
 
 def _result_list(payload: Any) -> list[Any]:
@@ -326,9 +376,7 @@ class SearchRouter:
         *,
         http_client_factory: Callable[..., httpx.AsyncClient] = httpx.AsyncClient,
         tavily_client_factory: Callable[..., Client] = Client,
-        duckduckgo_search: Callable[[str, int, float], list[dict[str, Any]]] = (
-            _duckduckgo_search
-        ),
+        duckduckgo_client_factory: Callable[..., Client] = Client,
     ) -> None:
         self.config = config
         self._brave_keys = BraveKeys(config.brave_keys, config.brave_cooldown_seconds)
@@ -338,7 +386,16 @@ class SearchRouter:
         self._provider_lock = asyncio.Lock()
         self._http_client_factory = http_client_factory
         self._tavily_client_factory = tavily_client_factory
-        self._duckduckgo_search = duckduckgo_search
+        self._duckduckgo_client_factory = duckduckgo_client_factory
+
+    def _duckduckgo_client(self) -> Client:
+        transport = StdioTransport(
+            command=self.config.duckduckgo_command,
+            args=list(self.config.duckduckgo_args),
+        )
+        return self._duckduckgo_client_factory(
+            transport, timeout=self.config.request_timeout_seconds
+        )
 
     async def _search_brave(
         self,
@@ -385,31 +442,46 @@ class SearchRouter:
     ) -> list[dict[str, str]]:
         await self._duckduckgo_gate.enter()
         try:
-            results = await asyncio.to_thread(
-                self._duckduckgo_search,
-                query,
-                max_results,
-                self.config.request_timeout_seconds,
-            )
+            async with self._duckduckgo_client() as client:
+                payload = _tool_result_data(
+                    await client.call_tool(
+                        "search", {"query": query, "max_results": max_results}
+                    )
+                )
+            results = _normalize_duckduckgo_results(payload)
             if not results:
                 raise DuckDuckGoUnavailable("DuckDuckGo returned no results")
-            if not isinstance(results, list) or not all(
-                isinstance(result, dict) for result in results
-            ):
-                raise DuckDuckGoUnavailable(
-                    "DuckDuckGo returned a bot-detection response"
-                )
-            normalized = _normalize_search_results(
-                results, url_field="href", snippet_field="body"
-            )
-            if not normalized:
-                raise DuckDuckGoUnavailable("DuckDuckGo returned no usable results")
-            return normalized
+            return results
         except Exception as error:
             await self._duckduckgo_gate.defer()
             if isinstance(error, DuckDuckGoUnavailable):
                 raise
             raise DuckDuckGoUnavailable("DuckDuckGo search request failed") from error
+
+    async def _fetch_duckduckgo(
+        self, urls: list[str]
+    ) -> tuple[list[dict[str, str]], list[str]]:
+        fetched: list[dict[str, str]] = []
+        missing: list[str] = []
+        async with self._duckduckgo_client() as client:
+            outcomes = await asyncio.gather(
+                *(client.call_tool("fetch_content", {"url": url}) for url in urls),
+                return_exceptions=True,
+            )
+
+        for url, outcome in zip(urls, outcomes, strict=True):
+            if isinstance(outcome, BaseException):
+                missing.append(url)
+                continue
+            try:
+                content = _result_text(_tool_result_data(outcome))
+            except ProviderRequestError:
+                content = None
+            if content:
+                fetched.append({"url": url, "content": content})
+            else:
+                missing.append(url)
+        return fetched, missing
 
     async def _call_tavily(self, tool_name: str, arguments: dict[str, Any]) -> Any:
         if not self._tavily_keys.configured:
@@ -482,16 +554,24 @@ class SearchRouter:
         raise ProviderRequestError("All web search providers failed") from last_error
 
     async def fetch_content(self, urls: list[str]) -> list[dict[str, str]]:
+        try:
+            fetched, missing = await self._fetch_duckduckgo(urls)
+        except Exception:  # noqa: BLE001
+            fetched, missing = [], urls
+
+        if not missing:
+            return fetched
+
         payload = await self._call_tavily(
             "tavily_extract",
             {
-                "urls": urls,
+                "urls": missing,
                 "extract_depth": "basic",
                 "format": "markdown",
                 "include_images": False,
             },
         )
-        return _normalize_extracted_content(payload)
+        return fetched + _normalize_extracted_content(payload)
 
     async def research(self, task: str) -> str:
         payload = await self._call_tavily(

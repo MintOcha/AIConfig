@@ -20,6 +20,8 @@ def router_config(
     *, brave_keys: tuple[str, ...] = (), tavily_keys: tuple[str, ...] = ()
 ) -> RouterConfig:
     return RouterConfig(
+        duckduckgo_command="uvx",
+        duckduckgo_args=("duckduckgo-mcp-server==0.6.1",),
         brave_keys=brave_keys,
         tavily_keys=tavily_keys,
         tavily_endpoint="https://mcp.tavily.com/mcp/",
@@ -110,9 +112,9 @@ class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
             await keys.acquire(wait=False)
 
     async def test_empty_duckduckgo_response_falls_back_to_tavily(self) -> None:
-        router = SearchRouter(
-            router_config(tavily_keys=("tavily",)),
-            duckduckgo_search=lambda *_args: [],
+        router = SearchRouter(router_config(tavily_keys=("tavily",)))
+        router._search_duckduckgo = AsyncMock(
+            side_effect=DuckDuckGoUnavailable("empty")
         )
         router._search_tavily = AsyncMock(
             return_value=[
@@ -133,7 +135,9 @@ class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
         router = SearchRouter(
             router_config(brave_keys=("brave",)),
             http_client_factory=lambda **_kwargs: FakeBraveClient(request),
-            duckduckgo_search=lambda *_args: [],
+        )
+        router._search_duckduckgo = AsyncMock(
+            side_effect=DuckDuckGoUnavailable("empty")
         )
 
         result = await router.search("fastmcp", 5)
@@ -232,6 +236,7 @@ class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
             router_config(tavily_keys=("tavily",)),
             tavily_client_factory=factory,
         )
+        router._fetch_duckduckgo = AsyncMock(return_value=([], ["https://example.com"]))
 
         content = await router.fetch_content(["https://example.com"])
         report = await router.research("Compare the options")
