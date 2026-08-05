@@ -7,7 +7,7 @@
 [mcp.web-search]
 label = "Web search router"
 category = "search"
-description = "Brave search with cooldown-aware Tavily MCP fallback and API-key rotation"
+description = "Provider-hidden web search, content fetching, and Tavily research with automatic fallback"
 transport = "stdio"
 command = "uv"
 args = ["run", "--script", "{REPO_ROOT}/mcp/web_search_mcp.py", "--config", "{CODEX_HOME}/web-search-mcp.toml"]

@@ -64,12 +64,17 @@ Brave and Tavily keys to the two `api_keys` lists there; each list supports
 multiple keys and is round-robin. No keys are placed in `mcp.toml` or in the
 Codex command.
 
-`web-search` sends auto searches to Brave while a Brave key is ready. It
-reserves each Brave key for the configured one-second free-tier cooldown. When
-every key is cooling down, `brave_cooldown_strategy = "tavily"` proxies the
-search through Tavily's existing remote MCP using the next Tavily key; set it
-to `"wait"` to wait for Brave instead. The server exposes one `web_search`
-tool, with optional `provider = "brave"` or `"tavily"` overrides.
+The server exposes three intent-level tools: `web_search`, `fetch_content`, and
+`tavily_research`. They do not expose provider selection, provider-specific
+search options, or routing metadata. `web_search` translates its generic query
+and result limit for each backend and round-robins through DuckDuckGo, Brave,
+and Tavily in that order. If the selected provider fails, the same request
+advances through the remaining providers and returns an error only if all three
+fail. DuckDuckGo bot detection, HTTP 429s, empty responses, and other request
+failures start a local cooldown so later requests skip the blocked route.
+`fetch_content` maps URLs to Tavily extraction, while
+`tavily_research` remains a separate tool for long-form research. Tavily calls
+retry across the configured API keys before returning an error.
 
 
 ## Use with other coding agents

@@ -1,13 +1,12 @@
 # API keys are deliberately kept in this machine-local file, not in mcp.toml
-# or the Codex command. Add as many keys as you have; both providers rotate
-# through their configured keys in order.
+# or the Codex command. Add as many keys as you have; both keyed providers
+# rotate through their configured keys in order.
 
 [search]
-# "tavily" sends an auto search to Tavily's existing remote MCP whenever every
-# Brave key is still within its cooldown. "wait" holds the request until a
-# Brave key is available instead.
-brave_cooldown_strategy = "tavily"
 brave_cooldown_seconds = 1.0
+# Avoid repeatedly hitting DuckDuckGo after bot detection, a 429, or an empty
+# result response. Requests skip DuckDuckGo during this cooldown.
+duckduckgo_cooldown_seconds = 60.0
 request_timeout_seconds = 30
 
 [providers.brave]
