@@ -120,6 +120,43 @@ else:
 PY
 }
 
+render_mcp_template() {
+  local value="$1"
+  value="${value//\{REPO_ROOT\}/$repo_root}"
+  value="${value//\{CODEX_HOME\}/$codex_home}"
+  printf '%s\n' "$value"
+}
+
+prepare_mcp_config() {
+  local server_id="$1"
+  local template_path config_path source_path
+  template_path="$(mcp_value "$server_id" config_template)"
+  config_path="$(mcp_value "$server_id" config_path)"
+
+  [[ -z "$template_path" && -z "$config_path" ]] && return 0
+  [[ -n "$template_path" && -n "$config_path" ]] || {
+    printf 'error: %s must define both config_template and config_path\n' "$server_id" >&2
+    return 1
+  }
+
+  source_path="${repo_root}/${template_path}"
+  config_path="$(render_mcp_template "$config_path")"
+  [[ -f "$source_path" ]] || {
+    printf 'error: MCP configuration template not found: %s\n' "$source_path" >&2
+    return 1
+  }
+
+  if [[ -e "$config_path" ]]; then
+    printf '%s\n' "Using existing MCP configuration: $config_path"
+  elif ((dry_run)); then
+    printf '%s\n' "Dry run: would create editable MCP configuration: $config_path"
+  else
+    mkdir -p "$(dirname -- "$config_path")"
+    install -m 600 "$source_path" "$config_path"
+    success "Created editable MCP configuration: $config_path"
+  fi
+}
+
 selected_mcp_ids=()
 
 select_mcp_ids() {
@@ -185,7 +222,7 @@ prompt_secret() {
 
 install_mcp() {
   local server_id="$1"
-  local transport command_name url_template url placeholder secret_label secret_choice
+  local transport command_name url_template url placeholder secret_label secret_choice argument_index
   local -a command_args
 
   transport="$(mcp_value "$server_id" transport)"
@@ -221,12 +258,16 @@ install_mcp() {
     codex_command mcp remove "$server_id" >/dev/null 2>&1 || true
     codex_command mcp add "$server_id" --url "$url"
   else
-    command_name="$(mcp_value "$server_id" command)"
+    prepare_mcp_config "$server_id" || return 1
+    command_name="$(render_mcp_template "$(mcp_value "$server_id" command)")"
     mapfile -t command_args < <(mcp_value "$server_id" args)
     ((${#command_args[@]} > 0)) || {
       printf 'error: %s has no command arguments in mcp.toml\n' "$server_id" >&2
       return 1
     }
+    for argument_index in "${!command_args[@]}"; do
+      command_args[$argument_index]="$(render_mcp_template "${command_args[argument_index]}")"
+    done
     if ((dry_run)); then
       printf '%s\n' "Dry run: would install MCP: $server_id"
       return 0

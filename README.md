@@ -57,9 +57,19 @@ substituted only for the `codex mcp add` call and are never stored here.
 `--codex-home PATH` for a separate Codex installation, and `--dry-run` to
 preview every operation without changing the target.
 
-The installer uses the latest `duckduckgo-mcp-server` package available through
-`uvx`, enables its browser extra, and selects the curl backend for a
-browser-like TLS fingerprint. DuckDuckGo search does not require an API key.
+The search entry installs one local FastMCP server, `web-search`, run by `uv`
+from this repository. Its machine-local configuration is created at
+`~/.codex/web-search-mcp.toml` (or under the `--codex-home` directory). Add
+Brave and Tavily keys to the two `api_keys` lists there; each list supports
+multiple keys and is round-robin. No keys are placed in `mcp.toml` or in the
+Codex command.
+
+`web-search` sends auto searches to Brave while a Brave key is ready. It
+reserves each Brave key for the configured one-second free-tier cooldown. When
+every key is cooling down, `brave_cooldown_strategy = "tavily"` proxies the
+search through Tavily's existing remote MCP using the next Tavily key; set it
+to `"wait"` to wait for Brave instead. The server exposes one `web_search`
+tool, with optional `provider = "brave"` or `"tavily"` overrides.
 
 
 ## Use with other coding agents

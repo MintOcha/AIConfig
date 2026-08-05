@@ -1,0 +1,18 @@
+# API keys are deliberately kept in this machine-local file, not in mcp.toml
+# or the Codex command. Add as many keys as you have; both providers rotate
+# through their configured keys in order.
+
+[search]
+# "tavily" sends an auto search to Tavily's existing remote MCP whenever every
+# Brave key is still within its cooldown. "wait" holds the request until a
+# Brave key is available instead.
+brave_cooldown_strategy = "tavily"
+brave_cooldown_seconds = 1.0
+request_timeout_seconds = 30
+
+[providers.brave]
+api_keys = []
+
+[providers.tavily]
+api_keys = []
+endpoint = "https://mcp.tavily.com/mcp/"
