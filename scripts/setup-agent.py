@@ -77,26 +77,14 @@ def supports_standalone_web_search(api_key, models):
         return False
 
 
-def choose_standalone_web_search(api_key, models, preference):
+def detect_standalone_web_search(api_key, models):
     print("  Checking for native Codex standalone web search...")
     if not supports_standalone_web_search(api_key, models):
         print("  Standalone web search is not available at this endpoint; skipped.")
         return False
 
-    print("  Standalone web search is supported by the endpoint.")
-    if preference is not None:
-        return preference
-    if not sys.stdin.isatty():
-        print("  Non-interactive setup did not opt in; skipped.")
-        return False
-    try:
-        answer = input(
-            "  Reuse v-rail's standalone search in Codex? [Y/n] "
-        ).strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return False
-    return answer in ("", "y", "yes")
+    print("  Standalone web search is supported by the endpoint; enabling it.")
+    return True
 
 
 def find_existing_api_key():
@@ -325,13 +313,9 @@ def setup_kilocode(api_key, models):
         print(f"  Skipped cache (not found): {cache_path}")
 
 
-def setup_codex(api_key, models, standalone_search_preference=None):
+def setup_codex(api_key, models):
     print("\n[Codex] Setting up config...")
-    enable_standalone_search = choose_standalone_web_search(
-        api_key,
-        models,
-        standalone_search_preference,
-    )
+    enable_standalone_search = detect_standalone_web_search(api_key, models)
     auth_path = os.path.join(HOME, ".codex", "auth.json")
     auth_data = read_json(auth_path)
     auth_data["auth_mode"] = "apikey"
@@ -432,20 +416,6 @@ def main():
         help="Setup KiloCode",
     )
     parser.add_argument("--codex", action="store_true", help="Setup Codex")
-    standalone_search = parser.add_mutually_exclusive_group()
-    standalone_search.add_argument(
-        "--standalone-web-search",
-        dest="standalone_web_search",
-        action="store_true",
-        help="Enable Codex standalone web search when the endpoint supports it",
-    )
-    standalone_search.add_argument(
-        "--no-standalone-web-search",
-        dest="standalone_web_search",
-        action="store_false",
-        help="Do not enable Codex standalone web search",
-    )
-    parser.set_defaults(standalone_web_search=None)
 
     args = parser.parse_args()
 
@@ -485,7 +455,7 @@ def main():
     if "kilocode" in selected:
         setup_kilocode(api_key, models)
     if "codex" in selected:
-        setup_codex(api_key, models, args.standalone_web_search)
+        setup_codex(api_key, models)
 
     print("\nDone.")
 
