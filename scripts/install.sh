@@ -120,28 +120,6 @@ else:
 PY
 }
 
-mcp_credentials() {
-  local server_id="$1"
-  python3 - "$mcp_file" "$server_id" <<'PY'
-import sys
-import tomllib
-
-with open(sys.argv[1], "rb") as stream:
-    catalog = tomllib.load(stream)
-
-server = catalog.get("mcp", {}).get(sys.argv[2])
-if server is None:
-    raise SystemExit(f"unknown MCP: {sys.argv[2]}")
-
-for credential in server.get("credentials", []):
-    print("\t".join((
-        credential.get("label", "API key"),
-        credential.get("config_table", ""),
-        credential.get("config_key", ""),
-    )))
-PY
-}
-
 render_mcp_template() {
   local value="$1"
   value="${value//\{REPO_ROOT\}/$repo_root}"
@@ -242,102 +220,6 @@ prompt_secret() {
   }
 }
 
-write_config_api_key() {
-  local config_path="$1"
-  local config_table="$2"
-  local config_key="$3"
-
-  python3 /dev/fd/3 "$config_path" "$config_table" "$config_key" 3<<'PY' <<<"$secret_value"
-import json
-import os
-from pathlib import Path
-import re
-import sys
-import tempfile
-import tomllib
-
-path = Path(sys.argv[1])
-table = sys.argv[2]
-key = sys.argv[3]
-secret = sys.stdin.read().rstrip("\n")
-
-if not table or not key:
-    raise SystemExit("credential entries require config_table and config_key")
-
-lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
-header = f"[{table}]"
-try:
-    section_start = next(
-        index for index, line in enumerate(lines) if line.strip() == header
-    )
-except StopIteration:
-    raise SystemExit(f"configuration table not found in {path}: {table}")
-
-section_end = next(
-    (
-        index
-        for index in range(section_start + 1, len(lines))
-        if lines[index].lstrip().startswith("[")
-    ),
-    len(lines),
-)
-key_pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
-replacement = f"{key} = [{json.dumps(secret, ensure_ascii=False)}]\n"
-for index in range(section_start + 1, section_end):
-    if key_pattern.match(lines[index]):
-        lines[index] = replacement
-        break
-else:
-    lines.insert(section_start + 1, replacement)
-
-updated = "".join(lines)
-tomllib.loads(updated)
-with tempfile.NamedTemporaryFile(
-    "w", encoding="utf-8", dir=path.parent, delete=False
-) as stream:
-    stream.write(updated)
-    temporary_path = stream.name
-os.chmod(temporary_path, 0o600)
-os.replace(temporary_path, path)
-PY
-}
-
-configure_mcp_credentials() {
-  local server_id="$1"
-  local config_path entry label config_table config_key
-  local -a credentials
-  mapfile -t credentials < <(mcp_credentials "$server_id")
-  ((${#credentials[@]} > 0)) || return 0
-
-  config_path="$(render_mcp_template "$(mcp_value "$server_id" config_path)")"
-  [[ -n "$config_path" ]] || {
-    printf 'error: %s credentials require config_path\n' "$server_id" >&2
-    return 1
-  }
-
-  if ((dry_run)); then
-    for entry in "${credentials[@]}"; do
-      IFS=$'\t' read -r label _ <<< "$entry"
-      printf '%s\n' "Dry run: would request $label"
-    done
-    return 0
-  fi
-
-  for entry in "${credentials[@]}"; do
-    IFS=$'\t' read -r label config_table config_key <<< "$entry"
-    printf 'Enter the %s (input hidden; leave blank to keep the current value): ' "$label"
-    IFS= read -r -s secret_value
-    printf '\n'
-    if [[ -z "$secret_value" ]]; then
-      printf '%s\n' "Kept current value for $label"
-      continue
-    fi
-    write_config_api_key "$config_path" "$config_table" "$config_key"
-    unset secret_value
-    success "Configured $label in $config_path"
-  done
-}
-
 install_mcp() {
   local server_id="$1"
   local transport command_name url_template url placeholder secret_label secret_choice argument_index
@@ -377,7 +259,6 @@ install_mcp() {
     codex_command mcp add "$server_id" --url "$url"
   else
     prepare_mcp_config "$server_id" || return 1
-    configure_mcp_credentials "$server_id" || return 1
     command_name="$(render_mcp_template "$(mcp_value "$server_id" command)")"
     mapfile -t command_args < <(mcp_value "$server_id" args)
     ((${#command_args[@]} > 0)) || {
@@ -402,10 +283,6 @@ install_mcp() {
 install_mcps() {
   require_command codex
   select_mcp_ids || return 1
-  install_selected_mcps
-}
-
-install_selected_mcps() {
   local server_id
   for server_id in "${selected_mcp_ids[@]}"; do
     install_mcp "$server_id"
@@ -466,10 +343,10 @@ select_prompt_source() {
   IFS=$'\t' read -r _ _ selected_prompt_path <<< "${entries[prompt_number]}"
 }
 
-link_prompt() {
-  local prompt_path="$1"
+install_prompt() {
+  select_prompt_source || return 0
   local target="${codex_home}/AGENTS.md"
-  local import_line="@${prompt_path}"
+  local import_line="@${selected_prompt_path}"
 
   if ((dry_run)); then
     printf '%s\n' "Preview: would link $import_line through $target"
@@ -483,21 +360,6 @@ link_prompt() {
     printf '\n%s\n' "$import_line" >> "$target"
   fi
   success "Prompt linked through $target"
-}
-
-install_prompt() {
-  select_prompt_source || return 0
-  link_prompt "$selected_prompt_path"
-}
-
-install_all_prompts() {
-  local entry prompt_path
-  local -a entries
-  mapfile -t entries < <(prompt_entries)
-  for entry in "${entries[@]}"; do
-    IFS=$'\t' read -r _ _ prompt_path <<< "$entry"
-    link_prompt "$prompt_path"
-  done
 }
 
 skill_entries() {
@@ -636,29 +498,18 @@ select_skill_set() {
 
 install_skills() {
   require_command codex
-  select_skill_set || return 1
-  install_selected_skills
-}
-
-install_selected_skills() {
   local skills_dir="${codex_home}/skills"
-  local skill target source
+  select_skill_set || return 1
 
   ((dry_run)) || mkdir -p "$skills_dir"
 
   for skill in "${selected_skills[@]}"; do
-    target="${skills_dir}/${skill}"
-    source="${repo_root}/skill/${skill}"
+    local target="${skills_dir}/${skill}"
+    local source="${repo_root}/skill/${skill}"
     if [[ -L "$target" && "$(readlink -f "$target")" == "$source" ]]; then
       printf '%s\n' "Already linked: $skill"
     elif [[ -e "$target" || -L "$target" ]]; then
-      if ((dry_run)); then
-        printf '%s\n' "Preview: would replace existing skill and link $skill"
-      else
-        rm -rf -- "$target"
-        ln -s "$source" "$target"
-        success "Replaced existing skill with repository link: $skill"
-      fi
+      warning "Skipped existing non-repository skill: $target"
     elif ((dry_run)); then
       printf '%s\n' "Preview: would link skill $skill"
     else
@@ -668,24 +519,6 @@ install_selected_skills() {
   done
 }
 
-install_everything() {
-  require_config
-  require_command codex
-
-  selected_mcp_ids=()
-  local entry server_id
-  while IFS= read -r entry; do
-    IFS=$'\t' read -r server_id _ <<< "$entry"
-    selected_mcp_ids+=("$server_id")
-  done < <(mcp_entries)
-  install_selected_mcps
-
-  install_all_prompts
-
-  mapfile -t selected_skills < <(skill_entries)
-  install_selected_skills
-}
-
 menu() {
   while true; do
     draw_header
@@ -693,18 +526,16 @@ menu() {
     printf '%s\n' '  1) Install MCPs        Select from the catalog'
     printf '%s\n' '  2) Install a prompt    Choose the global instruction set'
     printf '%s\n' '  3) Install skills      Choose a group or individual skills'
-    printf '%s\n' '  4) Install everything  Install every MCP, prompt, and skill'
-    printf '%s\n' '  5) Exit'
-    printf '%s' 'Select an option [1-5]: '
+    printf '%s\n' '  4) Exit'
+    printf '%s' 'Select an option [1-4]: '
     read -r choice || return 0
 
     case "$choice" in
       1) install_mcps || true ;;
       2) install_prompt || true ;;
       3) install_skills || true ;;
-      4) install_everything || true ;;
-      5) return 0 ;;
-      *) warning 'Please choose 1, 2, 3, 4, or 5.' ;;
+      4) return 0 ;;
+      *) warning 'Please choose 1, 2, 3, or 4.' ;;
     esac
   done
 }
