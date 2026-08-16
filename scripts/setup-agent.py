@@ -9,7 +9,10 @@ import uuid
 import urllib.request
 import urllib.error
 
-import yaml
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 BASE_URL = "https://litellm.v-rail.org"
 MODELS_ENDPOINT = f"{BASE_URL}/v1/models"
@@ -188,16 +191,19 @@ def write_json(path, data):
 
 
 def read_yaml(path):
-    if os.path.exists(path):
-        try:
-            with open(path, "r") as f:
-                return yaml.safe_load(f) or {}
-        except yaml.YAMLError:
-            return {}
-    return {}
+    if not os.path.exists(path) or yaml is None:
+        return {}
+    try:
+        with open(path, "r") as f:
+            return yaml.safe_load(f) or {}
+    except yaml.YAMLError:
+        return {}
 
 
 def write_yaml(path, data):
+    if yaml is None:
+        print("Error: PyYAML is required for omp setup (pip install pyyaml).", file=sys.stderr)
+        sys.exit(1)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         yaml.safe_dump(data, f, sort_keys=False, default_flow_style=False)
@@ -350,15 +356,10 @@ def setup_omp(api_key, models):
 
     agent_dir = os.path.join(HOME, ".omp", "agent")
 
-    # models.yml: custom providers pointing at the v-rail CLIProxyAPI gateway.
-    # - v-rail: chat models, auto-discovered from the OpenAI-compatible
-    #   /v1/models endpoint at runtime (the harness-native equivalent of Claude
-    #   Code gateway model discovery), so we never hand-maintain a model list.
-    # - openai-codex: powers omp's OpenAI/ChatGPT-style web search provider.
-    #   omp's codex search adapter resolves an API key for custom endpoints
-    #   from this provider entry and calls {baseUrl}/codex/responses with the
-    #   hosted web_search tool (it refuses OAuth/env credentials for custom
-    #   endpoints, so the pinned apiKey is required).
+    # models.yml: v-rail chat provider (auto-discovered from /v1/models at
+    # runtime, mirroring Claude Code gateway discovery) plus openai-codex for
+    # OpenAI-style web search. The codex adapter calls {baseUrl}/codex/responses
+    # and refuses OAuth for custom endpoints, so the pinned apiKey is required.
     models_path = os.path.join(agent_dir, "models.yml")
     models_data = {
         "providers": {
