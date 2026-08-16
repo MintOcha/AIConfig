@@ -42,6 +42,11 @@ Launch the setup menu:
 Use `./scripts/install.sh --dry-run` to exercise the menus without
 changing Codex configuration.
 
+Use `./scripts/install.sh --omp` to install selected MCPs into OMP's user MCP
+registry at `~/.omp/agent/mcp.json`. OMP-specific runs show only MCP setup and
+exit choices; Codex prompt and skill installation remain available in the
+default mode.
+
 The main menu installs MCPs, the shared prompt, or skills as independent
 choices. Installing a prompt or skill never reinstalls MCPs or touches their
 credentials. MCPs are discovered from [`mcp.toml`](mcp.toml), so adding another entry only
@@ -57,23 +62,35 @@ substituted only for the `codex mcp add` call and are never stored here.
 `--codex-home PATH` for a separate Codex installation, and `--dry-run` to
 preview every operation without changing the target.
 
-The search entry installs one local FastMCP server, `web-search`, run by `uv`
-from this repository. Its machine-local configuration is created at
-`~/.codex/web-search-mcp.toml` (or under the `--codex-home` directory). Add
-Brave and Tavily keys to the two `api_keys` lists there; each list supports
-multiple keys and is round-robin. Brave searches are delegated to Brave's
-official MCP server. No keys are placed in `mcp.toml` or in the Codex command.
+The search entry installs one local FastMCP server, `web`, run by `uv`
+from this repository. Its machine-local configuration is created under the
+selected agent home. Setup opens a provider menu for Brave, DuckDuckGo, Codex
+standalone search, and Tavily. Selecting a keyed provider requests its key
+through hidden input; configured providers receive a green checkmark.
+DuckDuckGo is disabled by default and its menu item toggles it directly. The
+menu also offers to edit the complete configuration in Vim before installing.
+No keys are placed in `mcp.toml` or in an agent command.
+OMP exposes the concise `web/search`, `web/fetch`, and `web/research` tool set,
+mounted as `mcp__web_search`, `mcp__web_fetch`, and `mcp__web_research`.
 
-The server exposes three intent-level tools: `web_search`, `fetch_content`, and
-`tavily_research`. They do not expose provider selection, provider-specific
-search options, or routing metadata. `web_search` translates its generic query
-and result limit for each backend and round-robins through DuckDuckGo, Brave,
-and Tavily in that order. If the selected provider fails, the same request
-advances through the remaining providers and returns an error only if all three
-fail. DuckDuckGo bot detection, HTTP 429s, empty responses, and other request
-failures start a local cooldown so later requests skip the blocked route.
-`fetch_content` maps URLs to Tavily extraction, while
-`tavily_research` remains a separate tool for long-form research. Tavily calls
+Codex standalone search uses an API key with
+`POST {base_url}/alpha/search`; its defaults are
+`https://litellm.v-rail.org/v1` and `gpt-5.6-sol`. It is a separate protocol
+from Codex OAuth and the Responses API. Brave searches are delegated to
+Brave's official MCP server. Each keyed provider accepts multiple keys in the
+configuration file and rotates through them in order.
+
+The server exposes three intent-level tools: `search`, `fetch`, and `research`.
+They do not expose provider selection, provider-specific
+search options, or routing metadata. `search` translates its generic query
+and result limit for each backend and round-robins through Brave, DuckDuckGo,
+Codex standalone, and Tavily. Unconfigured or disabled providers are skipped.
+If the selected provider fails, the same request advances through the remaining
+providers and returns an error only if all of them fail. DuckDuckGo bot
+detection, HTTP 429s, empty responses, and other request failures start a local
+cooldown so later requests skip the blocked route.
+`fetch` maps URLs to Tavily extraction, while `research` remains a separate
+tool for long-form research. Tavily calls
 retry across the configured API keys before returning an error.
 
 

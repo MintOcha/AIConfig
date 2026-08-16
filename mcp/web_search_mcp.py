@@ -12,6 +12,7 @@ import asyncio
 import json
 import re
 import time
+import uuid
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +24,7 @@ import tomllib
 from fastmcp import Client, FastMCP
 from fastmcp.client.transports import StdioTransport
 
-SEARCH_PROVIDERS = ("duckduckgo", "brave", "tavily")
+SEARCH_PROVIDERS = ("brave", "duckduckgo", "codex_standalone", "tavily")
 
 
 class ConfigurationError(ValueError):
@@ -51,6 +52,10 @@ class RouterConfig:
     brave_command: str
     brave_args: tuple[str, ...]
     brave_keys: tuple[str, ...]
+    duckduckgo_enabled: bool
+    codex_standalone_keys: tuple[str, ...]
+    codex_standalone_base_url: str
+    codex_standalone_model: str
     tavily_keys: tuple[str, ...]
     tavily_endpoint: str
     brave_cooldown_seconds: float
@@ -121,6 +126,7 @@ class BraveKeys:
                 raise BraveCooldown(delay_seconds)
             await asyncio.sleep(delay_seconds)
 
+
 class CooldownGate:
     def __init__(self, cooldown_seconds: float) -> None:
         self._available_at = 0.0
@@ -152,6 +158,31 @@ def _number(data: dict[str, Any], key: str, default: float) -> float:
     if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
         raise ConfigurationError(f"search.{key} must be a positive number")
     return float(value)
+
+
+def _boolean(data: dict[str, Any], key: str, default: bool) -> bool:
+    value = data.get(key, default)
+    if not isinstance(value, bool):
+        raise ConfigurationError(f"{key} must be true or false")
+    return value
+
+
+def _http_url(data: dict[str, Any], key: str, default: str) -> str:
+    value = data.get(key, default)
+    if not isinstance(value, str):
+        raise ConfigurationError(f"{key} must be an HTTP(S) URL")
+    normalized = value.rstrip("/")
+    parsed = urlsplit(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ConfigurationError(f"{key} must be an HTTP(S) URL")
+    return normalized
+
+
+def _string(data: dict[str, Any], key: str, default: str) -> str:
+    value = data.get(key, default)
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigurationError(f"{key} must be a non-empty string")
+    return value.strip()
 
 
 def _command(
@@ -189,8 +220,12 @@ def load_config(path: Path) -> RouterConfig:
 
     duckduckgo = providers.get("duckduckgo", {})
     brave = providers.get("brave", {})
+    codex_standalone = providers.get("codex_standalone", {})
     tavily = providers.get("tavily", {})
-    if not all(isinstance(provider, dict) for provider in (duckduckgo, brave, tavily)):
+    if not all(
+        isinstance(provider, dict)
+        for provider in (duckduckgo, brave, codex_standalone, tavily)
+    ):
         raise ConfigurationError("each configured provider must be a table")
 
     duckduckgo_command, duckduckgo_args = _command(
@@ -218,6 +253,18 @@ def load_config(path: Path) -> RouterConfig:
         brave_command=brave_command,
         brave_args=brave_args,
         brave_keys=_api_keys(brave, "brave"),
+        duckduckgo_enabled=_boolean(duckduckgo, "enabled", False),
+        codex_standalone_keys=_api_keys(codex_standalone, "codex_standalone"),
+        codex_standalone_base_url=_http_url(
+            codex_standalone,
+            "base_url",
+            "https://litellm.v-rail.org/v1",
+        ),
+        codex_standalone_model=_string(
+            codex_standalone,
+            "model",
+            "gpt-5.6-sol",
+        ),
         tavily_keys=_api_keys(tavily, "tavily"),
         tavily_endpoint=endpoint,
         brave_cooldown_seconds=_number(search, "brave_cooldown_seconds", 1.0),
@@ -375,9 +422,11 @@ class SearchRouter:
         tavily_client_factory: Callable[..., Client] = Client,
         brave_client_factory: Callable[..., Client] = Client,
         duckduckgo_client_factory: Callable[..., Client] = Client,
+        codex_client_factory: Callable[..., httpx.AsyncClient] = httpx.AsyncClient,
     ) -> None:
         self.config = config
         self._brave_keys = BraveKeys(config.brave_keys, config.brave_cooldown_seconds)
+        self._codex_standalone_keys = RoundRobinKeys(config.codex_standalone_keys)
         self._tavily_keys = RoundRobinKeys(config.tavily_keys)
         self._duckduckgo_gate = CooldownGate(config.duckduckgo_cooldown_seconds)
         self._next_provider_index = 0
@@ -385,6 +434,7 @@ class SearchRouter:
         self._tavily_client_factory = tavily_client_factory
         self._brave_client_factory = brave_client_factory
         self._duckduckgo_client_factory = duckduckgo_client_factory
+        self._codex_client_factory = codex_client_factory
 
     def _duckduckgo_client(self) -> Client:
         transport = StdioTransport(
@@ -435,6 +485,8 @@ class SearchRouter:
     async def _search_duckduckgo(
         self, query: str, max_results: int
     ) -> list[dict[str, str]]:
+        if not self.config.duckduckgo_enabled:
+            raise ConfigurationError("DuckDuckGo is disabled")
         await self._duckduckgo_gate.enter()
         try:
             async with self._duckduckgo_client() as client:
@@ -453,9 +505,51 @@ class SearchRouter:
                 raise
             raise DuckDuckGoUnavailable("DuckDuckGo search request failed") from error
 
+    async def _search_codex_standalone(
+        self, query: str, max_results: int
+    ) -> list[dict[str, str]]:
+        if not self._codex_standalone_keys.configured:
+            raise ConfigurationError("No Codex standalone API keys are configured")
+
+        endpoint = f"{self.config.codex_standalone_base_url.rstrip('/')}/alpha/search"
+        last_error: Exception | None = None
+        for _ in range(self._codex_standalone_keys.count):
+            api_key = await self._codex_standalone_keys.next_key()
+            try:
+                async with self._codex_client_factory(
+                    timeout=self.config.request_timeout_seconds
+                ) as client:
+                    response = await client.post(
+                        endpoint,
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        json={
+                            "id": str(uuid.uuid4()),
+                            "model": self.config.codex_standalone_model,
+                            "commands": {"search_query": [{"q": query}]},
+                        },
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                results = _normalize_search_results(
+                    payload, url_field="url", snippet_field="snippet"
+                )[:max_results]
+                if results:
+                    return results
+                raise ProviderRequestError(
+                    "Codex standalone search returned no usable results"
+                )
+            except Exception as error:  # noqa: BLE001
+                last_error = error
+
+        raise ProviderRequestError(
+            "Codex standalone search failed for every configured key"
+        ) from last_error
+
     async def _fetch_duckduckgo(
         self, urls: list[str]
     ) -> tuple[list[dict[str, str]], list[str]]:
+        if not self.config.duckduckgo_enabled:
+            raise ConfigurationError("DuckDuckGo is disabled")
         fetched: list[dict[str, str]] = []
         missing: list[str] = []
         async with self._duckduckgo_client() as client:
@@ -536,6 +630,8 @@ class SearchRouter:
                     return await self._search_brave(
                         query, max_results, wait_for_cooldown=False
                     )
+                if provider == "codex_standalone":
+                    return await self._search_codex_standalone(query, max_results)
                 return await self._search_tavily(query, max_results)
             except (
                 BraveCooldown,
@@ -584,7 +680,7 @@ mcp = FastMCP(
 router: SearchRouter | None = None
 
 
-@mcp.tool(name="web_search")
+@mcp.tool(name="search")
 async def web_search(
     query: str,
     max_results: int = 10,
@@ -600,7 +696,7 @@ async def web_search(
     return await router.search(query, max_results)
 
 
-@mcp.tool(name="fetch_content")
+@mcp.tool(name="fetch")
 async def fetch_content(urls: list[str]) -> list[dict[str, str]]:
     """Fetch readable Markdown content from one or more web URLs."""
     if router is None:
@@ -608,7 +704,7 @@ async def fetch_content(urls: list[str]) -> list[dict[str, str]]:
     return await router.fetch_content(_validate_urls(urls))
 
 
-@mcp.tool(name="tavily_research")
+@mcp.tool(name="research")
 async def tavily_research(task: str) -> str:
     """Run an in-depth web research task and return the finished report."""
     if not task.strip():
@@ -640,7 +736,10 @@ def main() -> None:
     if arguments.check_config:
         print(
             "Configuration is valid "
-            f"(Brave keys: {len(config.brave_keys)}, Tavily keys: {len(config.tavily_keys)})"
+            f"(Brave keys: {len(config.brave_keys)}, "
+            f"DuckDuckGo: {'enabled' if config.duckduckgo_enabled else 'disabled'}, "
+            f"Codex standalone keys: {len(config.codex_standalone_keys)}, "
+            f"Tavily keys: {len(config.tavily_keys)})"
         )
         return
 

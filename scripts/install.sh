@@ -2,7 +2,8 @@
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-codex_home="${CODEX_HOME:-${HOME}/.codex}"
+target_agent="codex"
+target_home="${CODEX_HOME:-${HOME}/.codex}"
 mcp_file="${repo_root}/mcp.toml"
 skills_file="${repo_root}/skills.toml"
 prompts_file="${repo_root}/prompts.toml"
@@ -36,7 +37,7 @@ draw_header() {
   printf '\n%s%s%s\n' "$blue" '────────────────────────────────────────────────────────' "$reset"
   printf '%s%s Agent setup%s\n' "$bold" "$cyan" "$reset"
   printf '%s  Source: %s%s\n' "$dim" "$repo_root" "$reset"
-  printf '%s  Target: Codex · %s%s\n' "$dim" "$codex_home" "$reset"
+  printf '%s  Target: %s · %s%s\n' "$dim" "$target_agent" "$target_home" "$reset"
   ((dry_run)) && printf '%s  Mode:   preview only (no changes)%s\n' "$yellow" "$reset"
   printf '%s%s%s\n' "$blue" '────────────────────────────────────────────────────────' "$reset"
 }
@@ -56,6 +57,7 @@ are requested interactively and are never written to this repository.
 Options:
   --dry-run             Exercise the menus without changing anything
   --codex-home PATH     Use a specific Codex home instead of ~/.codex
+  --omp                  Install MCPs into ~/.omp/agent/mcp.json
 EOF
 }
 
@@ -70,7 +72,7 @@ require_command() {
 }
 
 codex_command() {
-  CODEX_HOME="$codex_home" codex "$@"
+  CODEX_HOME="$target_home" codex "$@"
 }
 
 require_config() {
@@ -120,10 +122,33 @@ else:
 PY
 }
 
+mcp_provider_entries() {
+  local server_id="$1"
+  python3 - "$mcp_file" "$server_id" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as stream:
+    catalog = tomllib.load(stream)
+
+server = catalog.get("mcp", {}).get(sys.argv[2])
+if server is None:
+    raise SystemExit(f"unknown MCP: {sys.argv[2]}")
+
+for provider in server.get("providers", []):
+    print("\t".join((
+        provider["label"],
+        provider["kind"],
+        provider["config_table"],
+        provider["config_key"],
+    )))
+PY
+}
+
 render_mcp_template() {
   local value="$1"
   value="${value//\{REPO_ROOT\}/$repo_root}"
-  value="${value//\{CODEX_HOME\}/$codex_home}"
+  value="${value//\{CODEX_HOME\}/$target_home}"
   printf '%s\n' "$value"
 }
 
@@ -220,6 +245,228 @@ prompt_secret() {
   }
 }
 
+config_provider_state() {
+  local config_path="$1"
+  local config_table="$2"
+  local config_key="$3"
+  local kind="$4"
+  python3 - "$config_path" "$config_table" "$config_key" "$kind" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as stream:
+    value = tomllib.load(stream)
+for part in sys.argv[2].split("."):
+    value = value.get(part, {}) if isinstance(value, dict) else {}
+value = value.get(sys.argv[3]) if isinstance(value, dict) else None
+if sys.argv[4] == "toggle":
+    print("enabled" if value is True else "disabled")
+else:
+    print("configured" if isinstance(value, list) and bool(value) else "not configured")
+PY
+}
+
+write_config_api_key() {
+  local config_path="$1"
+  local config_table="$2"
+  local config_key="$3"
+
+  python3 /dev/fd/3 "$config_path" "$config_table" "$config_key" 3<<'PY' <<<"$secret_value"
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+import tomllib
+
+path = Path(sys.argv[1])
+table = sys.argv[2]
+key = sys.argv[3]
+secret = sys.stdin.read().rstrip("\n")
+lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+header = f"[{table}]"
+section_start = next(
+    index for index, line in enumerate(lines) if line.strip() == header
+)
+section_end = next(
+    (
+        index
+        for index in range(section_start + 1, len(lines))
+        if lines[index].lstrip().startswith("[")
+    ),
+    len(lines),
+)
+key_pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+replacement = f"{key} = [{json.dumps(secret, ensure_ascii=False)}]\n"
+for index in range(section_start + 1, section_end):
+    if key_pattern.match(lines[index]):
+        lines[index] = replacement
+        break
+else:
+    lines.insert(section_start + 1, replacement)
+
+updated = "".join(lines)
+tomllib.loads(updated)
+with tempfile.NamedTemporaryFile(
+    "w", encoding="utf-8", dir=path.parent, delete=False
+) as stream:
+    stream.write(updated)
+    temporary_path = stream.name
+os.chmod(temporary_path, 0o600)
+os.replace(temporary_path, path)
+PY
+}
+
+toggle_config_boolean() {
+  local config_path="$1"
+  local config_table="$2"
+  local config_key="$3"
+
+  python3 - "$config_path" "$config_table" "$config_key" <<'PY'
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+import tomllib
+
+path = Path(sys.argv[1])
+table = sys.argv[2]
+key = sys.argv[3]
+lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+parsed = tomllib.loads("".join(lines))
+value = parsed
+for part in table.split("."):
+    value = value.get(part, {}) if isinstance(value, dict) else {}
+current = value.get(key) is True if isinstance(value, dict) else False
+header = f"[{table}]"
+section_start = next(
+    index for index, line in enumerate(lines) if line.strip() == header
+)
+section_end = next(
+    (
+        index
+        for index in range(section_start + 1, len(lines))
+        if lines[index].lstrip().startswith("[")
+    ),
+    len(lines),
+)
+key_pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+replacement = f"{key} = {'false' if current else 'true'}\n"
+for index in range(section_start + 1, section_end):
+    if key_pattern.match(lines[index]):
+        lines[index] = replacement
+        break
+else:
+    lines.insert(section_start + 1, replacement)
+
+updated = "".join(lines)
+tomllib.loads(updated)
+with tempfile.NamedTemporaryFile(
+    "w", encoding="utf-8", dir=path.parent, delete=False
+) as stream:
+    stream.write(updated)
+    temporary_path = stream.name
+os.chmod(temporary_path, 0o600)
+os.replace(temporary_path, path)
+PY
+}
+
+configure_mcp() {
+  local server_id="$1"
+  local config_path entry label kind config_table config_key state choice index
+  local -a providers
+  mapfile -t providers < <(mcp_provider_entries "$server_id")
+  ((${#providers[@]} > 0)) || return 0
+
+  config_path="$(render_mcp_template "$(mcp_value "$server_id" config_path)")"
+  if ((dry_run)); then
+    printf '%s\n' "Dry run: would open the provider configuration menu for $server_id"
+    return 0
+  fi
+
+  while true; do
+    printf '\n%s%s provider setup%s\n' "$bold" "$server_id" "$reset"
+    index=1
+    for entry in "${providers[@]}"; do
+      IFS=$'\t' read -r label kind config_table config_key <<< "$entry"
+      state="$(config_provider_state "$config_path" "$config_table" "$config_key" "$kind")"
+      if [[ "$state" == "configured" || "$state" == "enabled" ]]; then
+        printf ' %d) %-24s %s✓ %s%s\n' "$index" "$label" "$green" "$state" "$reset"
+      else
+        printf ' %d) %-24s %s%s%s\n' "$index" "$label" "$dim" "$state" "$reset"
+      fi
+      ((index += 1))
+    done
+    printf ' %d) Paste/edit full config in Vim\n' "$index"
+    printf ' %d) Install config and continue\n' "$((index + 1))"
+    printf 'Select an option [1-%d]: ' "$((index + 1))"
+    read -r choice
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#providers[@]})); then
+      IFS=$'\t' read -r label kind config_table config_key <<< "${providers[choice - 1]}"
+      if [[ "$kind" == "toggle" ]]; then
+        toggle_config_boolean "$config_path" "$config_table" "$config_key"
+      else
+        prompt_secret "$label" || continue
+        write_config_api_key "$config_path" "$config_table" "$config_key"
+        unset secret_value
+      fi
+      continue
+    fi
+    if [[ "$choice" == "$index" ]]; then
+      require_command vim
+      vim "$config_path"
+      python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' "$config_path"
+      continue
+    fi
+    if [[ "$choice" == "$((index + 1))" ]]; then
+      return 0
+    fi
+    warning "Please choose a number from 1 to $((index + 1))."
+  done
+}
+
+write_omp_mcp() {
+  local server_id="$1"
+  local transport="$2"
+  shift 2
+  local config_path="${target_home}/mcp.json"
+
+  mkdir -p "$target_home"
+  python3 - "$config_path" "$server_id" "$transport" "$@" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+path = Path(sys.argv[1])
+server_id = sys.argv[2]
+transport = sys.argv[3]
+values = sys.argv[4:]
+if path.exists():
+    config = json.loads(path.read_text(encoding="utf-8"))
+else:
+    config = {"mcpServers": {}}
+servers = config.setdefault("mcpServers", {})
+if transport == "url":
+    servers[server_id] = {"url": values[0]}
+else:
+    servers[server_id] = {"command": values[0], "args": values[1:]}
+
+with tempfile.NamedTemporaryFile(
+    "w", encoding="utf-8", dir=path.parent, delete=False
+) as stream:
+    json.dump(config, stream, indent=2)
+    stream.write("\n")
+    temporary_path = stream.name
+os.chmod(temporary_path, 0o600)
+os.replace(temporary_path, path)
+PY
+}
+
 install_mcp() {
   local server_id="$1"
   local transport command_name url_template url placeholder secret_label secret_choice argument_index
@@ -255,10 +502,15 @@ install_mcp() {
       printf '%s\n' "Dry run: would install MCP: $server_id"
       return 0
     fi
-    codex_command mcp remove "$server_id" >/dev/null 2>&1 || true
-    codex_command mcp add "$server_id" --url "$url"
+    if [[ "$target_agent" == "omp" ]]; then
+      write_omp_mcp "$server_id" url "$url"
+    else
+      codex_command mcp remove "$server_id" >/dev/null 2>&1 || true
+      codex_command mcp add "$server_id" --url "$url"
+    fi
   else
     prepare_mcp_config "$server_id" || return 1
+    configure_mcp "$server_id" || return 1
     command_name="$(render_mcp_template "$(mcp_value "$server_id" command)")"
     mapfile -t command_args < <(mcp_value "$server_id" args)
     ((${#command_args[@]} > 0)) || {
@@ -272,8 +524,12 @@ install_mcp() {
       printf '%s\n' "Dry run: would install MCP: $server_id"
       return 0
     fi
-    codex_command mcp remove "$server_id" >/dev/null 2>&1 || true
-    codex_command mcp add "$server_id" -- "$command_name" "${command_args[@]}"
+    if [[ "$target_agent" == "omp" ]]; then
+      write_omp_mcp "$server_id" stdio "$command_name" "${command_args[@]}"
+    else
+      codex_command mcp remove "$server_id" >/dev/null 2>&1 || true
+      codex_command mcp add "$server_id" -- "$command_name" "${command_args[@]}"
+    fi
   fi
 
   unset secret_value
@@ -281,7 +537,7 @@ install_mcp() {
 }
 
 install_mcps() {
-  require_command codex
+  [[ "$target_agent" == "omp" ]] || require_command codex
   select_mcp_ids || return 1
   local server_id
   for server_id in "${selected_mcp_ids[@]}"; do
@@ -345,7 +601,7 @@ select_prompt_source() {
 
 install_prompt() {
   select_prompt_source || return 0
-  local target="${codex_home}/AGENTS.md"
+  local target="${target_home}/AGENTS.md"
   local import_line="@${selected_prompt_path}"
 
   if ((dry_run)); then
@@ -353,7 +609,7 @@ install_prompt() {
     return 0
   fi
 
-  mkdir -p "$codex_home"
+  mkdir -p "$target_home"
   if [[ ! -e "$target" && ! -L "$target" ]]; then
     printf '# Global Agent Instructions\n\n%s\n' "$import_line" > "$target"
   elif ! grep -Fqx "$import_line" "$target"; then
@@ -498,7 +754,7 @@ select_skill_set() {
 
 install_skills() {
   require_command codex
-  local skills_dir="${codex_home}/skills"
+  local skills_dir="${target_home}/skills"
   select_skill_set || return 1
 
   ((dry_run)) || mkdir -p "$skills_dir"
@@ -524,18 +780,23 @@ menu() {
     draw_header
     printf '%s\n' 'What would you like to set up?'
     printf '%s\n' '  1) Install MCPs        Select from the catalog'
-    printf '%s\n' '  2) Install a prompt    Choose the global instruction set'
-    printf '%s\n' '  3) Install skills      Choose a group or individual skills'
-    printf '%s\n' '  4) Exit'
-    printf '%s' 'Select an option [1-4]: '
+    if [[ "$target_agent" == "omp" ]]; then
+      printf '%s\n' '  2) Exit'
+      printf '%s' 'Select an option [1-2]: '
+    else
+      printf '%s\n' '  2) Install a prompt    Choose the global instruction set'
+      printf '%s\n' '  3) Install skills      Choose a group or individual skills'
+      printf '%s\n' '  4) Exit'
+      printf '%s' 'Select an option [1-4]: '
+    fi
     read -r choice || return 0
 
     case "$choice" in
       1) install_mcps || true ;;
-      2) install_prompt || true ;;
-      3) install_skills || true ;;
-      4) return 0 ;;
-      *) warning 'Please choose 1, 2, 3, or 4.' ;;
+      2) [[ "$target_agent" == "omp" ]] && return 0; install_prompt || true ;;
+      3) [[ "$target_agent" == "codex" ]] && install_skills || true ;;
+      4) [[ "$target_agent" == "codex" ]] && return 0 ;;
+      *) warning 'Please choose one of the displayed options.' ;;
     esac
   done
 }
@@ -546,8 +807,13 @@ while (($# > 0)); do
     --dry-run) dry_run=1; shift ;;
     --codex-home)
       [[ $# -ge 2 ]] || { failure '--codex-home requires a path.'; exit 2; }
-      codex_home="$2"
+      target_home="$2"
       shift 2
+      ;;
+    --omp)
+      target_agent="omp"
+      target_home="${HOME}/.omp/agent"
+      shift
       ;;
     *) usage >&2; exit 2 ;;
   esac

@@ -1,15 +1,39 @@
 # Portable MCP catalog for the setup menu.
 #
-# The web-search entry is a single local FastMCP server. Its editable runtime
+# The web entry is a single local FastMCP server. Its editable runtime
 # configuration is created in CODEX_HOME when the server is installed; no API
 # keys are stored in this repository or in the Codex MCP command.
 
-[mcp.web-search]
-label = "Web search router"
+[mcp.web]
+label = "Web"
 category = "search"
-description = "Provider-hidden web search, content fetching, and Tavily research with automatic fallback"
+description = "Brave, optional DuckDuckGo, Codex standalone, and Tavily search with automatic fallback"
 transport = "stdio"
 command = "uv"
-args = ["run", "--script", "{REPO_ROOT}/mcp/web_search_mcp.py", "--config", "{CODEX_HOME}/web-search-mcp.toml"]
+args = ["run", "--script", "{REPO_ROOT}/mcp/web_search_mcp.py", "--config", "{CODEX_HOME}/web.toml"]
 config_template = "mcp/web-search-mcp.toml"
-config_path = "{CODEX_HOME}/web-search-mcp.toml"
+config_path = "{CODEX_HOME}/web.toml"
+
+[[mcp.web.providers]]
+label = "Brave"
+kind = "api_key"
+config_table = "providers.brave"
+config_key = "api_keys"
+
+[[mcp.web.providers]]
+label = "DuckDuckGo"
+kind = "toggle"
+config_table = "providers.duckduckgo"
+config_key = "enabled"
+
+[[mcp.web.providers]]
+label = "Codex standalone"
+kind = "api_key"
+config_table = "providers.codex_standalone"
+config_key = "api_keys"
+
+[[mcp.web.providers]]
+label = "Tavily"
+kind = "api_key"
+config_table = "providers.tavily"
+config_key = "api_keys"

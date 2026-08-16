@@ -1,8 +1,11 @@
+import json
 import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+
+import httpx
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "mcp"))
 
@@ -18,7 +21,11 @@ from web_search_mcp import (
 
 
 def router_config(
-    *, brave_keys: tuple[str, ...] = (), tavily_keys: tuple[str, ...] = ()
+    *,
+    brave_keys: tuple[str, ...] = (),
+    codex_standalone_keys: tuple[str, ...] = (),
+    codex_standalone_base_url: str = "https://example.test/v1",
+    tavily_keys: tuple[str, ...] = (),
 ) -> RouterConfig:
     return RouterConfig(
         duckduckgo_command="uvx",
@@ -26,6 +33,10 @@ def router_config(
         brave_command="npx",
         brave_args=("-y", "@brave/brave-search-mcp-server@2.1.0"),
         brave_keys=brave_keys,
+        duckduckgo_enabled=False,
+        codex_standalone_keys=codex_standalone_keys,
+        codex_standalone_base_url=codex_standalone_base_url,
+        codex_standalone_model="gpt-5.6-sol",
         tavily_keys=tavily_keys,
         tavily_endpoint="https://mcp.tavily.com/mcp/",
         brave_cooldown_seconds=1.0,
@@ -113,7 +124,66 @@ class FakeBraveFactory:
         return FakeBraveClient(self.request, transport)
 
 
+class FakeCodexFactory:
+    def __init__(self, payload) -> None:
+        self.payload = payload
+        self.requests = []
+
+    def __call__(self, *, timeout):
+        self.timeout = timeout
+
+        async def handle(request):
+            self.requests.append(request)
+            return httpx.Response(200, json=self.payload)
+
+        return httpx.AsyncClient(transport=httpx.MockTransport(handle), timeout=timeout)
+
+
 class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_codex_standalone_uses_alpha_contract_and_normalizes_results(
+        self,
+    ) -> None:
+        factory = FakeCodexFactory(
+            {
+                "output": "Aggregated answer",
+                "results": [
+                    {
+                        "type": "text_result",
+                        "title": "OpenAI API",
+                        "url": "https://platform.openai.com/docs",
+                        "snippet": "Developer documentation",
+                    }
+                ],
+            }
+        )
+        router = SearchRouter(
+            router_config(
+                codex_standalone_keys=("secret",),
+                codex_standalone_base_url="https://example.test/v1/",
+            ),
+            codex_client_factory=factory,
+        )
+
+        results = await router._search_codex_standalone("OpenAI docs", 5)
+
+        request = factory.requests[0]
+        body = json.loads(request.content)
+        self.assertEqual(str(request.url), "https://example.test/v1/alpha/search")
+        self.assertEqual(request.headers["Authorization"], "Bearer secret")
+        self.assertEqual(body["model"], "gpt-5.6-sol")
+        self.assertEqual(body["commands"], {"search_query": [{"q": "OpenAI docs"}]})
+        self.assertTrue(body["id"])
+        self.assertEqual(
+            results,
+            [
+                {
+                    "title": "OpenAI API",
+                    "url": "https://platform.openai.com/docs",
+                    "snippet": "Developer documentation",
+                }
+            ],
+        )
+
     async def test_tavily_keys_rotate_in_order(self) -> None:
         keys = RoundRobinKeys(("first", "second"))
 
@@ -201,18 +271,27 @@ class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
                 {"title": "Tavily", "url": "https://tavily.example", "snippet": ""}
             ]
         )
+        router._search_codex_standalone = AsyncMock(
+            side_effect=[
+                [{"title": "Codex", "url": "https://codex.example", "snippet": ""}],
+                ProviderRequestError("failed"),
+            ]
+        )
 
         first = await router.search("first", 5)
         second = await router.search("second", 5)
         third = await router.search("third", 5)
         fourth = await router.search("fourth", 5)
+        fifth = await router.search("fifth", 5)
 
-        self.assertEqual(first[0]["title"], "DDG")
-        self.assertEqual(second[0]["title"], "Brave")
-        self.assertEqual(third[0]["title"], "Tavily")
+        self.assertEqual(first[0]["title"], "Brave")
+        self.assertEqual(second[0]["title"], "DDG")
+        self.assertEqual(third[0]["title"], "Codex")
         self.assertEqual(fourth[0]["title"], "Tavily")
+        self.assertEqual(fifth[0]["title"], "Tavily")
         self.assertEqual(router._search_duckduckgo.await_count, 2)
         self.assertEqual(router._search_brave.await_count, 2)
+        self.assertEqual(router._search_codex_standalone.await_count, 2)
         self.assertEqual(router._search_tavily.await_count, 2)
 
     async def test_search_errors_only_after_all_providers_fail(self) -> None:
@@ -221,6 +300,9 @@ class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
             side_effect=DuckDuckGoUnavailable("blocked")
         )
         router._search_brave = AsyncMock(side_effect=ProviderRequestError("failed"))
+        router._search_codex_standalone = AsyncMock(
+            side_effect=ProviderRequestError("failed")
+        )
         router._search_tavily = AsyncMock(side_effect=ProviderRequestError("failed"))
 
         with self.assertRaisesRegex(
@@ -230,6 +312,7 @@ class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         router._search_duckduckgo.assert_awaited_once()
         router._search_brave.assert_awaited_once()
+        router._search_codex_standalone.assert_awaited_once()
         router._search_tavily.assert_awaited_once()
 
     async def test_tavily_retries_with_the_next_key(self) -> None:
