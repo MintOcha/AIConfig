@@ -43,13 +43,15 @@ Use `./scripts/install.sh --dry-run` to exercise the menus without
 changing Codex configuration.
 
 The main menu installs MCPs, the shared prompt, or skills as independent
-choices. Installing a prompt or skill never reinstalls MCPs or touches their
-credentials. MCPs are discovered from [`mcp.toml`](mcp.toml), so adding another entry only
-requires editing that file. Skills are discovered from `skill/*/SKILL.md` and
-grouped through [`skills.toml`](skills.toml), which keeps large skill catalogs
-manageable. If an MCP URL contains a `{PLACEHOLDER}`, the menu offers to
-paste its credential through hidden input or skip that MCP. Credentials are
-substituted only for the `codex mcp add` call and are never stored here.
+choices, and also has an **Install everything** option. Installing a prompt or
+skill never reinstalls MCPs or touches their credentials. MCPs are discovered
+from [`mcp.toml`](mcp.toml), so adding another entry only requires editing that
+file. MCP credential entries request each provider API key through hidden
+interactive input and write it only to the machine-local MCP configuration.
+Skills are discovered from `skill/*/SKILL.md` and grouped through
+[`skills.toml`](skills.toml), which keeps large skill catalogs manageable.
+Selected repository skills replace same-named skills already installed in the
+Codex home, ensuring that Codex uses the repository-managed version.
 
 `prompts/coding-rules.md` is available as one selectable prompt. Add more Markdown files under
 [`prompts/`](prompts/) to make them selectable, then describe them in
@@ -59,10 +61,11 @@ preview every operation without changing the target.
 
 The search entry installs one local FastMCP server, `web-search`, run by `uv`
 from this repository. Its machine-local configuration is created at
-`~/.codex/web-search-mcp.toml` (or under the `--codex-home` directory). Add
-Brave and Tavily keys to the two `api_keys` lists there; each list supports
-multiple keys and is round-robin. Brave searches are delegated to Brave's
-official MCP server. No keys are placed in `mcp.toml` or in the Codex command.
+`~/.codex/web-search-mcp.toml` (or under the `--codex-home` directory). Setup
+prompts for Brave and Tavily API keys and stores them in the corresponding
+`api_keys` lists; the configuration also supports adding more keys manually
+for round-robin use. Brave searches are delegated to Brave's official MCP
+server. No keys are placed in `mcp.toml` or in the Codex command.
 
 The server exposes three intent-level tools: `web_search`, `fetch_content`, and
 `tavily_research`. They do not expose provider selection, provider-specific

@@ -13,3 +13,13 @@ command = "uv"
 args = ["run", "--script", "{REPO_ROOT}/mcp/web_search_mcp.py", "--config", "{CODEX_HOME}/web-search-mcp.toml"]
 config_template = "mcp/web-search-mcp.toml"
 config_path = "{CODEX_HOME}/web-search-mcp.toml"
+
+[[mcp.web-search.credentials]]
+label = "Brave Search API key"
+config_table = "providers.brave"
+config_key = "api_keys"
+
+[[mcp.web-search.credentials]]
+label = "Tavily API key"
+config_table = "providers.tavily"
+config_key = "api_keys"
