@@ -2,10 +2,14 @@
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import sys
 import uuid
 import urllib.request
 import urllib.error
+
+import yaml
 
 BASE_URL = "https://litellm.v-rail.org"
 MODELS_ENDPOINT = f"{BASE_URL}/v1/models"
@@ -97,13 +101,12 @@ def find_existing_api_key():
         if token:
             return token, claude_path
 
-    # Factory Droid
-    droid_path = os.path.join(HOME, ".factory", "settings.json")
-    data = read_json(droid_path)
-    for m in data.get("customModels", []):
-        base = m.get("baseUrl", "")
-        if base.startswith(BASE_URL) and m.get("apiKey"):
-            return m["apiKey"], droid_path
+    # Oh My Pi (omp)
+    omp_path = os.path.join(HOME, ".omp", "agent", "models.yml")
+    data = read_yaml(omp_path)
+    for prov in data.get("providers", {}).values():
+        if str(prov.get("baseUrl", "")).startswith(BASE_URL) and prov.get("apiKey"):
+            return prov["apiKey"], omp_path
 
     # OpenCode
     oc_path = os.path.join(HOME, ".config", "opencode", "opencode.json")
@@ -182,6 +185,34 @@ def write_json(path, data):
         json.dump(data, f, indent=2)
         f.write("\n")
     print(f"  Written: {path}")
+
+
+def read_yaml(path):
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return yaml.safe_load(f) or {}
+        except yaml.YAMLError:
+            return {}
+    return {}
+
+
+def write_yaml(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        yaml.safe_dump(data, f, sort_keys=False, default_flow_style=False)
+    print(f"  Written: {path}")
+
+
+def ensure_omp_installed():
+    """Install the Oh My Pi (omp) CLI via its official installer if missing."""
+    if shutil.which("omp"):
+        return
+    print("  omp not found on PATH; installing via official installer...")
+    subprocess.run(
+        ["bash", "-c", "curl -fsSL https://omp.sh/install | sh"],
+        check=True,
+    )
 
 
 def print_model_list(models):
@@ -313,6 +344,54 @@ def setup_kilocode(api_key, models):
         print(f"  Skipped cache (not found): {cache_path}")
 
 
+def setup_omp(api_key, models):
+    print("\n[Oh My Pi (omp)] Configuring v-rail provider with auto-discovery...")
+    ensure_omp_installed()
+
+    agent_dir = os.path.join(HOME, ".omp", "agent")
+
+    # models.yml: custom providers pointing at the v-rail CLIProxyAPI gateway.
+    # - v-rail: chat models, auto-discovered from the OpenAI-compatible
+    #   /v1/models endpoint at runtime (the harness-native equivalent of Claude
+    #   Code gateway model discovery), so we never hand-maintain a model list.
+    # - openai-codex: powers omp's OpenAI/ChatGPT-style web search provider.
+    #   omp's codex search adapter resolves an API key for custom endpoints
+    #   from this provider entry and calls {baseUrl}/codex/responses with the
+    #   hosted web_search tool (it refuses OAuth/env credentials for custom
+    #   endpoints, so the pinned apiKey is required).
+    models_path = os.path.join(agent_dir, "models.yml")
+    models_data = {
+        "providers": {
+            "v-rail": {
+                "baseUrl": f"{BASE_URL}/v1",
+                "api": "openai-completions",
+                "apiKey": api_key,
+                "authHeader": True,
+                "discovery": {"type": "openai-models-list"},
+            },
+            "openai-codex": {
+                "baseUrl": f"{BASE_URL}/v1",
+                "api": "openai-codex-responses",
+                "apiKey": api_key,
+            },
+        }
+    }
+    write_yaml(models_path, models_data)
+
+    # config.yml: pin a default role only if none is set yet (an existing
+    # choice is preserved), and prefer the OpenAI (codex) search provider.
+    config_path = os.path.join(agent_dir, "config.yml")
+    config_data = read_yaml(config_path)
+    config_data.setdefault("modelRoles", {})
+    config_data["modelRoles"].setdefault("default", f"v-rail/{models[0]}")
+    config_data.setdefault("providers", {})
+    config_data["providers"]["webSearchOrder"] = ["codex"]
+    write_yaml(config_path, config_data)
+    print(f"  Default model: {config_data['modelRoles']['default']} (full list auto-discovered at runtime)")
+    print("  Web search: OpenAI (codex) provider via v-rail, pinned first in webSearchOrder")
+    print(f"  Verify with: omp models find v-rail")
+
+
 def setup_codex(api_key, models):
     print("\n[Codex] Setting up config...")
     enable_standalone_search = detect_standalone_web_search(api_key, models)
@@ -391,6 +470,7 @@ AGENT_NAMES = {
     "opencode": "OpenCode (~/.config/opencode/)",
     "kilocode": "KiloCode (~/.local/share/kilo/, ~/.cache/kilo/)",
     "codex": "Codex (~/.codex/)",
+    "omp": "Oh My Pi (~/.omp/agent/)",
 }
 
 
@@ -416,6 +496,10 @@ def main():
         help="Setup KiloCode",
     )
     parser.add_argument("--codex", action="store_true", help="Setup Codex")
+    parser.add_argument(
+        "--omp", "--oh-my-pi", dest="omp", action="store_true",
+        help="Setup Oh My Pi (omp)",
+    )
 
     args = parser.parse_args()
 
@@ -430,11 +514,13 @@ def main():
         selected.append("kilocode")
     if args.codex:
         selected.append("codex")
+    if args.omp:
+        selected.append("omp")
 
     if not selected:
         parser.error(
             "Specify at least one agent: --claude, --droid/--factory, "
-            "--opencode, --kilo/--kilocode, --codex"
+            "--opencode, --kilo/--kilocode, --codex, --omp/--oh-my-pi"
         )
 
     print(f"Fetching models from {MODELS_ENDPOINT}...")
@@ -442,7 +528,7 @@ def main():
     print(f"Found {len(models)} models.")
 
     # Agents that do full overwrite of model lists
-    overwrite_agents = [a for a in selected if a in ("droid", "opencode", "kilocode")]
+    overwrite_agents = [a for a in selected if a in ("droid", "opencode", "kilocode", "omp")]
     if overwrite_agents:
         confirm_overwrite([AGENT_NAMES[a] for a in overwrite_agents])
 
@@ -456,6 +542,8 @@ def main():
         setup_kilocode(api_key, models)
     if "codex" in selected:
         setup_codex(api_key, models)
+    if "omp" in selected:
+        setup_omp(api_key, models)
 
     print("\nDone.")
 
