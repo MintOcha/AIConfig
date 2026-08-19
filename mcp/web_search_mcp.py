@@ -185,6 +185,13 @@ def _string(data: dict[str, Any], key: str, default: str) -> str:
     return value.strip()
 
 
+def _optional_string(data: dict[str, Any], key: str) -> str:
+    value = data.get(key, "")
+    if not isinstance(value, str):
+        raise ConfigurationError(f"{key} must be a string")
+    return value.strip()
+
+
 def _command(
     provider: dict[str, Any],
     provider_name: str,
@@ -260,11 +267,7 @@ def load_config(path: Path) -> RouterConfig:
             "base_url",
             "https://litellm.v-rail.org/v1",
         ),
-        codex_standalone_model=_string(
-            codex_standalone,
-            "model",
-            "gpt-5.6-sol",
-        ),
+        codex_standalone_model=_optional_string(codex_standalone, "model"),
         tavily_keys=_api_keys(tavily, "tavily"),
         tavily_endpoint=endpoint,
         brave_cooldown_seconds=_number(search, "brave_cooldown_seconds", 1.0),

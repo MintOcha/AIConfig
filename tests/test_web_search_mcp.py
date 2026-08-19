@@ -36,7 +36,7 @@ def router_config(
         duckduckgo_enabled=False,
         codex_standalone_keys=codex_standalone_keys,
         codex_standalone_base_url=codex_standalone_base_url,
-        codex_standalone_model="gpt-5.6-sol",
+        codex_standalone_model="",
         tavily_keys=tavily_keys,
         tavily_endpoint="https://mcp.tavily.com/mcp/",
         brave_cooldown_seconds=1.0,
@@ -170,7 +170,7 @@ class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
         body = json.loads(request.content)
         self.assertEqual(str(request.url), "https://example.test/v1/alpha/search")
         self.assertEqual(request.headers["Authorization"], "Bearer secret")
-        self.assertEqual(body["model"], "gpt-5.6-sol")
+        self.assertEqual(body["model"], "")
         self.assertEqual(body["commands"], {"search_query": [{"q": "OpenAI docs"}]})
         self.assertTrue(body["id"])
         self.assertEqual(

@@ -81,8 +81,9 @@ OMP exposes the concise `web/search`, `web/fetch`, and `web/research` tool set,
 mounted as `mcp__web_search`, `mcp__web_fetch`, and `mcp__web_research`.
 
 Codex standalone search uses an API key with
-`POST {base_url}/alpha/search`; its defaults are
-`https://litellm.v-rail.org/v1` and `gpt-5.6-sol`. It is a separate protocol
+`POST {base_url}/alpha/search`; it defaults to
+`https://litellm.v-rail.org/v1` with an empty `model` so the backend chooses
+its own default model. It is a separate protocol
 from Codex OAuth and the Responses API. Brave searches are delegated to
 Brave's official MCP server. Each keyed provider accepts multiple keys in the
 configuration file and rotates through them in order.
