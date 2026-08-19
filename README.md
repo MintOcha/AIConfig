@@ -47,6 +47,13 @@ registry at `~/.omp/agent/mcp.json`. OMP-specific runs show only MCP setup and
 exit choices; Codex prompt and skill installation remain available in the
 default mode.
 
+Use `./scripts/install.sh --freebuff` to install into Freebuff. MCPs are merged
+into `~/.agents/mcp.json`, skills are linked under `~/.agents/skills`, and the
+selected prompt is inlined into `~/.AGENTS.md`. Freebuff reads user knowledge
+files directly and does not resolve `@path` imports, so prompt content is copied
+rather than referenced. Use `--freebuff-home PATH` for a different Freebuff home
+directory.
+
 The main menu installs MCPs, the shared prompt, or skills as independent
 choices. Installing a prompt or skill never reinstalls MCPs or touches their
 credentials. MCPs are discovered from [`mcp.toml`](mcp.toml), so adding another entry only

@@ -58,6 +58,10 @@ Options:
   --dry-run             Exercise the menus without changing anything
   --codex-home PATH     Use a specific Codex home instead of ~/.codex
   --omp                  Install MCPs into ~/.omp/agent/mcp.json
+  --droid, --factory     Install into Factory Droid (~/.factory)
+  --factory-home PATH    Use a specific Factory Droid home instead of ~/.factory
+  --freebuff             Install into Freebuff (~/.agents)
+  --freebuff-home PATH   Use a specific Freebuff home instead of ~/.agents
 EOF
 }
 
@@ -502,7 +506,7 @@ install_mcp() {
       printf '%s\n' "Dry run: would install MCP: $server_id"
       return 0
     fi
-    if [[ "$target_agent" == "omp" ]]; then
+    if [[ "$target_agent" == "omp" || "$target_agent" == "droid" || "$target_agent" == "freebuff" ]]; then
       write_omp_mcp "$server_id" url "$url"
     else
       codex_command mcp remove "$server_id" >/dev/null 2>&1 || true
@@ -524,7 +528,7 @@ install_mcp() {
       printf '%s\n' "Dry run: would install MCP: $server_id"
       return 0
     fi
-    if [[ "$target_agent" == "omp" ]]; then
+    if [[ "$target_agent" == "omp" || "$target_agent" == "droid" || "$target_agent" == "freebuff" ]]; then
       write_omp_mcp "$server_id" stdio "$command_name" "${command_args[@]}"
     else
       codex_command mcp remove "$server_id" >/dev/null 2>&1 || true
@@ -537,7 +541,7 @@ install_mcp() {
 }
 
 install_mcps() {
-  [[ "$target_agent" == "omp" ]] || require_command codex
+  [[ "$target_agent" == "omp" || "$target_agent" == "droid" || "$target_agent" == "freebuff" ]] || require_command codex
   select_mcp_ids || return 1
   local server_id
   for server_id in "${selected_mcp_ids[@]}"; do
@@ -599,8 +603,41 @@ select_prompt_source() {
   IFS=$'\t' read -r _ _ selected_prompt_path <<< "${entries[prompt_number]}"
 }
 
+install_freebuff_prompt() {
+  local target="${HOME}/.AGENTS.md"
+  local prompt_name
+  prompt_name="$(basename "$selected_prompt_path" .md)"
+  local marker="AIConfig prompt: ${prompt_name}"
+
+  if ((dry_run)); then
+    printf '%s\n' "Preview: would inline $selected_prompt_path into $target"
+    return 0
+  fi
+
+  if [[ -e "$target" ]] && grep -Fq "$marker" "$target"; then
+    printf '%s\n' "Already installed in $target"
+    return 0
+  fi
+
+  {
+    [[ -e "$target" ]] && printf '\n'
+    printf '# %s\n' "$marker"
+    printf '%s\n' "<!-- installed from ${selected_prompt_path} by scripts/install.sh -->"
+    printf '\n'
+    cat "$selected_prompt_path"
+    printf '\n'
+  } >> "$target"
+  success "Prompt inlined through $target"
+}
+
 install_prompt() {
   select_prompt_source || return 0
+
+  if [[ "$target_agent" == "freebuff" ]]; then
+    install_freebuff_prompt
+    return 0
+  fi
+
   local target="${target_home}/AGENTS.md"
   local import_line="@${selected_prompt_path}"
 
@@ -753,7 +790,7 @@ select_skill_set() {
 }
 
 install_skills() {
-  require_command codex
+  [[ "$target_agent" == "droid" || "$target_agent" == "freebuff" ]] || require_command codex
   local skills_dir="${target_home}/skills"
   select_skill_set || return 1
 
@@ -794,8 +831,8 @@ menu() {
     case "$choice" in
       1) install_mcps || true ;;
       2) [[ "$target_agent" == "omp" ]] && return 0; install_prompt || true ;;
-      3) [[ "$target_agent" == "codex" ]] && install_skills || true ;;
-      4) [[ "$target_agent" == "codex" ]] && return 0 ;;
+      3) [[ "$target_agent" != "omp" ]] && install_skills || true ;;
+      4) [[ "$target_agent" != "omp" ]] && return 0 ;;
       *) warning 'Please choose one of the displayed options.' ;;
     esac
   done
@@ -814,6 +851,28 @@ while (($# > 0)); do
       target_agent="omp"
       target_home="${HOME}/.omp/agent"
       shift
+      ;;
+    --droid|--factory)
+      target_agent="droid"
+      target_home="${HOME}/.factory"
+      shift
+      ;;
+    --factory-home|--droid-home)
+      [[ $# -ge 2 ]] || { failure '--factory-home requires a path.'; exit 2; }
+      target_agent="droid"
+      target_home="$2"
+      shift 2
+      ;;
+    --freebuff)
+      target_agent="freebuff"
+      target_home="${FREEBUFF_HOME:-${HOME}/.agents}"
+      shift
+      ;;
+    --freebuff-home)
+      [[ $# -ge 2 ]] || { failure '--freebuff-home requires a path.'; exit 2; }
+      target_agent="freebuff"
+      target_home="$2"
+      shift 2
       ;;
     *) usage >&2; exit 2 ;;
   esac
