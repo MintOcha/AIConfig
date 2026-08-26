@@ -311,6 +311,10 @@ def update_managed_text(path, marker, block):
     start_marker = f"# >>> {marker} >>>"
     end_marker = f"# <<< {marker} <<<"
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    meaningful = "\n".join(
+        line for line in existing.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ).strip()
     managed = f"{start_marker}\n{block.rstrip()}\n{end_marker}\n"
     start = existing.find(start_marker)
     if start >= 0:
@@ -320,7 +324,7 @@ def update_managed_text(path, marker, block):
             sys.exit(1)
         end += len(end_marker)
         updated = existing[:start] + managed + existing[end:].lstrip("\n")
-    elif existing.strip() in ("", "[]"):
+    elif meaningful in ("", "[]"):
         updated = managed
     else:
         updated = existing.rstrip() + "\n\n" + managed
@@ -347,6 +351,15 @@ def ensure_omp_installed():
         ["bash", "-c", "curl -fsSL https://omp.sh/install | sh"],
         check=True,
     )
+
+
+def resolve_user_command(name):
+    """Find a command on PATH or in an installed NVM Node version."""
+    candidates = list((Path(HOME) / ".nvm" / "versions" / "node").glob(f"*/bin/{name}"))
+    if candidates:
+        return max(candidates, key=lambda path: path.stat().st_mtime)
+    command = shutil.which(name)
+    return Path(command) if command else None
 
 
 def print_model_list(models):
@@ -595,6 +608,24 @@ def setup_codex(api_key, models):
 
 def setup_dsh(api_key, models):
     """Install AIConfig's prompt, skills, proxy models, and web MCP into DSH."""
+    dsh_command = resolve_user_command("dsh")
+    if dsh_command is None:
+        print("\n[DeepSeek Harness] Installing the official npm package...")
+        npm_command = resolve_user_command("npm")
+        if npm_command is None:
+            print("npm is required to install DeepSeek Harness.", file=sys.stderr)
+            sys.exit(1)
+        subprocess.run(
+            [str(npm_command), "install", "--global", "@deepseek-ai/dsh@latest"],
+            check=True,
+        )
+        dsh_command = npm_command.with_name("dsh")
+        if not dsh_command.is_file():
+            dsh_command = resolve_user_command("dsh")
+        if dsh_command is None:
+            print("The DSH install completed but dsh was not found.", file=sys.stderr)
+            sys.exit(1)
+
     dsh_home = Path(os.environ.get("DSH_HOME", os.path.join(HOME, ".dsh"))).expanduser()
     dsh_home.mkdir(parents=True, exist_ok=True)
     os.chmod(dsh_home, 0o700)
@@ -710,8 +741,42 @@ endpoint = "https://mcp.tavily.com/mcp/"
         failOnStartupError: true
 '''
     update_managed_text(dsh_home / "cordis.patch.yml", "AIConfig DSH integration", patch_block)
+
+    print("  Installing the maintained terminal UI...")
+    dsh_env = os.environ.copy()
+    dsh_env["PATH"] = os.pathsep.join(
+        [str(dsh_command.parent), dsh_env.get("PATH", "")]
+    )
+    subprocess.run(
+        [str(dsh_command), "plugin", "--profile", "martty", "add", "martty@latest"],
+        check=True,
+        env=dsh_env,
+    )
+    tui_patch = f'''- id: tui-acp-host
+  config:
+    provider: cliproxyapi
+    model: {DEFAULT_DSH_MODEL}
+'''
+    update_managed_text(
+        dsh_home / "profiles" / "martty" / "cordis.patch.yml",
+        "AIConfig DSH TUI integration",
+        tui_patch,
+    )
+    shell_function = '''dsh() {
+  if [ "$#" -eq 0 ]; then
+    command dsh --profile martty
+  else
+    command dsh "$@"
+  fi
+}'''
+    update_managed_text(
+        Path(HOME) / ".bashrc",
+        "AIConfig DSH launcher",
+        shell_function,
+    )
     print("  Web MCP: mcp__web__search, mcp__web__fetch, mcp__web__research")
     print("  Codex search auth: selected CLIProxyAPI key (DuckDuckGo fallback enabled)")
+    print("  Terminal UI: run dsh in a new Bash shell")
 
 
 AGENT_NAMES = {

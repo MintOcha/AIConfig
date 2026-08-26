@@ -58,10 +58,12 @@ Use `./scripts/install.sh --dsh` for the published DeepSeek Harness install. It
 discovers the first CLIProxyAPI `api-keys` value with exactly four hyphens,
 configures the local OpenAI-compatible endpoint, writes the built-in model
 catalog and default `gpt-5.6-sol`, copies the coding prompt, links all AIConfig
-skills, and installs the `mcp__web__search`/`fetch`/`research` bridge. The key is
-stored only in DSH's owner-readable credentials/config files. DSH itself should
-be installed with the official npm package (`npm install --global
-@deepseek-ai/dsh`); this repository does not build a DSH source checkout.
+skills, installs the `mcp__web__search`/`fetch`/`research` bridge, and installs
+the maintained Martty terminal profile. In a new Bash shell, bare `dsh` opens
+the TUI while arguments such as `dsh --version` continue to reach the official
+CLI. The key is stored only in DSH's owner-readable credentials/config files.
+If needed, the script installs DSH from its official npm package; this
+repository does not build a DSH source checkout.
 
 The main menu installs MCPs, the shared prompt, or skills as independent
 choices. Installing a prompt or skill never reinstalls MCPs or touches their
