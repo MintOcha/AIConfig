@@ -24,7 +24,9 @@ import tomllib
 from fastmcp import Client, FastMCP
 from fastmcp.client.transports import StdioTransport
 
-SEARCH_PROVIDERS = ("brave", "duckduckgo", "codex_standalone", "tavily")
+# CLIProxyAPI is the configured first-party search backend. Other providers
+# remain failover options when its Codex route is unavailable.
+SEARCH_PROVIDERS = ("codex_standalone", "brave", "duckduckgo", "tavily")
 
 
 class ConfigurationError(ValueError):

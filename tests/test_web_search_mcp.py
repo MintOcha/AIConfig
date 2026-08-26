@@ -284,9 +284,9 @@ class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
         fourth = await router.search("fourth", 5)
         fifth = await router.search("fifth", 5)
 
-        self.assertEqual(first[0]["title"], "Brave")
-        self.assertEqual(second[0]["title"], "DDG")
-        self.assertEqual(third[0]["title"], "Codex")
+        self.assertEqual(first[0]["title"], "Codex")
+        self.assertEqual(second[0]["title"], "Brave")
+        self.assertEqual(third[0]["title"], "DDG")
         self.assertEqual(fourth[0]["title"], "Tavily")
         self.assertEqual(fifth[0]["title"], "Tavily")
         self.assertEqual(router._search_duckduckgo.await_count, 2)

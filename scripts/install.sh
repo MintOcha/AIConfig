@@ -10,6 +10,7 @@ prompts_file="${repo_root}/prompts.toml"
 prompts_dir="${repo_root}/prompts"
 dry_run=0
 selected_prompt_path=""
+dsh_mode=0
 
 shopt -s nullglob
 
@@ -58,6 +59,7 @@ Options:
   --dry-run             Exercise the menus without changing anything
   --codex-home PATH     Use a specific Codex home instead of ~/.codex
   --omp                  Install MCPs into ~/.omp/agent/mcp.json
+  --dsh                  Install AIConfig prompt, skills, web MCP, and CLIProxyAPI models into DSH
   --droid, --factory     Install into Factory Droid (~/.factory)
   --factory-home PATH    Use a specific Factory Droid home instead of ~/.factory
   --freebuff             Install into Freebuff (~/.agents)
@@ -852,6 +854,12 @@ while (($# > 0)); do
       target_home="${HOME}/.omp/agent"
       shift
       ;;
+    --dsh)
+      target_agent="dsh"
+      target_home="${DSH_HOME:-${HOME}/.dsh}"
+      dsh_mode=1
+      shift
+      ;;
     --droid|--factory)
       target_agent="droid"
       target_home="${HOME}/.factory"
@@ -877,5 +885,14 @@ while (($# > 0)); do
     *) usage >&2; exit 2 ;;
   esac
 done
+
+if ((dsh_mode)); then
+  if ((dry_run)); then
+    printf '%s\n' "Dry run: would run setup-agent.py --dsh"
+    exit 0
+  fi
+  require_command python3
+  exec python3 "${repo_root}/scripts/setup-agent.py" --dsh
+fi
 
 menu
