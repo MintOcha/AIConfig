@@ -344,7 +344,7 @@ def update_managed_text(path, marker, block):
 
 def ensure_omp_installed():
     """Install the Oh My Pi (omp) CLI via its official installer if missing."""
-    if shutil.which("omp"):
+    if resolve_user_command("omp"):
         return
     print("  omp not found on PATH; installing via official installer...")
     subprocess.run(
@@ -355,6 +355,9 @@ def ensure_omp_installed():
 
 def resolve_user_command(name):
     """Find a command on PATH or in an installed NVM Node version."""
+    bun_command = Path(HOME) / ".bun" / "bin" / name
+    if bun_command.is_file():
+        return bun_command
     candidates = list((Path(HOME) / ".nvm" / "versions" / "node").glob(f"*/bin/{name}"))
     if candidates:
         return max(candidates, key=lambda path: path.stat().st_mtime)
@@ -525,12 +528,39 @@ def setup_omp(api_key, models):
     config_path = os.path.join(agent_dir, "config.yml")
     config_data = read_yaml(config_path)
     config_data.setdefault("modelRoles", {})
-    config_data["modelRoles"].setdefault("default", f"v-rail/{models[0]}")
+    preferred_model = DEFAULT_DSH_MODEL if DEFAULT_DSH_MODEL in models else models[0]
+    config_data["modelRoles"].setdefault("default", f"v-rail/{preferred_model}")
     config_data.setdefault("providers", {})
     config_data["providers"]["webSearchOrder"] = ["codex"]
     write_yaml(config_path, config_data)
     print(f"  Default model: {config_data['modelRoles']['default']} (full list auto-discovered at runtime)")
     print("  Web search: OpenAI (codex) provider via v-rail, pinned first in webSearchOrder")
+
+    prompt_path = REPO_ROOT / "prompts" / "coding-rules.md"
+    prompt_block = f"@{prompt_path}"
+    update_managed_text(
+        Path(agent_dir) / "AGENTS.md",
+        "AIConfig prompt: coding-rules",
+        prompt_block,
+    )
+
+    skills_dir = Path(HOME) / ".agents" / "skills"
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    linked_skills = 0
+    for source in sorted((REPO_ROOT / "skill").iterdir()):
+        if not source.is_dir() or not (source / "SKILL.md").is_file():
+            continue
+        target = skills_dir / source.name
+        if target.is_symlink() and target.resolve() == source.resolve():
+            linked_skills += 1
+            continue
+        if target.exists() or target.is_symlink():
+            print(f"  Skipped existing non-AIConfig skill: {target}", file=sys.stderr)
+            continue
+        target.symlink_to(source, target_is_directory=True)
+        linked_skills += 1
+        print(f"  Linked skill: {source.name}")
+    print(f"  Skills available to OMP: {linked_skills}")
     print(f"  Verify with: omp models find v-rail")
 
 
