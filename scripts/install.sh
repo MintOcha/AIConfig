@@ -10,7 +10,6 @@ prompts_file="${repo_root}/prompts.toml"
 prompts_dir="${repo_root}/prompts"
 dry_run=0
 selected_prompt_path=""
-dsh_mode=0
 
 shopt -s nullglob
 
@@ -59,9 +58,6 @@ Options:
   --dry-run             Exercise the menus without changing anything
   --codex-home PATH     Use a specific Codex home instead of ~/.codex
   --omp                  Install MCPs into ~/.omp/agent/mcp.json
-  --dsh                  Install AIConfig prompt, skills, web MCP, and CLIProxyAPI models into DSH
-  --droid, --factory     Install into Factory Droid (~/.factory)
-  --factory-home PATH    Use a specific Factory Droid home instead of ~/.factory
   --freebuff             Install into Freebuff (~/.agents)
   --freebuff-home PATH   Use a specific Freebuff home instead of ~/.agents
 EOF
@@ -508,7 +504,7 @@ install_mcp() {
       printf '%s\n' "Dry run: would install MCP: $server_id"
       return 0
     fi
-    if [[ "$target_agent" == "omp" || "$target_agent" == "droid" || "$target_agent" == "freebuff" ]]; then
+    if [[ "$target_agent" == "omp" || "$target_agent" == "freebuff" ]]; then
       write_omp_mcp "$server_id" url "$url"
     else
       codex_command mcp remove "$server_id" >/dev/null 2>&1 || true
@@ -530,7 +526,7 @@ install_mcp() {
       printf '%s\n' "Dry run: would install MCP: $server_id"
       return 0
     fi
-    if [[ "$target_agent" == "omp" || "$target_agent" == "droid" || "$target_agent" == "freebuff" ]]; then
+    if [[ "$target_agent" == "omp" || "$target_agent" == "freebuff" ]]; then
       write_omp_mcp "$server_id" stdio "$command_name" "${command_args[@]}"
     else
       codex_command mcp remove "$server_id" >/dev/null 2>&1 || true
@@ -792,7 +788,7 @@ select_skill_set() {
 }
 
 install_skills() {
-  [[ "$target_agent" == "droid" || "$target_agent" == "freebuff" ]] || require_command codex
+  [[ "$target_agent" == "freebuff" ]] || require_command codex
   local skills_dir="${target_home}/skills"
   select_skill_set || return 1
 
@@ -854,23 +850,6 @@ while (($# > 0)); do
       target_home="${HOME}/.omp/agent"
       shift
       ;;
-    --dsh)
-      target_agent="dsh"
-      target_home="${DSH_HOME:-${HOME}/.dsh}"
-      dsh_mode=1
-      shift
-      ;;
-    --droid|--factory)
-      target_agent="droid"
-      target_home="${HOME}/.factory"
-      shift
-      ;;
-    --factory-home|--droid-home)
-      [[ $# -ge 2 ]] || { failure '--factory-home requires a path.'; exit 2; }
-      target_agent="droid"
-      target_home="$2"
-      shift 2
-      ;;
     --freebuff)
       target_agent="freebuff"
       target_home="${FREEBUFF_HOME:-${HOME}/.agents}"
@@ -886,13 +865,5 @@ while (($# > 0)); do
   esac
 done
 
-if ((dsh_mode)); then
-  if ((dry_run)); then
-    printf '%s\n' "Dry run: would run setup-agent.py --dsh"
-    exit 0
-  fi
-  require_command python3
-  exec python3 "${repo_root}/scripts/setup-agent.py" --dsh
-fi
 
 menu
