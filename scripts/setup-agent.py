@@ -539,6 +539,16 @@ def setup_omp(api_key, models):
     print(f"  Default model: {config_data['modelRoles']['default']} (full list auto-discovered at runtime)")
     print("  Web search: OpenAI (codex) provider via v-rail, pinned first in webSearchOrder")
 
+    # Make the primary model shortcut use OMP's session-only picker, which
+    # closes immediately after selection. Keep the role editor available on a
+    # less prominent chord for users who need persistent role assignments.
+    keybindings_path = os.path.join(agent_dir, "keybindings.json")
+    keybindings_data = read_json(keybindings_path)
+    keybindings_data["app.model.selectTemporary"] = ["Alt+M", "Alt+P"]
+    keybindings_data["app.model.select"] = "Ctrl+Alt+M"
+    write_json(keybindings_path, keybindings_data)
+    print("  Model picker: Alt+M/Alt+P switches immediately; Ctrl+Alt+M edits roles")
+
     prompt_path = REPO_ROOT / "prompts" / "coding-rules.md"
     prompt_block = f"@{prompt_path}"
     update_managed_text(
