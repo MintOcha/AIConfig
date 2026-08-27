@@ -529,7 +529,10 @@ def setup_omp(api_key, models):
     config_data = read_yaml(config_path)
     config_data.setdefault("modelRoles", {})
     preferred_model = DEFAULT_DSH_MODEL if DEFAULT_DSH_MODEL in models else models[0]
-    config_data["modelRoles"].setdefault("default", f"v-rail/{preferred_model}")
+    config_data["modelRoles"]["default"] = f"v-rail/{preferred_model}"
+    disabled_providers = config_data.setdefault("disabledProviders", [])
+    if "claude" not in disabled_providers:
+        disabled_providers.append("claude")
     config_data.setdefault("providers", {})
     config_data["providers"]["webSearchOrder"] = ["codex"]
     write_yaml(config_path, config_data)
