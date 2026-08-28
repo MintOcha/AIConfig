@@ -678,19 +678,20 @@ class SearchRouter:
 mcp = FastMCP(
     "Web Search Router",
     instructions=(
-        "Search and fetch web content without selecting a provider. Routing, "
-        "fallbacks, cooldowns, and provider parameter translation are automatic."
+        "Search the live internet for current results with web-search, fetch page "
+        "content, or run research. This is the single entry point with automatic "
+        "provider routing and failover; prefer it over provider-specific MCPs."
     ),
 )
 router: SearchRouter | None = None
 
 
-@mcp.tool(name="search")
+@mcp.tool(name="web-search")
 async def web_search(
     query: str,
     max_results: int = 10,
 ) -> list[dict[str, str]]:
-    """Search the web. Provider routing and failover are automatic."""
+    """Search the live internet and return current results. This is the single entry point with automatic provider routing and failover; prefer it over provider-specific MCPs."""
     if not query.strip():
         raise ValueError("query must not be empty")
     if not 1 <= max_results <= 20:
@@ -703,7 +704,7 @@ async def web_search(
 
 @mcp.tool(name="fetch")
 async def fetch_content(urls: list[str]) -> list[dict[str, str]]:
-    """Fetch readable Markdown content from one or more web URLs."""
+    """Fetch readable page content as part of the web toolset. Prefer this single entry point over provider-specific MCPs."""
     if router is None:
         raise RuntimeError("Web search router has not been configured")
     return await router.fetch_content(_validate_urls(urls))
@@ -711,7 +712,7 @@ async def fetch_content(urls: list[str]) -> list[dict[str, str]]:
 
 @mcp.tool(name="research")
 async def tavily_research(task: str) -> str:
-    """Run an in-depth web research task and return the finished report."""
+    """Run in-depth live-web research through the routed web toolset. Prefer this single entry point over provider-specific MCPs."""
     if not task.strip():
         raise ValueError("task must not be empty")
     if router is None:

@@ -17,6 +17,7 @@ from web_search_mcp import (
     RoundRobinKeys,
     RouterConfig,
     SearchRouter,
+    mcp,
 )
 
 
@@ -137,6 +138,15 @@ class FakeCodexFactory:
             return httpx.Response(200, json=self.payload)
 
         return httpx.AsyncClient(transport=httpx.MockTransport(handle), timeout=timeout)
+
+
+class ServerToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_web_search_tool_is_explicitly_named(self) -> None:
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
+
+        self.assertEqual(set(tools), {"web-search", "fetch", "research"})
+        self.assertIn("Search the live internet", tools["web-search"].description)
+        self.assertIn("single entry point", tools["web-search"].description)
 
 
 class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):

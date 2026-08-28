@@ -77,8 +77,8 @@ through hidden input; configured providers receive a green checkmark.
 DuckDuckGo is disabled by default and its menu item toggles it directly. The
 menu also offers to edit the complete configuration in Vim before installing.
 No keys are placed in `mcp.toml` or in an agent command.
-OMP exposes the concise `web/search`, `web/fetch`, and `web/research` tool set,
-mounted as `mcp__web_search`, `mcp__web_fetch`, and `mcp__web_research`.
+OMP exposes the explicit `web.web-search`, `web.fetch`, and `web.research`
+tool set.
 
 Codex standalone search uses an API key with
 `POST {base_url}/alpha/search`; it defaults to
@@ -88,11 +88,11 @@ from Codex OAuth and the Responses API. Brave searches are delegated to
 Brave's official MCP server. Each keyed provider accepts multiple keys in the
 configuration file and rotates through them in order.
 
-The server exposes three intent-level tools: `search`, `fetch`, and `research`.
-They do not expose provider selection, provider-specific
-search options, or routing metadata. `search` translates its generic query
-and result limit for each backend and round-robins through Brave, DuckDuckGo,
-Codex standalone, and Tavily. Unconfigured or disabled providers are skipped.
+The server exposes three intent-level tools: `web-search`, `fetch`, and
+`research`. They do not expose provider selection, provider-specific search
+options, or routing metadata. `web-search` searches the live internet for
+current results and round-robins through Brave, DuckDuckGo, Codex standalone,
+and Tavily. Unconfigured or disabled providers are skipped.
 If the selected provider fails, the same request advances through the remaining
 providers and returns an error only if all of them fail. DuckDuckGo bot
 detection, HTTP 429s, empty responses, and other request failures start a local
