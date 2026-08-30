@@ -1,8 +1,9 @@
 modelRoles:
   default: v-rail/gemini-3.7-flash-high:medium
-  advisor: v-rail/gemini-3.7-flash-high
-  smol: v-rail/gemini-3.7-flash-high
-  task: v-rail/gpt-5.6-sol
+  smol: v-rail/gpt-5.6-luna
+  slow: v-rail/gpt-5.6-sol
+  task: v-rail/gemini-3.7-flash-high
+  designer: v-rail/claude-opus-5
 disabledProviders:
   - claude
 providers:
