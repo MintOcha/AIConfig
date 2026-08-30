@@ -1,0 +1,31 @@
+modelRoles:
+  default: v-rail/gemini-3.7-flash-high:medium
+  advisor: v-rail/gemini-3.7-flash-high
+  smol: v-rail/gemini-3.7-flash-high
+  task: v-rail/gpt-5.6-sol
+disabledProviders:
+  - claude
+providers:
+  webSearchOrder:
+    - codex
+symbolPreset: unicode
+composer:
+  shape: claude
+theme:
+  dark: titanium
+  light: light
+setupVersion: 2
+steeringMode: all
+followUpMode: all
+statusLine:
+  preset: nerd
+interruptMode: wait
+tools:
+  approvalMode: yolo
+display:
+  showTokenUsage: true
+extendedContext: false
+compaction:
+  thresholdPercent: -1
+  thresholdTokens: 200000
+  idleEnabled: true

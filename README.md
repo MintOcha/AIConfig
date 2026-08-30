@@ -39,13 +39,17 @@ Launch the setup menu:
 ./scripts/install.sh
 ```
 
-Use `./scripts/install.sh --dry-run` to exercise the menus without
-changing Codex configuration.
+Use `./scripts/install.sh --dry-run` to exercise the menus without changing
+agent configuration.
 
-Use `./scripts/install.sh --omp` to install selected MCPs into OMP's user MCP
-registry at `~/.omp/agent/mcp.json`. OMP-specific runs show only MCP setup and
-exit choices; Codex prompt and skill installation remain available in the
-default mode.
+Use `./scripts/install.sh --omp` to apply the tracked files in `config/omp/` to
+`~/.omp/agent`, then optionally configure MCPs. Existing MCP configuration is
+left untouched until the MCP installer is selected. Run
+`./scripts/sync-omp-config.py` to capture the current machine's allowlisted OMP
+settings (`config.yml` and keybinding files) back into `config/omp/`. The sync
+tool excludes model credentials, MCP configuration, databases, sessions,
+history, caches, and other transient state; it also refuses allowlisted files
+that contain secret-like keys.
 
 Use `./scripts/install.sh --freebuff` to install into Freebuff. MCPs are merged
 into `~/.agents/mcp.json`, skills are linked under `~/.agents/skills`, and the

@@ -8,6 +8,7 @@ mcp_file="${repo_root}/mcp.toml"
 skills_file="${repo_root}/skills.toml"
 prompts_file="${repo_root}/prompts.toml"
 prompts_dir="${repo_root}/prompts"
+omp_config_dir="${repo_root}/config/omp"
 dry_run=0
 selected_prompt_path=""
 
@@ -51,13 +52,14 @@ usage() {
 Usage: ./scripts/install.sh
 
 Launch the interactive setup menu. MCP choices are discovered from mcp.toml,
-skill groups from skills.toml, and prompt metadata from prompts.toml. Secrets
-are requested interactively and are never written to this repository.
+skill groups from skills.toml, and prompt metadata from prompts.toml. OMP runs
+apply tracked settings from config/omp. Secrets are requested interactively and
+are never written to this repository.
 
 Options:
   --dry-run             Exercise the menus without changing anything
   --codex-home PATH     Use a specific Codex home instead of ~/.codex
-  --omp                  Install MCPs into ~/.omp/agent/mcp.json
+  --omp                  Apply saved settings and configure ~/.omp/agent
   --freebuff             Install into Freebuff (~/.agents)
   --freebuff-home PATH   Use a specific Freebuff home instead of ~/.agents
 EOF
@@ -809,6 +811,26 @@ install_skills() {
     fi
   done
 }
+install_omp_config() {
+  [[ -d "$omp_config_dir" ]] || {
+    failure "OMP settings directory not found: $omp_config_dir"
+    return 1
+  }
+
+  local source target
+  for source in "$omp_config_dir"/*; do
+    [[ -f "$source" ]] || continue
+    target="${target_home}/$(basename "$source")"
+    if ((dry_run)); then
+      printf '%s\n' "Preview: would install OMP setting $(basename "$source")"
+      continue
+    fi
+    mkdir -p "$target_home"
+    install -m 600 "$source" "$target"
+    success "Installed OMP setting: $(basename "$source")"
+  done
+}
+
 
 menu() {
   while true; do
@@ -816,8 +838,9 @@ menu() {
     printf '%s\n' 'What would you like to set up?'
     printf '%s\n' '  1) Install MCPs        Select from the catalog'
     if [[ "$target_agent" == "omp" ]]; then
-      printf '%s\n' '  2) Exit'
-      printf '%s' 'Select an option [1-2]: '
+      printf '%s\n' '  2) Apply saved settings Reinstall config/omp files'
+      printf '%s\n' '  3) Exit'
+      printf '%s' 'Select an option [1-3]: '
     else
       printf '%s\n' '  2) Install a prompt    Choose the global instruction set'
       printf '%s\n' '  3) Install skills      Choose a group or individual skills'
@@ -828,8 +851,8 @@ menu() {
 
     case "$choice" in
       1) install_mcps || true ;;
-      2) [[ "$target_agent" == "omp" ]] && return 0; install_prompt || true ;;
-      3) [[ "$target_agent" != "omp" ]] && install_skills || true ;;
+      2) [[ "$target_agent" == "omp" ]] && { install_omp_config || true; continue; }; install_prompt || true ;;
+      3) [[ "$target_agent" == "omp" ]] && return 0; install_skills || true ;;
       4) [[ "$target_agent" != "omp" ]] && return 0 ;;
       *) warning 'Please choose one of the displayed options.' ;;
     esac
@@ -865,5 +888,8 @@ while (($# > 0)); do
   esac
 done
 
+if [[ "$target_agent" == "omp" ]]; then
+  install_omp_config
+fi
 
 menu
