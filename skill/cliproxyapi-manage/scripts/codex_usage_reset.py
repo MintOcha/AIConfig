@@ -2,7 +2,7 @@
 """
 Codex Usage & Reset Manager for CLIProxyAPI
 ===========================================
-Displays 7-day usage metrics for all Codex accounts in the auth directory
+Displays 7-day quota remaining metrics for all Codex accounts in the auth directory
 and allows triggering / redeeming banked usage resets.
 
 Zero external dependencies - runs on standard Python 3.8+.
@@ -297,20 +297,20 @@ def format_duration(seconds: int) -> str:
     return " ".join(parts)
 
 
-def make_progress_bar(percent: float, width: int = 20) -> str:
-    """Create a colored progress bar for usage percent."""
-    percent = max(0.0, min(100.0, float(percent)))
-    filled_len = int(round(width * percent / 100))
+def make_progress_bar(remaining_percent: float, width: int = 20) -> str:
+    """Create a colored progress bar for remaining quota percent."""
+    remaining_percent = max(0.0, min(100.0, float(remaining_percent)))
+    filled_len = int(round(width * remaining_percent / 100))
     empty_len = width - filled_len
     
     bar_color = Colors.GREEN
-    if percent >= 90:
+    if remaining_percent <= 10:
         bar_color = Colors.RED
-    elif percent >= 70:
+    elif remaining_percent <= 30:
         bar_color = Colors.YELLOW
         
     bar = f"{bar_color}{'█' * filled_len}{Colors.DIM}{'░' * empty_len}{Colors.RESET}"
-    return f"[{bar}] {bar_color}{percent:5.1f}%{Colors.RESET}"
+    return f"[{bar}] {bar_color}{remaining_percent:5.1f}%{Colors.RESET}"
 
 
 def display_dashboard(accounts: List[CodexAccount]):
@@ -331,12 +331,13 @@ def display_dashboard(accounts: List[CodexAccount]):
             print(f"  {Colors.RED}Error fetching account status: {acc.fetch_error}{Colors.RESET}")
             continue
 
-        # 7-Day / Primary Window Usage
+        # 7-Day / Primary Window Remaining Quota
         rate_limit = (acc.usage_data.get("rate_limit") or {}) if acc.usage_data else {}
         primary = rate_limit.get("primary_window") if rate_limit else None
         
         if primary:
-            used_pct = primary.get("used_percent", 0) or 0
+            used_pct = float(primary.get("used_percent", 0) or 0)
+            remaining_pct = max(0.0, min(100.0, 100.0 - used_pct))
             limit_reached = rate_limit.get("limit_reached", False) or False
             reset_after = primary.get("reset_after_seconds", 0) or 0
             reset_at_ts = primary.get("reset_at", 0) or 0
@@ -351,17 +352,18 @@ def display_dashboard(accounts: List[CodexAccount]):
                     pass
 
             status_tag = f" {Colors.RED}{Colors.BOLD}[LIMIT REACHED]{Colors.RESET}" if limit_reached else ""
-            print(f"  {Colors.BOLD}7-Day Usage:{Colors.RESET}  {make_progress_bar(used_pct, 24)}{status_tag}")
-            print(f"  {Colors.BOLD}Next Reset:{Colors.RESET}   in {Colors.GREEN}{reset_str}{Colors.RESET}{reset_time_str}")
+            print(f"  {Colors.BOLD}7-Day Remaining:{Colors.RESET} {make_progress_bar(remaining_pct, 24)} {Colors.DIM}(used: {used_pct:.1f}%){Colors.RESET}{status_tag}")
+            print(f"  {Colors.BOLD}Next Reset:{Colors.RESET}      in {Colors.GREEN}{reset_str}{Colors.RESET}{reset_time_str}")
         else:
-            print(f"  {Colors.BOLD}7-Day Usage:{Colors.RESET}  {Colors.DIM}No primary window rate limit data{Colors.RESET}")
+            print(f"  {Colors.BOLD}7-Day Remaining:{Colors.RESET} {Colors.DIM}No primary window rate limit data{Colors.RESET}")
 
-        # Secondary Window Usage (e.g. 5-hour limit if present)
+        # Secondary Window Remaining (e.g. 5-hour limit if present)
         secondary = rate_limit.get("secondary_window") if rate_limit else None
         if secondary:
-            sec_pct = secondary.get("used_percent", 0) or 0
+            sec_used = float(secondary.get("used_percent", 0) or 0)
+            sec_rem = max(0.0, min(100.0, 100.0 - sec_used))
             sec_rst = format_duration(secondary.get("reset_after_seconds", 0) or 0)
-            print(f"  {Colors.BOLD}5-Hour Usage:{Colors.RESET} {make_progress_bar(sec_pct, 24)} (resets in {sec_rst})")
+            print(f"  {Colors.BOLD}5-Hour Remaining:{Colors.RESET} {make_progress_bar(sec_rem, 24)} {Colors.DIM}(used: {sec_used:.1f}%){Colors.RESET} (resets in {sec_rst})")
 
         # Additional rate limits (e.g. Spark)
         add_limits = (acc.usage_data.get("additional_rate_limits") or []) if acc.usage_data else []
@@ -371,9 +373,10 @@ def display_dashboard(accounts: List[CodexAccount]):
             lname = extra.get("limit_name", "Extra Limit")
             eprim = (extra.get("rate_limit") or {}).get("primary_window")
             if eprim and isinstance(eprim, dict):
-                e_pct = eprim.get("used_percent", 0) or 0
+                e_used = float(eprim.get("used_percent", 0) or 0)
+                e_rem = max(0.0, min(100.0, 100.0 - e_used))
                 e_rst = format_duration(eprim.get("reset_after_seconds", 0) or 0)
-                print(f"  {Colors.DIM}↳ {lname}:{Colors.RESET} {make_progress_bar(e_pct, 14)} (resets in {e_rst})")
+                print(f"  {Colors.DIM}↳ {lname} Remaining:{Colors.RESET} {make_progress_bar(e_rem, 14)} {Colors.DIM}(used: {e_used:.1f}%){Colors.RESET} (resets in {e_rst})")
 
         # Banked Resets
         resets_info = acc.reset_data or {}
@@ -502,7 +505,14 @@ def main():
                 print(f"\n{Colors.BOLD}Select account to reset:{Colors.RESET}")
                 for i, acc in enumerate(accounts, 1):
                     avail = (acc.reset_data or {}).get("available_count", 0)
-                    print(f"  [{i}] {acc.email} ({avail} resets available)")
+                    rate_limit = (acc.usage_data.get("rate_limit") or {}) if acc.usage_data else {}
+                    primary = rate_limit.get("primary_window") if rate_limit else None
+                    rem_str = ""
+                    if primary:
+                        u = float(primary.get("used_percent", 0) or 0)
+                        r = max(0.0, min(100.0, 100.0 - u))
+                        rem_str = f" - {r:.1f}% remaining"
+                    print(f"  [{i}] {acc.email} ({avail} resets available{rem_str})")
                 
                 try:
                     acc_idx_str = input(f"Account number (1-{len(accounts)}) or 'c' to cancel: ").strip()
@@ -519,7 +529,17 @@ def main():
                     continue
 
             avail = (target_acc.reset_data or {}).get("available_count", 0)
+            rate_limit = (target_acc.usage_data.get("rate_limit") or {}) if target_acc.usage_data else {}
+            primary = rate_limit.get("primary_window") if rate_limit else None
+
             print(f"\n{Colors.YELLOW}Triggering reset for {Colors.BOLD}{target_acc.email}{Colors.RESET} {Colors.YELLOW}(Available resets: {avail})...{Colors.RESET}")
+            if primary:
+                used_pct = float(primary.get("used_percent", 0) or 0)
+                rem_pct = max(0.0, min(100.0, 100.0 - used_pct))
+                if rem_pct >= 20.0:
+                    print(f"  {Colors.RED}{Colors.BOLD}⚠️  WARNING: This account still has {rem_pct:.1f}% quota remaining ({used_pct:.1f}% used)!{Colors.RESET}")
+                else:
+                    print(f"  Account status: {rem_pct:.1f}% quota remaining ({used_pct:.1f}% used)")
             confirm = input(f"Are you sure you want to consume 1 banked reset? [y/N]: ").strip().lower()
             if confirm not in ("y", "yes"):
                 print("Reset cancelled.")

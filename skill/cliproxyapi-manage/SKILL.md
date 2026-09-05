@@ -11,7 +11,7 @@ This skill provides utilities to manage, monitor, diagnose, and configure the CL
 
 The scripts are located in `scripts/` under this skill directory:
 
-1. **`codex_usage_reset.py`** — Inspect Codex accounts, 7-day rolling usage percentages, next reset countdowns, and interactively view or redeem banked rate-limit resets.
+1. **`codex_usage_reset.py`** — Inspect Codex accounts, 7-day rolling quota remaining percentages, next reset countdowns, and interactively view or redeem banked rate-limit resets.
 2. **`view-failure-logs.sh`** — Query Postgres `usage_records` and Docker logs to diagnose recent request failures, token usage, latency, and status codes.
 3. **`update-server.py`** — Fetch latest OpenCode models, synchronize `config.yaml`, display recent errors, and restart both CLIProxyAPI and Dashboard compose stacks.
 4. **`changemodels.py`** — Interactively add, sync, or remove custom OpenAI-compatible model providers in `config.yaml`.
@@ -35,7 +35,7 @@ python3 scripts/codex_usage_reset.py --auth-dir /path/to/auths
 > **Note for Agent execution:** If you are running the script outside the proxy directory or against a specific directory other than `./auth` or `./auths`, always supply the path to the auth directory explicitly as an argument.
 
 ### Features:
-- **7-Day Rolling Usage**: Shows progress bar and percentage used for each account's primary quota window.
+- **7-Day Rolling Quota Remaining**: Shows progress bar and percentage remaining for each account's primary quota window.
 - **Reset Countdown**: Shows exact time remaining until next natural quota reset.
 - **Banked Resets**: Displays number of banked resets available, total earned, and expiration timestamps.
 - **Interactive Actions**:
