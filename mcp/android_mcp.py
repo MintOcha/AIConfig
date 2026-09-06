@@ -522,6 +522,11 @@ mcp = FastMCP(
     instructions=(
         "Android automation over ADB. Use screen for compact text/controls, act for ordered batches "
         "with one final observation; screenshots only when needed. Coordinates are device pixels. "
+        'Start with devices(); if multiple transports are listed, select one with devices(serial="0") '
+        "(use a unique prefix), then screen(). Listing alone does not select a device. "
+        'Every act action requires an "op" field, e.g. '
+        'act(actions=[{"op":"tap","target":{"ref":"1:2"}}]). '
+        'Never use {"click":...} or invent tool names such as open_app; open_app is an act op. '
         "Screen refs expire on the next observation/device selection and are checked before use. "
         "Prefer selectors after navigation and wait for a specific element instead of fixed sleeps. "
         "Input accepts Unicode and newlines verbatim; never shell-escape it. Key sequences use "
@@ -592,7 +597,39 @@ def act(
     actions: Annotated[list[Action], Field(min_length=1, max_length=50)],
     feedback: Literal["final", "each", "none"] = "final",
 ) -> str:
-    """Execute ordered actions; stop at first failure, no rollback. Return one final screen, or each action's screen, or only receipts. Each receipt names the action. Scroll direction means content travel. Input replaces by default; omit target for focused field. Wait uses selectors. Use single-action calls for immediate feedback between decisions."""
+    """Control the phone. Pass actions as a JSON array; EVERY item requires "op".
+
+    Examples (refs are illustrative; copy actual refs from the latest screen):
+    {"actions":[{"op":"tap","target":{"ref":"1:2"}}]}
+    {"actions":[{"op":"tap","target":{"text":"NEXT"}}]}
+    {"actions":[{"op":"tap","point":[540,1200]}]}
+    {"actions":[{"op":"input","target":{"ref":"2:4"},"text":"Full report"}]}
+    {"actions":[{"op":"input","text":"Append to focused field","replace":false}]}
+    {"actions":[{"op":"open_app","value":"com.android.settings"}]}
+    {"actions":[{"op":"keys","keys":[{"code":29,"meta":4096},{"code":"delete"}]}]}
+    {"actions":[{"op":"scroll","direction":"down"}]}
+    {"actions":[{"op":"wait","target":{"text":"NEXT"},"timeout":10},{"op":"tap","target":{"text":"NEXT"}}]}
+
+    Use op="tap", NOT {"click":...}. Select one phone with devices(serial=prefix)
+    first if multiple devices/transports are listed. A target uses either ref or
+    exact text/description/resource_id/class_name fields; add zero-based instance
+    only to disambiguate duplicate selectors. Point coordinates are device pixels.
+    Input accepts Unicode/newlines without shell escaping and replaces by default.
+    Key modifiers require numeric Android keycodes (CTRL=4096, SHIFT=1, ALT=2).
+
+    Other ops: long_press/double_tap (target or point), swipe/drag (start, end,
+    duration), stop_app/open_url (value), editor_action (action), system (action),
+    pause (seconds). Scroll direction is the direction to browse, not finger motion.
+    Prefer wait with selectors over pause. Use the schema for allowed system actions.
+
+    Default feedback="final" returns receipts and the resulting compact screen;
+    "each" includes intermediate screens in one response; "none" returns receipts.
+    Use single-action calls to decide between screens. Do not request another screen
+    when the returned observation suffices. Never reuse illustrative or expired refs.
+    On "Screen target changed", read screen once and use a fresh ref or unique exact
+    selector; do not blindly retry the old ref or guess coordinates. On partial
+    failure, inspect and continue only remaining actions. No rollback or auto-retry.
+    """
     results = []
     for index, action in enumerate(actions, 1):
         try:
