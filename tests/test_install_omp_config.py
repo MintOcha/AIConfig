@@ -20,6 +20,12 @@ class InstallOmpConfigTests(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment["HOME"] = str(home)
+        fake_bin = home / "bin"
+        fake_bin.mkdir(parents=True, exist_ok=True)
+        fake_omp = fake_bin / "omp"
+        fake_omp.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_omp.chmod(0o755)
+        environment["PATH"] = f"{fake_bin}:{environment.get('PATH', '')}"
         if config_dir is not None:
             environment["AI_CONFIG_OMP_DIR"] = str(config_dir)
         return subprocess.run(
@@ -60,6 +66,7 @@ class InstallOmpConfigTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("Preview: would install OMP setting config.yml", result.stdout)
+            self.assertIn("Preview: would refresh OMP models catalog", result.stdout)
             self.assertFalse(target.exists())
 
 

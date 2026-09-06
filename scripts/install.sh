@@ -856,6 +856,15 @@ install_omp_config() {
     install -m 600 "$source" "$target"
     success "Installed OMP setting: $(basename "$source")"
   done
+
+  if command -v omp >/dev/null 2>&1; then
+    if ((dry_run)); then
+      printf '%s\n' "Preview: would refresh OMP models catalog"
+    else
+      printf '%s\n' "Refreshing OMP models catalog..."
+      omp models refresh || warning "Failed to refresh OMP models catalog automatically."
+    fi
+  fi
 }
 
 copy_omp_config() {
