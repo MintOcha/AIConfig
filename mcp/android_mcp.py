@@ -142,6 +142,9 @@ class System(Model):
     ]
 
 
+SystemAction = System.model_fields["action"].annotation
+
+
 class Editor(Model):
     op: Literal["editor_action"]
     action: Literal["go", "search", "send", "next", "done", "previous"] = "done"
@@ -263,6 +266,22 @@ def hierarchy(xml: str) -> list[Entry]:
     return entries
 
 
+def identity(entry: Entry) -> tuple:
+    return (entry.package, entry.resource_id, entry.role, entry.label)
+
+
+def matching_entry(entry: Entry, entries: list[Entry]) -> Entry | None:
+    candidates = [item for item in entries if identity(item) == identity(entry)]
+    if len(candidates) == 1 and (entry.label or entry.resource_id):
+        return candidates[0]
+    exact = [
+        item
+        for item in candidates
+        if item.path == entry.path and item.fingerprint == entry.fingerprint
+    ]
+    return exact[0] if len(exact) == 1 else None
+
+
 def select_device(devices, prefix):
     exact = [d for d in devices if d.serial == prefix]
     matches = exact or [d for d in devices if d.serial.startswith(prefix)]
@@ -285,7 +304,8 @@ class Phone:
         self.serial = os.environ.get("ANDROID_SERIAL", "")
         self.device = None
         self.lock = threading.Lock()
-        self.revision = 0
+        self.next_ref = 1
+        self.current_refs: set[str] = set()
         self.refs: dict[str, Entry] = {}
         self.output_chars = 12000
         self.wait_timeout = 3.0
@@ -304,14 +324,46 @@ class Phone:
             self.device.settings["operation_delay"] = (0, 0)
         return self.device
 
-    def observe(self, mode="all", offset=0, limit=80, text_chars=240, keep_refs=False):
+    def observe(
+        self,
+        mode="all",
+        offset=0,
+        limit=80,
+        text_chars=240,
+        keep_refs=False,
+        include_system=False,
+    ):
         d = self.get()
         entries = hierarchy(d.dump_hierarchy())
-        self.revision += 1
-        refs = {f"{self.revision}:{i}": entry for i, entry in enumerate(entries, 1)}
+        width, height = d.window_size()
+        if not include_system:
+            entries = [
+                e
+                for e in entries
+                if not (
+                    e.package == "com.android.systemui"
+                    and e.role == "text"
+                    and e.bounds[3] <= height * 0.06
+                )
+            ]
+        previous = {}
+        grouped = {}
+        for entry in entries:
+            grouped.setdefault(identity(entry), []).append(entry)
+        for ref, old in self.refs.items():
+            match = matching_entry(old, grouped.get(identity(old), []))
+            if match is not None:
+                previous.setdefault(match.path, ref)
+        refs = {}
+        for entry in entries:
+            ref = previous.get(entry.path)
+            if ref is None:
+                ref = str(self.next_ref)
+                self.next_ref += 1
+            refs[ref] = entry
+        self.current_refs = set(refs)
         self.refs = self.refs | refs if keep_refs else refs
         packages = list(dict.fromkeys(e.package for e in entries if e.package))
-        width, height = d.window_size()
         lines = [f"Screen {width}x{height} " + ", ".join(packages)]
         rows = [
             (ref, entry)
@@ -324,7 +376,7 @@ class Phone:
             x1, y1, x2, y2 = entry.bounds
             label = entry.label or entry.resource_id.rsplit("/", 1)[-1] or "unlabelled"
             flags = " ".join((entry.role, *entry.states))
-            line = f"{ref} {flags} {shorten(label, text_chars)} @{(x1 + x2) // 2},{(y1 + y2) // 2}"
+            line = f"{ref}: {flags} {shorten(label, text_chars)} @{(x1 + x2) // 2},{(y1 + y2) // 2}"
             if used + len(line) + 1 > self.output_chars:
                 break
             lines.append(line)
@@ -347,19 +399,15 @@ class Phone:
             if entry is None:
                 raise ToolError("Unknown or expired ref; call screen again")
             xml = d.dump_hierarchy()
-            current = next((e for e in hierarchy(xml) if e.path == entry.path), None)
-            if (
-                current is None
-                or current.fingerprint != entry.fingerprint
-                or current.label != entry.label
-            ):
+            current = matching_entry(entry, hierarchy(xml))
+            if current is None:
                 raise ToolError(
-                    "Screen target changed; call screen again before acting"
+                    "Target missing or ambiguous; read screen and select a fresh ref or exact selector"
                 )
             if "disabled" in current.states:
                 raise ToolError("Target is disabled")
             # uiautomator2 replaces XML node tags with class names; wildcard paths retain sibling positions.
-            path = "/hierarchy" + entry.path[1:].replace("/node[", "/*[")
+            path = "/hierarchy" + current.path[1:].replace("/node[", "/*[")
             return d.xpath(path, source=xml)
         fields = {
             "text": target.text,
@@ -525,9 +573,10 @@ mcp = FastMCP(
         'Start with devices(); if multiple transports are listed, select one with devices(serial="0") '
         "(use a unique prefix), then screen(). Listing alone does not select a device. "
         'Every act action requires an "op" field, e.g. '
-        'act(actions=[{"op":"tap","target":{"ref":"1:2"}}]). '
-        'Never use {"click":...} or invent tool names such as open_app; open_app is an act op. '
-        "Screen refs expire on the next observation/device selection and are checked before use. "
+        'act(actions=[{"op":"tap","target":{"ref":"2"}}]). '
+        "Prefer tap, input, key, open_app, swipe, drag and scroll for single actions; act is for batches. "
+        "Refs are plain numbers, retained for unchanged controls and never reassigned to different controls. "
+        "Use the latest screen refs; removed controls and device selection invalidate refs. "
         "Prefer selectors after navigation and wait for a specific element instead of fixed sleeps. "
         "Input accepts Unicode and newlines verbatim; never shell-escape it. Key sequences use "
         "Android numeric keycodes with optional meta bitmask (CTRL=4096, SHIFT=1, ALT=2), or "
@@ -586,9 +635,10 @@ def screen(
     offset: Annotated[int, Field(ge=0)] = 0,
     limit: Annotated[int, Field(ge=1, le=300)] = 80,
     text_chars: Annotated[int, Field(ge=40, le=10000)] = 240,
+    include_system: bool = False,
 ) -> str:
-    """Read visible text and controls, without XML. Rows: ref role [state] label @x,y. Ellipsis means shortened text; increase text_chars to read it."""
-    return phone.observe(mode, offset, limit, text_chars)
+    """Read compact screen rows: number: role [state] label @x,y. Use the number directly with tap(target=number). mode=controls omits passive text. Status-bar text is hidden unless include_system=true. Ellipsis means shortened text; increase text_chars or paginate with offset. Coordinates are device pixels; numeric handles can have gaps."""
+    return phone.observe(mode, offset, limit, text_chars, include_system=include_system)
 
 
 @mcp.tool()
@@ -600,10 +650,10 @@ def act(
     """Control the phone. Pass actions as a JSON array; EVERY item requires "op".
 
     Examples (refs are illustrative; copy actual refs from the latest screen):
-    {"actions":[{"op":"tap","target":{"ref":"1:2"}}]}
+    {"actions":[{"op":"tap","target":{"ref":"2"}}]}
     {"actions":[{"op":"tap","target":{"text":"NEXT"}}]}
     {"actions":[{"op":"tap","point":[540,1200]}]}
-    {"actions":[{"op":"input","target":{"ref":"2:4"},"text":"Full report"}]}
+    {"actions":[{"op":"input","target":{"ref":"4"},"text":"Full report"}]}
     {"actions":[{"op":"input","text":"Append to focused field","replace":false}]}
     {"actions":[{"op":"open_app","value":"com.android.settings"}]}
     {"actions":[{"op":"keys","keys":[{"code":29,"meta":4096},{"code":"delete"}]}]}
@@ -630,6 +680,10 @@ def act(
     selector; do not blindly retry the old ref or guess coordinates. On partial
     failure, inspect and continue only remaining actions. No rollback or auto-retry.
     """
+    return execute(actions, feedback)
+
+
+def execute(actions: list[Action], feedback: str = "final") -> str:
     results = []
     for index, action in enumerate(actions, 1):
         try:
@@ -639,7 +693,9 @@ def act(
                 f"Action {index}/{len(actions)} ({action.op}) failed; {index - 1} completed. "
                 f"Failed action may have partly applied; inspect before retrying. {shorten(str(exc), 1200)}"
             ) from exc
-        results.append(f"OK {index} {action.op}")
+        results.append(
+            f"OK {action.op}" if len(actions) == 1 else f"OK {index} {action.op}"
+        )
         if feedback == "each" or (feedback == "final" and index == len(actions)):
             try:
                 results.append(phone.observe(keep_refs=feedback == "each"))
@@ -650,11 +706,126 @@ def act(
                 ) from exc
     if feedback == "each":
         phone.refs = {
-            ref: entry
-            for ref, entry in phone.refs.items()
-            if ref.startswith(f"{phone.revision}:")
+            ref: entry for ref, entry in phone.refs.items() if ref in phone.current_refs
         }
     return "\n".join(results)
+
+
+def target_value(target: str | int | None) -> Target | None:
+    if target is None:
+        return None
+    if isinstance(target, int) or target.isdecimal():
+        return Target(ref=str(target))
+    return Target(text=target)
+
+
+@mcp.tool()
+@serialized
+def tap(
+    target: str | int | None = None,
+    point: Point | None = None,
+    gesture: Literal["tap", "long_press", "double_tap"] = "tap",
+) -> str:
+    """Tap a numeric screen ref or exact label: tap(target=2), tap(target="NEXT"). Or tap(point=[540,600]). Returns the resulting screen. gesture optionally holds or double-taps. Numeric labels use act with target.text."""
+    return execute([Tap(op=gesture, target=target_value(target), point=point)])
+
+
+@mcp.tool()
+@serialized
+def input(text: str, target: str | int | None = None, replace: bool = True) -> str:
+    """Type Unicode/multiline text verbatim, replacing by default. Omit target for focused field; otherwise use numeric ref or exact label. Returns resulting screen."""
+    return execute(
+        [Input(op="input", text=text, target=target_value(target), replace=replace)]
+    )
+
+
+@mcp.tool()
+@serialized
+def key(key: str | int, meta: int = 0) -> str:
+    """Press home/back/enter or an Android numeric keycode. Optional numeric-key modifiers: CTRL=4096, SHIFT=1, ALT=2. Returns resulting screen. Use act for sequences."""
+    return execute([Keys(op="keys", keys=[Key(code=key, meta=meta)])])
+
+
+@mcp.tool()
+@serialized
+def open_app(package: str, activity: str | None = None) -> str:
+    """Open a package (apps lists IDs); resolve its launcher unless activity supplied. Returns resulting screen."""
+    return execute([App(op="open_app", value=package, activity=activity)])
+
+
+@mcp.tool()
+@serialized
+def swipe(
+    start: Point, end: Point, duration: Annotated[float, Field(gt=0, le=10)] = 0.3
+) -> str:
+    """Swipe from start=[x,y] to end=[x,y] in device pixels, origin top-left. Up: end y smaller; down: larger. Returns resulting screen."""
+    return execute([Swipe(op="swipe", start=start, end=end, duration=duration)])
+
+
+@mcp.tool()
+@serialized
+def drag(
+    start: Point, end: Point, duration: Annotated[float, Field(gt=0, le=10)] = 0.5
+) -> str:
+    """Drag from start=[x,y] to end=[x,y] in device pixels. Returns resulting screen."""
+    return execute([Swipe(op="drag", start=start, end=end, duration=duration)])
+
+
+@mcp.tool()
+@serialized
+def scroll(
+    direction: Literal["up", "down", "left", "right"] = "down",
+    target: str | int | None = None,
+) -> str:
+    """Browse down/up/left/right; finger motion is opposite. Optional numeric ref/exact label confines the gesture to a container. Returns resulting screen."""
+    return execute(
+        [Scroll(op="scroll", direction=direction, target=target_value(target))]
+    )
+
+
+@mcp.tool()
+@serialized
+def system(action: SystemAction) -> str:
+    """wake/sleep the screen, show notifications/quick_settings, hide_keyboard, or change rotation. Sleep returns a receipt without trying to read a dark screen. Other actions return a screen."""
+    return execute(
+        [System(op="system", action=action)], "none" if action == "sleep" else "final"
+    )
+
+
+@mcp.tool()
+@serialized
+def wait(text: str, timeout: Seconds = 10, gone: bool = False) -> str:
+    """Wait for exact visible text to appear (or disappear with gone=true), then return the screen. Prefer this over arbitrary sleeps."""
+    return execute(
+        [Wait(op="wait", target=Target(text=text), timeout=timeout, gone=gone)]
+    )
+
+
+@mcp.tool()
+@serialized
+def editor(
+    action: Literal["go", "search", "send", "next", "done", "previous"] = "done",
+) -> str:
+    """Perform the focused field's keyboard action, e.g. search or next, then return screen. Send requires user authorization."""
+    return execute([Editor(op="editor_action", action=action)])
+
+
+@mcp.tool()
+@serialized
+def reboot() -> str:
+    """Reboot the selected phone ONLY when user requests it. Returns acknowledgment, no screen. Wait for boot and reconnect; never automatically retry a reboot."""
+    available = adbutils.adb.list(extended=True)
+    candidates = (
+        available if phone.serial else [d for d in available if d.state == "device"]
+    )
+    serial = select_device(candidates, phone.serial)
+    phone.serial = serial
+    phone.device = None
+    phone.refs.clear()
+    adbutils.adb.device(serial=serial).reboot()
+    return (
+        "Reboot requested. Device will disconnect; wait for boot before using screen."
+    )
 
 
 @mcp.tool()
