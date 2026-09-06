@@ -811,13 +811,40 @@ install_skills() {
     fi
   done
 }
+confirm_overwrite() {
+  local prompt="$1"
+  if ((dry_run)); then
+    return 0
+  fi
+  printf '%s' "$prompt"
+  local response=""
+  read -r response
+  [[ "$response" =~ ^[Yy]$ ]]
+}
+
 install_omp_config() {
   [[ -d "$omp_config_dir" ]] || {
     failure "OMP settings directory not found: $omp_config_dir"
     return 1
   }
 
-  local source target
+  local has_existing=0 source target
+  for source in "$omp_config_dir"/*; do
+    [[ -f "$source" ]] || continue
+    target="${target_home}/$(basename "$source")"
+    if [[ -f "$target" ]]; then
+      has_existing=1
+      break
+    fi
+  done
+
+  if ((has_existing)) && ! ((dry_run)); then
+    if ! confirm_overwrite "Overwrite existing OMP files in $target_home? [y/N]: "; then
+      printf '%s\n' "Cancelled applying OMP settings."
+      return 0
+    fi
+  fi
+
   for source in "$omp_config_dir"/*; do
     [[ -f "$source" ]] || continue
     target="${target_home}/$(basename "$source")"
@@ -830,6 +857,7 @@ install_omp_config() {
     success "Installed OMP setting: $(basename "$source")"
   done
 }
+
 copy_omp_config() {
   require_command python3
 
@@ -838,6 +866,21 @@ copy_omp_config() {
     failure "OMP sync tool not found: $sync_script"
     return 1
   }
+
+  local has_existing=0 name
+  for name in config.yml keybindings.yml keybindings.json; do
+    if [[ -f "${omp_config_dir}/${name}" ]]; then
+      has_existing=1
+      break
+    fi
+  done
+
+  if ((has_existing)) && ! ((dry_run)); then
+    if ! confirm_overwrite "Overwrite existing tracked OMP configs in $omp_config_dir? [y/N]: "; then
+      printf '%s\n' "Cancelled copying OMP settings."
+      return 0
+    fi
+  fi
 
   local -a args=(
     "$sync_script"

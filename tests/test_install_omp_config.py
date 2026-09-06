@@ -96,5 +96,65 @@ class InstallOmpConfigTests(unittest.TestCase):
                 '{"app.model.select": "Ctrl+Alt+M"}',
             )
 
+    def test_omp_menu_apply_confirmation_overwrites_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            home = root / "home"
+            config_dir = root / "tracked"
+            target = home / ".omp" / "agent"
+            target.mkdir(parents=True)
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.yml").write_text("steeringMode: all\n", encoding="utf-8")
+            (target / "config.yml").write_text("steeringMode: one-at-a-time\n", encoding="utf-8")
+
+            # Confirm with 'y'
+            result = self.run_installer(home, "2\ny\n4\n", config_dir=config_dir)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Overwrite existing OMP files", result.stdout)
+            self.assertEqual(
+                (target / "config.yml").read_text(encoding="utf-8"),
+                "steeringMode: all\n",
+            )
+
+    def test_omp_menu_apply_cancellation_preserves_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            home = root / "home"
+            config_dir = root / "tracked"
+            target = home / ".omp" / "agent"
+            target.mkdir(parents=True)
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.yml").write_text("steeringMode: all\n", encoding="utf-8")
+            (target / "config.yml").write_text("steeringMode: one-at-a-time\n", encoding="utf-8")
+
+            # Decline with 'n'
+            result = self.run_installer(home, "2\nn\n4\n", config_dir=config_dir)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Cancelled applying OMP settings", result.stdout)
+            self.assertEqual(
+                (target / "config.yml").read_text(encoding="utf-8"),
+                "steeringMode: one-at-a-time\n",
+            )
+
+    def test_omp_menu_copy_cancellation_preserves_tracked_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            home = root / "home"
+            config_dir = root / "tracked"
+            target = home / ".omp" / "agent"
+            target.mkdir(parents=True)
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.yml").write_text("steeringMode: original\n", encoding="utf-8")
+            (target / "config.yml").write_text("steeringMode: modified\n", encoding="utf-8")
+
+            # Decline with 'n'
+            result = self.run_installer(home, "3\nn\n4\n", config_dir=config_dir)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Cancelled copying OMP settings", result.stdout)
+            self.assertEqual(
+                (config_dir / "config.yml").read_text(encoding="utf-8"),
+                "steeringMode: original\n",
+            )
+
 if __name__ == "__main__":
     unittest.main()
