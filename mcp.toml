@@ -37,3 +37,13 @@ label = "Tavily"
 kind = "api_key"
 config_table = "providers.tavily"
 config_key = "api_keys"
+
+[mcp.android]
+label = "Android"
+category = "automation"
+description = "Compact phone screens, Unicode input and batched actions over ADB / UiAutomator"
+transport = "stdio"
+command = "uv"
+args = ["run", "--script", "{REPO_ROOT}/mcp/android_mcp.py", "--config", "{CODEX_HOME}/android.toml"]
+config_template = "mcp/android-mcp.toml"
+config_path = "{CODEX_HOME}/android.toml"
