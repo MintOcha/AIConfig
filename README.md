@@ -42,14 +42,14 @@ Launch the setup menu:
 Use `./scripts/install.sh --dry-run` to exercise the menus without changing
 agent configuration.
 
-Use `./scripts/install.sh --omp` to apply the tracked files in `config/omp/` to
-`~/.omp/agent`, then optionally configure MCPs. Existing MCP configuration is
-left untouched until the MCP installer is selected. Run
-`./scripts/sync-omp-config.py` to capture the current machine's allowlisted OMP
-settings (`config.yml` and keybinding files) back into `config/omp/`. The sync
-tool excludes model credentials, MCP configuration, databases, sessions,
-history, caches, and other transient state; it also refuses allowlisted files
-that contain secret-like keys.
+Use `./scripts/install.sh --omp` to configure OMP. The menu can apply tracked
+files from `config/omp/` to `~/.omp/agent`, copy existing `~/.omp/agent` configs
+back into `config/omp/`, or configure MCPs. You can also run
+`./scripts/sync-omp-config.py` directly to capture allowlisted OMP settings
+(`config.yml` and keybinding files) into `config/omp/`. The sync tool excludes
+model credentials, MCP configuration, databases, sessions, history, caches, and
+other transient state; it also refuses allowlisted files that contain
+secret-like keys.
 
 Use `./scripts/install.sh --freebuff` to install into Freebuff. MCPs are merged
 into `~/.agents/mcp.json`, skills are linked under `~/.agents/skills`, and the

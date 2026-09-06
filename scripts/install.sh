@@ -8,7 +8,7 @@ mcp_file="${repo_root}/mcp.toml"
 skills_file="${repo_root}/skills.toml"
 prompts_file="${repo_root}/prompts.toml"
 prompts_dir="${repo_root}/prompts"
-omp_config_dir="${repo_root}/config/omp"
+omp_config_dir="${AI_CONFIG_OMP_DIR:-${repo_root}/config/omp}"
 dry_run=0
 selected_prompt_path=""
 
@@ -830,7 +830,46 @@ install_omp_config() {
     success "Installed OMP setting: $(basename "$source")"
   done
 }
+copy_omp_config() {
+  require_command python3
 
+  local sync_script="${repo_root}/scripts/sync-omp-config.py"
+  [[ -f "$sync_script" ]] || {
+    failure "OMP sync tool not found: $sync_script"
+    return 1
+  }
+
+  local -a args=(
+    "$sync_script"
+    --source "$target_home"
+    --destination "$omp_config_dir"
+  )
+  ((dry_run)) && args+=(--dry-run)
+
+  if python3 "${args[@]}"; then
+    if ((dry_run)); then
+      printf '%s\n' "Preview: would copy existing OMP configs from $target_home to $omp_config_dir"
+    else
+      success "Copied existing OMP configs to $omp_config_dir"
+      if [[ -t 0 ]] && command -v git >/dev/null 2>&1 && git -C "$repo_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        if ! git -C "$repo_root" diff --quiet "$omp_config_dir" || [[ -n "$(git -C "$repo_root" status --porcelain "$omp_config_dir")" ]]; then
+          printf '%s' "Sync changes to git remote (commit and push)? [y/N]: "
+          local sync_choice=""
+          read -r sync_choice
+          if [[ "$sync_choice" =~ ^[Yy]$ ]]; then
+            git -C "$repo_root" add "$omp_config_dir"
+            git -C "$repo_root" commit -m "chore(omp): sync tracked agent settings"
+            git -C "$repo_root" push origin "$(git -C "$repo_root" branch --show-current)"
+            success "Pushed synced OMP configs to git remote"
+          fi
+        fi
+      fi
+    fi
+  else
+    failure "Failed to copy existing OMP configs"
+    return 1
+  fi
+}
 
 menu() {
   while true; do
@@ -838,9 +877,10 @@ menu() {
     printf '%s\n' 'What would you like to set up?'
     printf '%s\n' '  1) Install MCPs        Select from the catalog'
     if [[ "$target_agent" == "omp" ]]; then
-      printf '%s\n' '  2) Apply saved settings Reinstall config/omp files'
-      printf '%s\n' '  3) Exit'
-      printf '%s' 'Select an option [1-3]: '
+      printf '%s\n' '  2) Apply saved settings Restore config/omp into ~/.omp/agent'
+      printf '%s\n' '  3) Copy existing omp configs Save ~/.omp/agent into config/omp'
+      printf '%s\n' '  4) Exit'
+      printf '%s' 'Select an option [1-4]: '
     else
       printf '%s\n' '  2) Install a prompt    Choose the global instruction set'
       printf '%s\n' '  3) Install skills      Choose a group or individual skills'
@@ -852,13 +892,12 @@ menu() {
     case "$choice" in
       1) install_mcps || true ;;
       2) [[ "$target_agent" == "omp" ]] && { install_omp_config || true; continue; }; install_prompt || true ;;
-      3) [[ "$target_agent" == "omp" ]] && return 0; install_skills || true ;;
-      4) [[ "$target_agent" != "omp" ]] && return 0 ;;
+      3) [[ "$target_agent" == "omp" ]] && { copy_omp_config || true; continue; }; install_skills || true ;;
+      4) return 0 ;;
       *) warning 'Please choose one of the displayed options.' ;;
     esac
   done
 }
-
 while (($# > 0)); do
   case "$1" in
     --help|-h) usage; exit 0 ;;
@@ -889,7 +928,9 @@ while (($# > 0)); do
 done
 
 if [[ "$target_agent" == "omp" ]]; then
-  install_omp_config
+  if [[ ! -f "${target_home}/config.yml" ]]; then
+    install_omp_config
+  fi
 fi
 
 menu
