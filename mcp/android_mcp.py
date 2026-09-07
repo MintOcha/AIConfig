@@ -457,7 +457,13 @@ class Phone:
                 d.send_keys(action.text, clear=action.replace)
         elif isinstance(action, Keys):
             for key in action.keys:
-                if not d.press(key.code, meta=key.meta):
+                if key.code in ("back", 4) and not key.meta:
+                    result = d.shell(["input", "keyevent", "4"], timeout=5)
+                    if result.exit_code:
+                        raise ToolError(
+                            "Android rejected Back: " + shorten(result.output, 500)
+                        )
+                elif not d.press(key.code, meta=key.meta):
                     raise ToolError(f"Key injection rejected: {key.code}")
         elif isinstance(action, Swipe):
             method = d.swipe if action.op == "swipe" else d.drag
@@ -744,6 +750,13 @@ def input(text: str, target: str | int | None = None, replace: bool = True) -> s
 def key(key: str | int, meta: int = 0) -> str:
     """Press home/back/enter or an Android numeric keycode. Optional numeric-key modifiers: CTRL=4096, SHIFT=1, ALT=2. Returns resulting screen. Use act for sequences."""
     return execute([Keys(op="keys", keys=[Key(code=key, meta=meta)])])
+
+
+@mcp.tool()
+@serialized
+def back() -> str:
+    """Press Android Back once, then return the normal compact screen. Dismisses an open keyboard or navigates back; does not install/switch keyboards. Do not retry blindly if observation fails."""
+    return execute([Keys(op="keys", keys=[Key(code="back")])])
 
 
 @mcp.tool()

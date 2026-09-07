@@ -192,6 +192,13 @@ on each screen. Moving controls are matched by package, resource ID, role and
 label; ambiguous duplicates require an unchanged path/fingerprint or a new selector.
 Tool schemas expose allowed values and required arguments. No custom command language.
 
+`back()` presses Back once through ADB and immediately returns the normal compact
+screen, so the next call can target a returned control. It dismisses an open
+keyboard or navigates back; unlike the library's `hide_keyboard`, this Back path
+does not install/select an IME. The `hide_keyboard` and editor/input helper paths
+can still require the ATX APK, which Play Protect may block; do not bypass that
+warning. Direct Back is not a keyboard-only dismissal action.
+
 
 ## Use with other coding agents
 
