@@ -123,7 +123,7 @@ is needed. Keep the clone in a permanent location and restart the agent after se
 This is a [FastMCP](https://gofastmcp.com/) interface over
 [uiautomator2](https://github.com/openatx/uiautomator2), not repeated shell XML
 dumps. First device use deploys its UiAutomator service over ADB; Unicode input
-may install/select its helper keyboard. These helpers need device permission;
+never installs or switches keyboards. Accessibility input needs device permission;
 OEM restrictions, secure windows and inaccessible WebViews can limit automation.
 It cannot bypass a secure lock screen. Stop other UiAutomator/Appium sessions
 before using this server. No phone is contacted during MCP startup/discovery.
@@ -178,8 +178,9 @@ All gesture coordinates are device pixels, origin top-left. `system(action="wake
 and `system(action="sleep")` control screen power; sleep returns only a receipt.
 `reboot()` explicitly requests a reboot and invalidates the connection; call only
 when authorized, and wait for boot before reconnecting. No automatic retries.
-`wait(text="NEXT")` waits for a condition; `editor(action="search")` invokes the
-focused field's keyboard action. These reuse the same executor as batches.
+`wait(text="NEXT")` waits for a condition. `editor(action="search")` requires an
+already active optional ATX keyboard; otherwise it returns a short error without
+installing or switching anything. Tap the visible Search/Send control instead.
 
 Sequences remain available: `act(actions=[{"op":"scroll","direction":"down"},
 {"op":"pause","seconds":1},{"op":"scroll","direction":"down"}])` returns one
@@ -194,10 +195,18 @@ Tool schemas expose allowed values and required arguments. No custom command lan
 
 `back()` presses Back once through ADB and immediately returns the normal compact
 screen, so the next call can target a returned control. It dismisses an open
-keyboard or navigates back; unlike the library's `hide_keyboard`, this Back path
-does not install/select an IME. The `hide_keyboard` and editor/input helper paths
-can still require the ATX APK, which Play Protect may block; do not bypass that
-warning. Direct Back is not a keyboard-only dismissal action.
+keyboard or navigates back; it never installs/selects an IME.
+`system(action="hide_keyboard")` checks `dumpsys input_method` with a five-second
+timeout, sends Back only when the keyboard is reported visible, and does nothing
+when hidden. Unknown visibility returns an error rather than navigating blindly.
+Input replacement uses accessibility `set_text`; append uses verified clipboard
+RPCs. If denied, the operation fails without falling back to APK installation.
+Unicode input is preserved, but inaccessible fields/OEM clipboard restrictions
+can prevent input. Explicit `files(operation="install_apk", ...)` still installs
+a user-requested APK; Android verification is not bypassed.
+If Play Protect blocked ATX in an older session, leave protection enabled, dismiss
+the install prompt, and restart this MCP after updating. No helper installation
+is needed for normal input, Back, or keyboard dismissal.
 
 Tap variants use one tool: `tap(target=2)` taps, `tap(target=2,duration=0.8)`
 holds, and `tap(target=2,double=true)` double-taps. If both target and point are
