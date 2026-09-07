@@ -199,6 +199,14 @@ does not install/select an IME. The `hide_keyboard` and editor/input helper path
 can still require the ATX APK, which Play Protect may block; do not bypass that
 warning. Direct Back is not a keyboard-only dismissal action.
 
+Tap variants use one tool: `tap(target=2)` taps, `tap(target=2,duration=0.8)`
+holds, and `tap(target=2,double=true)` double-taps. If both target and point are
+provided, target wins in both the short tool and batches; stale targets never
+fall back to coordinates. Batch actions retain explicit `long_press`/`double_tap`
+ops. `home()` leaves apps running; `recent_apps()` opens the switcher;
+`stop_app(package="...")` force-stops an app and may discard unsaved state.
+The legacy Menu key stays under `key(key="menu")`; modern apps may ignore it.
+
 
 ## Use with other coding agents
 

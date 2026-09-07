@@ -68,8 +68,12 @@ class Tap(Model):
 
     @model_validator(mode="after")
     def validate_destination(self):
-        if (self.target is None) == (self.point is None):
-            raise ValueError("Provide exactly one of target or point")
+        if self.target is not None:
+            self.point = None
+        elif self.point is None:
+            raise ValueError(
+                "Provide target or point, e.g. target=2 or point=[540,600]"
+            )
         return self
 
 
@@ -730,10 +734,37 @@ def target_value(target: str | int | None) -> Target | None:
 def tap(
     target: str | int | None = None,
     point: Point | None = None,
-    gesture: Literal["tap", "long_press", "double_tap"] = "tap",
+    duration: Annotated[float, Field(gt=0, le=10)] | None = None,
+    double: bool = False,
 ) -> str:
-    """Tap a numeric screen ref or exact label: tap(target=2), tap(target="NEXT"). Or tap(point=[540,600]). Returns the resulting screen. gesture optionally holds or double-taps. Numeric labels use act with target.text."""
-    return execute([Tap(op=gesture, target=target_value(target), point=point)])
+    """Tap a numeric ref/exact label or point. duration=0.8 holds for 0.8 seconds; double=true double-taps. Omit both for a normal tap. Target wins over point, never coordinate fallback. Returns screen. Examples: tap(target=2), tap(point=[540,600]), tap(target=2,duration=0.8)."""
+    if double and duration is not None:
+        raise ToolError("Choose a hold duration or double=true, not both")
+    op = "double_tap" if double else "long_press" if duration is not None else "tap"
+    return execute(
+        [Tap(op=op, target=target_value(target), point=point, duration=duration or 0.5)]
+    )
+
+
+@mcp.tool()
+@serialized
+def home() -> str:
+    """Go to Android Home, then return the resulting compact screen."""
+    return execute([Keys(op="keys", keys=[Key(code="home")])])
+
+
+@mcp.tool()
+@serialized
+def recent_apps() -> str:
+    """Open the recent-apps switcher, without stopping any app; return screen."""
+    return execute([Keys(op="keys", keys=[Key(code="recent")])])
+
+
+@mcp.tool()
+@serialized
+def stop_app(package: str) -> str:
+    """Force-stop a package, including its background work, then return screen. May discard unsaved state. Use home to merely leave an app running."""
+    return execute([App(op="stop_app", value=package)])
 
 
 @mcp.tool()
