@@ -996,44 +996,57 @@ def execute(
 @mcp.tool()
 @serialized
 def act(
+    commands: Annotated[str | list[Action] | None, Field(default=None, description="Commands to run: multiline DuckyScript text, file path (@path or filename), or JSON actions list")] = None,
     actions: Annotated[list[Action] | None, Field(default=None, max_length=100)] = None,
-    script: Annotated[str | None, Field(default=None, description="DuckyScript-style macro lines (e.g. 'TAP 250 80\\nDELAY 200\\nSCREENSHOT\\nTAP 600 400\\nSCREENSHOT')")] = None,
-    macro: Annotated[str | None, Field(default=None, description="Macro name or file path (.ds/.ducky/.txt/.json)")] = None,
+    script: Annotated[str | None, Field(default=None, description="Alias for commands string")] = None,
+    macro: Annotated[str | None, Field(default=None, description="Macro name or file path")] = None,
     vars: Annotated[dict[str, Any] | None, Field(default=None, description="Variables to substitute in macro ($key)")] = None,
     feedback: Literal["final", "each", "none", "screenshot", "both"] = "final",
 ) -> str | list[Image | str]:
     """Control the phone with ordered action sequences, DuckyScript commands, or macro files.
 
-    DuckyScript commands (one per line, case-insensitive):
-      TAP x y            (or CLICK x y)
-      DELAY ms           (e.g. DELAY 200 = 200ms, or SLEEP 0.5 = 0.5s)
-      SCREENSHOT [path]  (or SS, SNAPSHOT, CAPTURE)
-      SWIPE x1 y1 x2 y2 [duration]
-      LONG_PRESS x y [duration]
-      DOUBLE_TAP x y
-      STRING text        (type Unicode text)
-      BACK / HOME / ENTER / APP_SWITCH
-      KEY keycode
-      OPEN package [activity]
-      REPEAT n           (repeat previous command n times)
-      STOP [reason]
+    Pass commands directly as a multiline string, a file path (or @path), or structured JSON actions:
+      TAP 250 80
+      DELAY 200
+      SCREENSHOT
+      TAP 600 400
+      SCREENSHOT
+      BACK
+      STOP Planted
 
-    Screenshots taken mid-sequence (via SCREENSHOT or {"op": "screenshot"}) apply at that step,
-    and when the whole sequence finishes all captured screenshots are returned to the caller.
-
-    Macros can be stored in ~/.config/android-macros/<name>.ds or loaded from file paths.
+    Screenshots taken mid-sequence apply at that step, and when the sequence finishes
+    all captured screenshots are returned together in one response.
     """
     total_actions: list[Action] = []
-    if script:
-        total_actions.extend(parse_ducky_script(script))
+
+    input_source = commands if commands is not None else script
+    if isinstance(input_source, list):
+        total_actions.extend(input_source)
+    elif isinstance(input_source, str):
+        raw_str = input_source.strip()
+        if raw_str.startswith("<<"):
+            # Strip heredoc markers like << 'EOF' ... EOF or <<< '...'
+            lines = raw_str.splitlines()
+            start = 1 if len(lines) > 1 else 0
+            end = len(lines) - 1 if len(lines) > 1 and lines[-1].strip().isalnum() else len(lines)
+            raw_str = "\n".join(lines[start:end]).strip()
+
+        if raw_str.startswith("@"):
+            # File reference like @macros/plant.ds
+            total_actions.extend(load_macro(raw_str[1:].strip(), vars))
+        elif "\n" not in raw_str and (Path(raw_str).is_file() or raw_str.endswith((".ds", ".ducky", ".txt", ".json"))):
+            total_actions.extend(load_macro(raw_str, vars))
+        else:
+            total_actions.extend(parse_ducky_script(raw_str))
+
     if macro:
         total_actions.extend(load_macro(macro, vars))
     if actions:
         total_actions.extend(actions)
-    if not total_actions:
-        raise ToolError("Provide actions, script, or a macro name to run")
-    return execute(total_actions, feedback)
 
+    if not total_actions:
+        raise ToolError("Provide commands (script text, @file, or action list) to run")
+    return execute(total_actions, feedback)
 
 @mcp.tool()
 @serialized
