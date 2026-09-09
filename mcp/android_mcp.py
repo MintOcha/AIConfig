@@ -5,15 +5,16 @@
 #   "fastmcp==3.4.5",
 #   "uiautomator2==3.7.0",
 #   "adbutils==2.12.0",
+#   "pillow>=10.0.0",
 # ]
 # ///
 
 import argparse
 import asyncio
+import base64
 import os
 import re
 import threading
-import tomllib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from functools import wraps
@@ -22,10 +23,12 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 import adbutils
+import tomllib
 import uiautomator2 as u2
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.utilities.types import Image
+from PIL import Image as PILImage
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
@@ -327,6 +330,54 @@ class Phone:
             self.device.implicitly_wait(self.wait_timeout)
             self.device.settings["operation_delay"] = (0, 0)
         return self.device
+    def screenshot(
+        self,
+        max_edge: int = 1280,
+        format: str = "jpeg",
+        quality: int = 80,
+    ) -> tuple[str, bytes]:
+        d = self.get()
+        img = None
+        raw_bytes = None
+        try:
+            b64 = d.jsonrpc.takeScreenshot(1, quality)
+            if b64:
+                raw_bytes = base64.b64decode(b64)
+                img = PILImage.open(BytesIO(raw_bytes))
+                orig_w, orig_h = img.size
+        except Exception:  # noqa: BLE001
+            img = None
+            raw_bytes = None
+
+        if img is None:
+            img = d.screenshot()
+            orig_w, orig_h = img.size
+
+        needs_resize = max(orig_w, orig_h) > max_edge
+        if not needs_resize and format == "jpeg" and raw_bytes is not None:
+            final_bytes = raw_bytes
+            w, h = orig_w, orig_h
+        else:
+            if needs_resize:
+                img.thumbnail((max_edge, max_edge), resample=PILImage.Resampling.BILINEAR)
+            w, h = img.size
+            buf = BytesIO()
+            if format == "jpeg":
+                if img.mode not in ("RGB", "L"):
+                    img = img.convert("RGB")
+                img.save(buf, format="JPEG", quality=quality)
+            else:
+                img.save(buf, format="PNG", compress_level=1)
+            final_bytes = buf.getvalue()
+
+        scale = round(w / orig_w, 3) if orig_w else 1.0
+        if scale < 0.999:
+            msg = f"Screenshot: {w}x{h} (screen: {orig_w}x{orig_h}, scale: {scale:.3f}). Coordinates in other tools use original {orig_w}x{orig_h} screen space."
+        else:
+            msg = f"Screenshot: {w}x{h} (screen: {orig_w}x{orig_h})."
+
+        return msg, final_bytes
+
 
     def observe(
         self,
@@ -948,13 +999,12 @@ def apps(
 @serialized
 def screenshot(
     max_edge: Annotated[int, Field(ge=320, le=4096)] = 1280,
-) -> Image:
-    """Return an actual image, not base64 text. Downscaled to max_edge; use screen coordinates or scale image coordinates to original size."""
-    image = phone.get().screenshot()
-    image.thumbnail((max_edge, max_edge))
-    data = BytesIO()
-    image.save(data, format="PNG")
-    return Image(data=data.getvalue(), format="png")
+    format: Literal["jpeg", "png"] = "jpeg",
+    quality: Annotated[int, Field(ge=10, le=100)] = 80,
+) -> list[Image | str]:
+    """Return an actual image with dimensions and scale metadata. Downscaled to max_edge; use screen coordinates or scale image coordinates to original size."""
+    msg, data = phone.screenshot(max_edge=max_edge, format=format, quality=quality)
+    return [msg, Image(data=data, format=format)]
 
 
 @mcp.tool()
