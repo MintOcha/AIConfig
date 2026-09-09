@@ -1226,8 +1226,20 @@ def system(action: SystemAction) -> str:
 
 @mcp.tool()
 @serialized
-def wait(text: str, timeout: Seconds = 10, gone: bool = False) -> str:
-    """Wait for exact visible text to appear (or disappear with gone=true), then return the screen. Prefer this over arbitrary sleeps."""
+def wait(
+    text: str | None = None,
+    seconds: Seconds | None = None,
+    duration: Seconds | None = None,
+    timeout: Seconds = 10,
+    gone: bool = False,
+) -> str:
+    """Wait for exact visible text to appear/disappear, or pause for a specified duration in seconds. Returns resulting screen."""
+    sleep_duration = seconds if seconds is not None else duration
+    if text is None:
+        if sleep_duration is not None:
+            return execute([Pause(op="pause", seconds=sleep_duration)])
+        # If neither provided, default to pause with timeout
+        return execute([Pause(op="pause", seconds=timeout)])
     return execute(
         [Wait(op="wait", target=Target(text=text), timeout=timeout, gone=gone)]
     )
