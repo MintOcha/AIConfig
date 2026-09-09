@@ -5,28 +5,32 @@
 #   "fastmcp==3.4.5",
 #   "uiautomator2==3.7.0",
 #   "adbutils==2.12.0",
+#   "pillow>=10.0.0",
 # ]
 # ///
 
 import argparse
 import asyncio
+import base64
+import json
 import os
 import re
 import threading
-import tomllib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from functools import wraps
 from io import BytesIO
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import adbutils
+import tomllib
 import uiautomator2 as u2
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.utilities.types import Image
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from PIL import Image as PILImage
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 
 class Model(BaseModel):
@@ -154,8 +158,32 @@ class Editor(Model):
     action: Literal["go", "search", "send", "next", "done", "previous"] = "done"
 
 
+class ScreenshotOp(Model):
+    op: Literal["screenshot"]
+    path: str | None = None
+    max_edge: Annotated[int | None, Field(default=None, ge=320, le=4096)] = None
+    format: Literal["jpeg", "png"] = "jpeg"
+    quality: Annotated[int, Field(ge=10, le=100)] = 80
+
+
+class Stop(Model):
+    op: Literal["stop"]
+    reason: str = "Sequence stopped"
+
+
 Action = Annotated[
-    Tap | Input | Keys | Swipe | Scroll | App | Wait | Pause | System | Editor,
+    Tap
+    | Input
+    | Keys
+    | Swipe
+    | Scroll
+    | App
+    | Wait
+    | Pause
+    | System
+    | Editor
+    | ScreenshotOp
+    | Stop,
     Field(discriminator="op"),
 ]
 
@@ -327,6 +355,45 @@ class Phone:
             self.device.implicitly_wait(self.wait_timeout)
             self.device.settings["operation_delay"] = (0, 0)
         return self.device
+    def screenshot(
+        self,
+        max_edge: int | None = None,
+        format: str = "jpeg",
+        quality: int = 80,
+    ) -> tuple[bytes, tuple[int, int]]:
+        d = self.get()
+        img = None
+        raw_bytes = None
+        try:
+            b64 = d.jsonrpc.takeScreenshot(1, quality)
+            if b64:
+                raw_bytes = base64.b64decode(b64)
+                img = PILImage.open(BytesIO(raw_bytes))
+                orig_w, orig_h = img.size
+        except Exception:  # noqa: BLE001
+            img = None
+            raw_bytes = None
+
+        if img is None:
+            img = d.screenshot()
+            orig_w, orig_h = img.size
+
+        needs_resize = max_edge is not None and max(orig_w, orig_h) > max_edge
+        if not needs_resize and format == "jpeg" and raw_bytes is not None:
+            return raw_bytes, (orig_w, orig_h)
+
+        if needs_resize:
+            img.thumbnail((max_edge, max_edge), resample=PILImage.Resampling.BILINEAR)
+        w, h = img.size
+        buf = BytesIO()
+        if format == "jpeg":
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            img.save(buf, format="JPEG", quality=quality)
+        else:
+            img.save(buf, format="PNG", compress_level=1)
+        return buf.getvalue(), (w, h)
+
 
     def observe(
         self,
@@ -381,7 +448,8 @@ class Phone:
             label = entry.label or entry.resource_id.rsplit("/", 1)[-1] or "unlabelled"
             flags = " ".join((entry.role, *entry.states))
             line = f"{ref}: {flags} {shorten(label, text_chars)} @{(x1 + x2) // 2},{(y1 + y2) // 2}"
-            if used + len(line) + 1 > self.output_chars:
+            budget = max(self.output_chars, text_chars * 2)
+            if used + len(line) + 1 > budget:
                 break
             lines.append(line)
             used += len(line) + 1
@@ -696,58 +764,187 @@ def screen(
     mode: Literal["all", "controls"] = "all",
     offset: Annotated[int, Field(ge=0)] = 0,
     limit: Annotated[int, Field(ge=1, le=300)] = 80,
-    text_chars: Annotated[int, Field(ge=40, le=10000)] = 240,
+    text_chars: Annotated[int, Field(ge=40, le=100000)] = 240,
     include_system: bool = False,
 ) -> str:
     """Read compact screen rows: number: role [state] label @x,y. Use the number directly with tap(target=number). mode=controls omits passive text. Status-bar text is hidden unless include_system=true. Ellipsis means shortened text; increase text_chars or paginate with offset. Coordinates are device pixels; numeric handles can have gaps."""
     return phone.observe(mode, offset, limit, text_chars, include_system=include_system)
 
 
-@mcp.tool()
-@serialized
-def act(
-    actions: Annotated[list[Action], Field(min_length=1, max_length=50)],
-    feedback: Literal["final", "each", "none"] = "final",
-) -> str:
-    """Control the phone. Pass actions as a JSON array; EVERY item requires "op".
-
-    Examples (refs are illustrative; copy actual refs from the latest screen):
-    {"actions":[{"op":"tap","target":{"ref":"2"}}]}
-    {"actions":[{"op":"tap","target":{"text":"NEXT"}}]}
-    {"actions":[{"op":"tap","point":[540,1200]}]}
-    {"actions":[{"op":"input","target":{"ref":"4"},"text":"Full report"}]}
-    {"actions":[{"op":"input","text":"Append to focused field","replace":false}]}
-    {"actions":[{"op":"open_app","value":"com.android.settings"}]}
-    {"actions":[{"op":"keys","keys":[{"code":29,"meta":4096},{"code":"delete"}]}]}
-    {"actions":[{"op":"scroll","direction":"down"}]}
-    {"actions":[{"op":"wait","target":{"text":"NEXT"},"timeout":10},{"op":"tap","target":{"text":"NEXT"}}]}
-
-    Use op="tap", NOT {"click":...}. Select one phone with devices(serial=prefix)
-    first if multiple devices/transports are listed. A target uses either ref or
-    exact text/description/resource_id/class_name fields; add zero-based instance
-    only to disambiguate duplicate selectors. Point coordinates are device pixels.
-    Input accepts Unicode/newlines without shell escaping and replaces by default.
-    Key modifiers require numeric Android keycodes (CTRL=4096, SHIFT=1, ALT=2).
-
-    Other ops: long_press/double_tap (target or point), swipe/drag (start, end,
-    duration), stop_app/open_url (value), editor_action (action), system (action),
-    pause (seconds). Scroll direction is the direction to browse, not finger motion.
-    Prefer wait with selectors over pause. Use the schema for allowed system actions.
-
-    Default feedback="final" returns receipts and the resulting compact screen;
-    "each" includes intermediate screens in one response; "none" returns receipts.
-    Use single-action calls to decide between screens. Do not request another screen
-    when the returned observation suffices. Never reuse illustrative or expired refs.
-    On "Screen target changed", read screen once and use a fresh ref or unique exact
-    selector; do not blindly retry the old ref or guess coordinates. On partial
-    failure, inspect and continue only remaining actions. No rollback or auto-retry.
-    """
-    return execute(actions, feedback)
+MACRO_DIR = Path.home() / ".config" / "android-macros"
 
 
-def execute(actions: list[Action], feedback: str = "final") -> str:
+def parse_ducky_script(script_text: str) -> list[Action]:
+    raw_actions = []
+    lines = script_text.splitlines()
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith(("REM", "#", "//")):
+            continue
+
+        parts = line.split(maxsplit=1)
+        cmd = parts[0].upper()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if cmd == "REPEAT":
+            count = int(arg) if arg.isdigit() else 1
+            if raw_actions:
+                last = raw_actions[-1]
+                for _ in range(count):
+                    raw_actions.append(dict(last))
+            continue
+
+        if cmd in ("DELAY", "SLEEP", "PAUSE"):
+            val = float(arg)
+            seconds = val / 1000.0 if (val >= 10 and cmd == "DELAY") else val
+            raw_actions.append({"op": "pause", "seconds": seconds})
+
+        elif cmd in ("TAP", "CLICK"):
+            coords = [int(n) for n in re.findall(r"\d+", arg)]
+            if len(coords) >= 2:
+                raw_actions.append({"op": "tap", "point": [coords[0], coords[1]]})
+
+        elif cmd in ("LONG_PRESS", "HOLD"):
+            coords = [int(n) for n in re.findall(r"\d+", arg)]
+            nums = re.findall(r"[0-9.]+", arg)
+            duration = float(nums[2]) if len(nums) >= 3 else 1.0
+            if len(coords) >= 2:
+                raw_actions.append({
+                    "op": "tap",
+                    "point": [coords[0], coords[1]],
+                    "gesture": "long_press",
+                    "duration": duration,
+                })
+
+        elif cmd == "DOUBLE_TAP":
+            coords = [int(n) for n in re.findall(r"\d+", arg)]
+            if len(coords) >= 2:
+                raw_actions.append({
+                    "op": "tap",
+                    "point": [coords[0], coords[1]],
+                    "gesture": "double_tap",
+                })
+
+        elif cmd in ("SWIPE", "DRAG"):
+            nums = re.findall(r"[0-9.]+", arg)
+            if len(nums) >= 4:
+                act_dict = {
+                    "op": "swipe" if cmd == "SWIPE" else "drag",
+                    "start": [int(nums[0]), int(nums[1])],
+                    "end": [int(nums[2]), int(nums[3])],
+                }
+                if len(nums) >= 5:
+                    act_dict["duration"] = float(nums[4])
+                raw_actions.append(act_dict)
+
+        elif cmd == "SCROLL":
+            direction = arg.lower() if arg.lower() in ("up", "down", "left", "right") else "down"
+            raw_actions.append({"op": "scroll", "direction": direction})
+
+        elif cmd in ("SCREENSHOT", "SNAPSHOT", "SS", "CAPTURE"):
+            path = arg if arg else None
+            raw_actions.append({"op": "screenshot", "path": path})
+
+        elif cmd in ("STRING", "TEXT", "INPUT", "TYPE"):
+            raw_actions.append({"op": "input", "text": arg})
+
+        elif cmd in ("BACK", "HOME", "ENTER", "APP_SWITCH", "SEARCH"):
+            raw_actions.append({"op": "keys", "keys": [{"code": cmd.lower()}]})
+
+        elif cmd in ("KEY", "PRESS"):
+            raw_actions.append({"op": "keys", "keys": [{"code": arg}]})
+
+        elif cmd in ("OPEN", "APP"):
+            app_parts = arg.split(maxsplit=1)
+            raw_actions.append({
+                "op": "open_app",
+                "value": app_parts[0],
+                "activity": app_parts[1] if len(app_parts) > 1 else None,
+            })
+
+        elif cmd == "STOP_APP":
+            raw_actions.append({"op": "stop_app", "value": arg})
+
+        elif cmd == "STOP":
+            raw_actions.append({"op": "stop", "reason": arg or "Stopped"})
+
+    return TypeAdapter(list[Action]).validate_python(raw_actions)
+
+
+def load_macro(name_or_path: str, vars: dict[str, Any] | None = None) -> list[Action]:
+    p = Path(name_or_path).expanduser()
+    if not (p.is_file() or "/" in name_or_path or name_or_path.endswith((".ds", ".ducky", ".txt", ".macro", ".json", ".toml", ".yaml"))):
+        MACRO_DIR.mkdir(parents=True, exist_ok=True)
+        for ext in (".ds", ".ducky", ".txt", ".macro", ".json", ".toml", ".yaml"):
+            cand = MACRO_DIR / f"{name_or_path}{ext}"
+            if cand.is_file():
+                p = cand
+                break
+    if not p.is_file():
+        raise ToolError(f"Macro not found: '{name_or_path}' (searched path and {MACRO_DIR})")
+
+    text = p.read_text(encoding="utf-8")
+    if vars:
+        for k, v in vars.items():
+            text = text.replace(f"${{{k}}}", str(v)).replace(f"${k}", str(v))
+
+    if p.suffix in (".ds", ".ducky", ".txt", ".macro") or not text.strip().startswith(("{", "[")):
+        return parse_ducky_script(text)
+
+    if p.suffix == ".toml":
+        raw = tomllib.loads(text)
+    else:
+        raw = json.loads(text)
+
+    if isinstance(raw, dict):
+        raw_actions = raw.get("actions", [])
+    elif isinstance(raw, list):
+        raw_actions = raw
+    else:
+        raise ToolError(f"Invalid macro in {p}: expected JSON list or dict with 'actions'")
+
+    return TypeAdapter(list[Action]).validate_python(raw_actions)
+
+def execute(
+    actions: list[Action],
+    feedback: str = "final",
+) -> str | list[Image | str]:
     results = []
+    captured_screenshots: list[Image] = []
     for index, action in enumerate(actions, 1):
+        if isinstance(action, Stop):
+            results.append(
+                f"OK {index} stop: {action.reason}"
+                if len(actions) > 1
+                else f"OK stop: {action.reason}"
+            )
+            break
+
+        if isinstance(action, ScreenshotOp):
+            try:
+                data, (w, h) = phone.screenshot(
+                    max_edge=action.max_edge,
+                    format=action.format,
+                    quality=action.quality,
+                )
+                if action.path:
+                    p = Path(action.path).expanduser()
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_bytes(data)
+                img = Image(data=data, format=action.format)
+                captured_screenshots.append(img)
+                msg = (
+                    f"OK {index} screenshot ({w}x{h})"
+                    + (f" -> {action.path}" if action.path else "")
+                )
+                results.append(msg)
+            except Exception as exc:
+                raise ToolError(
+                    f"Action {index}/{len(actions)} (screenshot) failed; {index - 1} completed. {shorten(str(exc), 1200)}"
+                ) from exc
+            continue
+
         try:
             phone.perform(action)
         except Exception as exc:
@@ -758,20 +955,146 @@ def execute(actions: list[Action], feedback: str = "final") -> str:
         results.append(
             f"OK {action.op}" if len(actions) == 1 else f"OK {index} {action.op}"
         )
-        if feedback == "each" or (feedback == "final" and index == len(actions)):
+        if feedback == "each":
             try:
-                results.append(phone.observe(keep_refs=feedback == "each"))
+                results.append(phone.observe(keep_refs=True))
             except Exception as exc:
                 raise ToolError(
                     f"Actions 1–{index} completed, but observation failed; remaining actions were not run. "
                     f"Do not repeat completed actions. {shorten(str(exc), 1200)}"
                 ) from exc
+
     if feedback == "each":
         phone.refs = {
             ref: entry for ref, entry in phone.refs.items() if ref in phone.current_refs
         }
-    return "\n".join(results)
+    elif feedback == "final":
+        try:
+            results.append(phone.observe())
+        except Exception:  # noqa: BLE001, S110
+            pass
+    elif feedback in ("screenshot", "both"):
+        if not captured_screenshots or feedback == "both":
+            try:
+                data, (w, h) = phone.screenshot()
+                captured_screenshots.append(Image(data=data, format="jpeg"))
+                results.append(f"Final screenshot: {w}x{h}")
+            except Exception:  # noqa: BLE001, S110
+                pass
+        if feedback == "both":
+            try:
+                results.append(phone.observe())
+            except Exception:  # noqa: BLE001, S110
+                pass
 
+    summary = "\n".join(results)
+    if captured_screenshots:
+        return [summary, *captured_screenshots]
+    return summary
+
+
+@mcp.tool()
+@serialized
+def act(
+    actions: Annotated[list[Action] | None, Field(default=None, max_length=100)] = None,
+    script: Annotated[str | None, Field(default=None, description="DuckyScript-style macro lines (e.g. 'TAP 250 80\\nDELAY 200\\nSCREENSHOT\\nTAP 600 400\\nSCREENSHOT')")] = None,
+    macro: Annotated[str | None, Field(default=None, description="Macro name or file path (.ds/.ducky/.txt/.json)")] = None,
+    vars: Annotated[dict[str, Any] | None, Field(default=None, description="Variables to substitute in macro ($key)")] = None,
+    feedback: Literal["final", "each", "none", "screenshot", "both"] = "final",
+) -> str | list[Image | str]:
+    """Control the phone with ordered action sequences, DuckyScript commands, or macro files.
+
+    DuckyScript commands (one per line, case-insensitive):
+      TAP x y            (or CLICK x y)
+      DELAY ms           (e.g. DELAY 200 = 200ms, or SLEEP 0.5 = 0.5s)
+      SCREENSHOT [path]  (or SS, SNAPSHOT, CAPTURE)
+      SWIPE x1 y1 x2 y2 [duration]
+      LONG_PRESS x y [duration]
+      DOUBLE_TAP x y
+      STRING text        (type Unicode text)
+      BACK / HOME / ENTER / APP_SWITCH
+      KEY keycode
+      OPEN package [activity]
+      REPEAT n           (repeat previous command n times)
+      STOP [reason]
+
+    Screenshots taken mid-sequence (via SCREENSHOT or {"op": "screenshot"}) apply at that step,
+    and when the whole sequence finishes all captured screenshots are returned to the caller.
+
+    Macros can be stored in ~/.config/android-macros/<name>.ds or loaded from file paths.
+    """
+    total_actions: list[Action] = []
+    if script:
+        total_actions.extend(parse_ducky_script(script))
+    if macro:
+        total_actions.extend(load_macro(macro, vars))
+    if actions:
+        total_actions.extend(actions)
+    if not total_actions:
+        raise ToolError("Provide actions, script, or a macro name to run")
+    return execute(total_actions, feedback)
+
+
+@mcp.tool()
+@serialized
+def macro(
+    operation: Literal["run", "save", "list", "show", "delete"],
+    name: str = "",
+    script: Annotated[str | None, Field(default=None, description="DuckyScript macro lines to save")] = None,
+    actions: Annotated[list[Action] | None, Field(default=None, max_length=100)] = None,
+    vars: Annotated[dict[str, Any] | None, Field(default=None, description="Variables to substitute in macro ($key)")] = None,
+    feedback: Literal["final", "each", "none", "screenshot", "both"] = "final",
+) -> str | list[Image | str]:
+    """Manage and execute phone macros (supports DuckyScript and JSON). Stored in ~/.config/android-macros/<name>.[ds|json]."""
+    MACRO_DIR.mkdir(parents=True, exist_ok=True)
+
+    if operation == "list":
+        macros = sorted({p.stem for p in MACRO_DIR.glob("*") if p.suffix in (".ds", ".ducky", ".txt", ".macro", ".json", ".toml")})
+        return f"Saved macros ({len(macros)}):\n" + "\n".join(f"- {m}" for m in macros) if macros else "No macros saved in ~/.config/android-macros"
+
+    if not name:
+        raise ToolError("name is required for this macro operation")
+
+    # Determine file path
+    if name.endswith((".ds", ".ducky", ".txt", ".macro", ".json", ".toml")) or "/" in name:
+        target = Path(name).expanduser()
+    else:
+        target = MACRO_DIR / f"{name}.ds" if script else MACRO_DIR / f"{name}.json"
+
+    if operation == "save":
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if script:
+            target.write_text(script.strip() + "\n", encoding="utf-8")
+            return f"Saved DuckyScript macro '{name}' to {target}"
+        elif actions:
+            raw = [a.model_dump(exclude_none=True) for a in actions]
+            target.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+            return f"Saved macro '{name}' with {len(actions)} actions to {target}"
+        else:
+            raise ToolError("Provide script (DuckyScript text) or actions list to save")
+    elif operation == "show":
+        cand = target
+        if not cand.is_file():
+            for ext in (".ds", ".ducky", ".txt", ".macro", ".json", ".toml"):
+                alt = MACRO_DIR / f"{name}{ext}"
+                if alt.is_file():
+                    cand = alt
+                    break
+        if not cand.is_file():
+            raise ToolError(f"Macro '{name}' not found at {target}")
+        return cand.read_text(encoding="utf-8")
+    elif operation == "delete":
+        deleted = False
+        for ext in ("", ".ds", ".ducky", ".txt", ".macro", ".json", ".toml"):
+            alt = (MACRO_DIR / f"{name}{ext}") if ext else target
+            if alt.is_file():
+                alt.unlink()
+                deleted = True
+        if not deleted:
+            raise ToolError(f"Macro '{name}' not found")
+        return f"Deleted macro '{name}'"
+    else:  # run
+        return act(macro=name, actions=actions, vars=vars, feedback=feedback)
 
 def target_value(target: str | int | None) -> Target | None:
     if target is None:
@@ -947,14 +1270,13 @@ def apps(
 @mcp.tool()
 @serialized
 def screenshot(
-    max_edge: Annotated[int, Field(ge=320, le=4096)] = 1280,
+    max_edge: Annotated[int | None, Field(default=None, ge=320, le=4096)] = None,
+    format: Literal["jpeg", "png"] = "jpeg",
+    quality: Annotated[int, Field(ge=10, le=100)] = 80,
 ) -> Image:
-    """Return an actual image, not base64 text. Downscaled to max_edge; use screen coordinates or scale image coordinates to original size."""
-    image = phone.get().screenshot()
-    image.thumbnail((max_edge, max_edge))
-    data = BytesIO()
-    image.save(data, format="PNG")
-    return Image(data=data.getvalue(), format="png")
+    """Return an actual image, not base64 text. Default keeps native 1:1 resolution so coordinates match screen pixels 1:1."""
+    data, _ = phone.screenshot(max_edge=max_edge, format=format, quality=quality)
+    return Image(data=data, format=format)
 
 
 @mcp.tool()
