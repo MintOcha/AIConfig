@@ -5,9 +5,9 @@
 # keys are stored in this repository or in the Codex MCP command.
 
 [mcp.web]
-label = "Web"
+label = "general web search tool. use for up-to-date information"
 category = "search"
-description = "Brave, optional DuckDuckGo, Codex standalone, and Tavily search with automatic fallback"
+description = "general web search tool. use for up-to-date information"
 transport = "stdio"
 command = "uv"
 args = ["run", "--script", "{REPO_ROOT}/mcp/web_search_mcp.py", "--config", "{CODEX_HOME}/web.toml"]

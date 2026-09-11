@@ -649,24 +649,17 @@ class SearchRouter:
         raise ProviderRequestError("All web search providers failed") from last_error
 
     async def fetch_content(self, urls: list[str]) -> list[dict[str, str]]:
-        try:
-            fetched, missing = await self._fetch_duckduckgo(urls)
-        except Exception:  # noqa: BLE001
-            fetched, missing = [], urls
-
-        if not missing:
-            return fetched
-
-        payload = await self._call_tavily(
-            "tavily_extract",
-            {
-                "urls": missing,
-                "extract_depth": "basic",
-                "format": "markdown",
-                "include_images": False,
-            },
-        )
-        return fetched + _normalize_extracted_content(payload)
+        """Fetch page content through DuckDuckGo's fetch_content tool."""
+        if not self.config.duckduckgo_enabled:
+            raise ConfigurationError(
+                "Fetch requires the DuckDuckGo provider to be enabled"
+            )
+        fetched, missing = await self._fetch_duckduckgo(urls)
+        if missing:
+            raise ProviderRequestError(
+                "DuckDuckGo could not fetch every requested URL"
+            )
+        return fetched
 
     async def research(self, task: str) -> str:
         payload = await self._call_tavily(
@@ -678,9 +671,12 @@ class SearchRouter:
 mcp = FastMCP(
     "Web Search Router",
     instructions=(
-        "Search the live internet for current results with web-search, fetch page "
-        "content, or run research. This is the single entry point with automatic "
-        "provider routing and failover; prefer it over provider-specific MCPs."
+        "REQUIRED for current or externally verifiable information: search the live internet "
+        "for benchmark scores, specifications, prices, news, documentation, and comparisons. "
+        "Use this instead of model memory. Return source URLs, prefer primary or reputable "
+        "sources, distinguish measured results from estimates, and use automatic provider "
+        "routing and failover. This is the single entry point; do not use provider-specific "
+        "MCPs directly."
     ),
 )
 router: SearchRouter | None = None
@@ -691,7 +687,7 @@ async def web_search(
     query: str,
     max_results: int = 10,
 ) -> list[dict[str, str]]:
-    """Search the live internet and return current results. This is the single entry point with automatic provider routing and failover; prefer it over provider-specific MCPs."""
+    "REQUIRED live-web search for current or externally verifiable information, including benchmark scores, specifications, prices, news, documentation, and comparisons. Prefer this over model memory; return source URLs, distinguish measured results from estimates, and use automatic provider routing and failover. This is the single entry point; do not use provider-specific MCPs directly."
     if not query.strip():
         raise ValueError("query must not be empty")
     if not 1 <= max_results <= 20:
@@ -704,7 +700,7 @@ async def web_search(
 
 @mcp.tool(name="fetch")
 async def fetch_content(urls: list[str]) -> list[dict[str, str]]:
-    """Fetch readable page content as part of the web toolset. Prefer this single entry point over provider-specific MCPs."""
+    "Fetch readable page content using DuckDuckGo's underlying fetch_content capability. Requires DuckDuckGo to be enabled; does not use Tavily."
     if router is None:
         raise RuntimeError("Web search router has not been configured")
     return await router.fetch_content(_validate_urls(urls))
@@ -712,7 +708,7 @@ async def fetch_content(urls: list[str]) -> list[dict[str, str]]:
 
 @mcp.tool(name="research")
 async def tavily_research(task: str) -> str:
-    """Run in-depth live-web research through the routed web toolset. Prefer this single entry point over provider-specific MCPs."""
+    """Run deeper live-web research when a question needs multiple sources, corroboration, or synthesis. Return source URLs and distinguish measured results from estimates."""
     if not task.strip():
         raise ValueError("task must not be empty")
     if router is None:
