@@ -526,9 +526,11 @@ class SearchRouter:
                 ) as client:
                     response = await client.post(
                         endpoint,
-                        headers={"Authorization": f"Bearer {api_key}"},
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+                        },
                         json={
-                            "id": str(uuid.uuid4()),
                             "model": self.config.codex_standalone_model,
                             "commands": {"search_query": [{"q": query}]},
                         },
@@ -549,6 +551,60 @@ class SearchRouter:
         raise ProviderRequestError(
             "Codex standalone search failed for every configured key"
         ) from last_error
+    async def _fetch_single_codex(
+        self, url: str, client: httpx.AsyncClient, api_key: str
+    ) -> str | None:
+        endpoint = f"{self.config.codex_standalone_base_url.rstrip('/')}/alpha/search"
+        try:
+            response = await client.post(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+                },
+                json={
+                    "id": str(uuid.uuid4()),
+                    "model": self.config.codex_standalone_model,
+                    "commands": {"open": [{"ref_id": url}]},
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+            raw_output = payload.get("output", "")
+            if not raw_output:
+                return None
+            lines = []
+            for line in raw_output.splitlines():
+                if line.startswith("L") and ":" in line[:6]:
+                    lines.append(line.split(":", 1)[1].strip())
+                elif not line.startswith("cite") and not line.startswith("http") and not line.startswith("Total lines:"):
+                    lines.append(line)
+            content = "\n".join(lines).strip()
+            return content or None
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _fetch_codex_standalone(
+        self, urls: list[str]
+    ) -> tuple[list[dict[str, str]], list[str]]:
+        if not self._codex_standalone_keys.configured:
+            return [], urls
+        api_key = await self._codex_standalone_keys.next_key()
+        async with self._codex_client_factory(
+            timeout=self.config.request_timeout_seconds
+        ) as client:
+            tasks = [self._fetch_single_codex(url, client, api_key) for url in urls]
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+
+        fetched: list[dict[str, str]] = []
+        missing: list[str] = []
+        for url, outcome in zip(urls, outcomes, strict=True):
+            if isinstance(outcome, str) and outcome:
+                fetched.append({"url": url, "content": outcome})
+            else:
+                missing.append(url)
+        return fetched, missing
+
 
     async def _fetch_duckduckgo(
         self, urls: list[str]
@@ -649,23 +705,68 @@ class SearchRouter:
         raise ProviderRequestError("All web search providers failed") from last_error
 
     async def fetch_content(self, urls: list[str]) -> list[dict[str, str]]:
-        """Fetch page content through DuckDuckGo's fetch_content tool."""
-        if not self.config.duckduckgo_enabled:
-            raise ConfigurationError(
-                "Fetch requires the DuckDuckGo provider to be enabled"
-            )
-        fetched, missing = await self._fetch_duckduckgo(urls)
-        if missing:
+        """Fetch page content through Codex native open command, with DuckDuckGo failover."""
+        fetched_all: dict[str, str] = {}
+        remaining_urls = list(urls)
+
+        # 1. Try Codex standalone first if configured
+        if self._codex_standalone_keys.configured:
+            try:
+                codex_fetched, codex_missing = await self._fetch_codex_standalone(remaining_urls)
+                for item in codex_fetched:
+                    fetched_all[item["url"]] = item["content"]
+                remaining_urls = codex_missing
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 2. Fall back to DuckDuckGo for any remaining URLs if enabled
+        if remaining_urls and self.config.duckduckgo_enabled:
+            try:
+                ddg_fetched, ddg_missing = await self._fetch_duckduckgo(remaining_urls)
+                for item in ddg_fetched:
+                    fetched_all[item["url"]] = item["content"]
+                remaining_urls = ddg_missing
+            except Exception:  # noqa: BLE001
+                pass
+
+        if not fetched_all:
             raise ProviderRequestError(
-                "DuckDuckGo could not fetch every requested URL"
+                "Could not fetch any requested URLs using available providers"
             )
-        return fetched
+
+        # Return in original requested order for successfully fetched URLs
+        return [{"url": u, "content": fetched_all[u]} for u in urls if u in fetched_all]
 
     async def research(self, task: str) -> str:
         payload = await self._call_tavily(
             "tavily_research", {"input": task, "model": "auto"}
         )
         return _normalize_research(payload)
+    async def execute_codex_command(
+        self, command_name: str, command_payload: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        if not self._codex_standalone_keys.configured:
+            raise ConfigurationError("Codex standalone is not configured")
+        api_key = await self._codex_standalone_keys.next_key()
+        endpoint = f"{self.config.codex_standalone_base_url.rstrip('/')}/alpha/search"
+        async with self._codex_client_factory(
+            timeout=self.config.request_timeout_seconds
+        ) as client:
+            response = await client.post(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+                },
+                json={
+                    "id": str(uuid.uuid4()),
+                    "model": self.config.codex_standalone_model,
+                    "commands": {command_name: command_payload},
+                },
+            )
+            response.raise_for_status()
+            return response.json()
+
 
 
 mcp = FastMCP(
@@ -680,40 +781,128 @@ mcp = FastMCP(
     ),
 )
 router: SearchRouter | None = None
+def register_tools(app: FastMCP, cfg: RouterConfig) -> None:
+    @app.tool(name="web-search")
+    async def web_search(
+        query: str,
+        max_results: int = 10,
+    ) -> list[dict[str, str]]:
+        "REQUIRED live-web search for current or externally verifiable information, including benchmark scores, specifications, prices, news, documentation, and comparisons. Prefer this over model memory; return source URLs, distinguish measured results from estimates, and use automatic provider routing and failover. This is the single entry point; do not use provider-specific MCPs directly."
+        if not query.strip():
+            raise ValueError("query must not be empty")
+        if not 1 <= max_results <= 20:
+            raise ValueError("max_results must be between 1 and 20")
+        if router is None:
+            raise RuntimeError("Web search router has not been configured")
+        return await router.search(query, max_results)
 
+    if cfg.codex_standalone_keys or cfg.duckduckgo_enabled:
+        @app.tool(name="fetch")
+        async def fetch_content(urls: list[str]) -> list[dict[str, str]]:
+            "Fetch readable page content for given URLs using Codex native page extraction, with automatic DuckDuckGo failover."
+            if router is None:
+                raise RuntimeError("Web search router has not been configured")
+            return await router.fetch_content(_validate_urls(urls))
 
-@mcp.tool(name="web-search")
-async def web_search(
-    query: str,
-    max_results: int = 10,
-) -> list[dict[str, str]]:
-    "REQUIRED live-web search for current or externally verifiable information, including benchmark scores, specifications, prices, news, documentation, and comparisons. Prefer this over model memory; return source URLs, distinguish measured results from estimates, and use automatic provider routing and failover. This is the single entry point; do not use provider-specific MCPs directly."
-    if not query.strip():
-        raise ValueError("query must not be empty")
-    if not 1 <= max_results <= 20:
-        raise ValueError("max_results must be between 1 and 20")
-    if router is None:
-        raise RuntimeError("Web search router has not been configured")
+    if cfg.codex_standalone_keys:
+        @app.tool(name="open-page")
+        async def open_page(ref_id: str, lineno: int | None = None) -> str:
+            """Open the page indicated by `ref_id` or URL and position viewport at line `lineno`."""
+            if router is None:
+                raise RuntimeError("Web search router has not been configured")
+            res = await router.execute_codex_command("open", [{"ref_id": ref_id, "lineno": lineno}])
+            return res.get("output", "")
 
-    return await router.search(query, max_results)
+        @app.tool(name="click-link")
+        async def click_link(ref_id: str, link_id: int) -> str:
+            """Open the link `link_id` (numbered link `【{id}†.*】`) from previously opened page `ref_id`."""
+            if router is None:
+                raise RuntimeError("Web search router has not been configured")
+            res = await router.execute_codex_command("click", [{"ref_id": ref_id, "id": link_id}])
+            return res.get("output", "")
 
+        @app.tool(name="find-in-page")
+        async def find_in_page(ref_id: str, pattern: str) -> str:
+            """Find text pattern in page indicated by `ref_id` or URL."""
+            if router is None:
+                raise RuntimeError("Web search router has not been configured")
+            res = await router.execute_codex_command("find", [{"ref_id": ref_id, "pattern": pattern}])
+            return res.get("output", "")
 
-@mcp.tool(name="fetch")
-async def fetch_content(urls: list[str]) -> list[dict[str, str]]:
-    "Fetch readable page content using DuckDuckGo's underlying fetch_content capability. Requires DuckDuckGo to be enabled; does not use Tavily."
-    if router is None:
-        raise RuntimeError("Web search router has not been configured")
-    return await router.fetch_content(_validate_urls(urls))
+        @app.tool(name="screenshot-pdf")
+        async def screenshot_pdf(ref_id: str, pageno: int) -> str:
+            """Take a screenshot of page `pageno` (0-indexed) indicated by `ref_id` or URL (works on PDFs)."""
+            if router is None:
+                raise RuntimeError("Web search router has not been configured")
+            res = await router.execute_codex_command("screenshot", [{"ref_id": ref_id, "pageno": pageno}])
+            return res.get("output", "")
 
+        @app.tool(name="image-search")
+        async def image_search(query: str, recency_days: int | None = None, domains: list[str] | None = None) -> list[dict[str, Any]]:
+            """Query image search engine for a given query."""
+            if router is None:
+                raise RuntimeError("Web search router has not been configured")
+            payload: dict[str, Any] = {"q": query}
+            if recency_days is not None:
+                payload["recency"] = recency_days
+            if domains is not None:
+                payload["domains"] = domains
+            res = await router.execute_codex_command("image_query", [payload])
+            return res.get("results", [])
 
-@mcp.tool(name="research")
-async def tavily_research(task: str) -> str:
-    """Run deeper live-web research when a question needs multiple sources, corroboration, or synthesis. Return source URLs and distinguish measured results from estimates."""
-    if not task.strip():
-        raise ValueError("task must not be empty")
-    if router is None:
-        raise RuntimeError("Web search router has not been configured")
-    return await router.research(task)
+        @app.tool(name="finance")
+        async def finance_lookup(ticker: str, asset_type: str = "equity", market: str | None = None) -> str:
+            """Look up financial quotes for a given ticker (type: equity, fund, crypto, index)."""
+            if router is None:
+                raise RuntimeError("Web search router has not been configured")
+            payload: dict[str, Any] = {"ticker": ticker, "type": asset_type}
+            if market:
+                payload["market"] = market
+            res = await router.execute_codex_command("finance", [payload])
+            return res.get("output", "")
+
+        @app.tool(name="weather")
+        async def weather_lookup(location: str, start_date: str | None = None, duration_days: int | None = None) -> str:
+            """Look up weather forecast for location (e.g. 'City, Country')."""
+            if router is None:
+                raise RuntimeError("Web search router has not been configured")
+            payload: dict[str, Any] = {"location": location}
+            if start_date:
+                payload["start"] = start_date
+            if duration_days:
+                payload["duration"] = duration_days
+            res = await router.execute_codex_command("weather", [payload])
+            return res.get("output", "")
+
+        @app.tool(name="sports")
+        async def sports_lookup(league: str, fn: str = "schedule", team: str | None = None) -> str:
+            """Look up sports schedules and standings (league: nba, wnba, nfl, nhl, mlb, epl, ncaamb, ncaawb, ipl; fn: schedule or standings)."""
+            if router is None:
+                raise RuntimeError("Web search router has not been configured")
+            payload: dict[str, Any] = {"tool": "sports", "fn": fn, "league": league}
+            if team:
+                payload["team"] = team
+            res = await router.execute_codex_command("sports", [payload])
+            return res.get("output", "")
+
+        @app.tool(name="world-time")
+        async def world_time(utc_offset: str) -> str:
+            """Get current time for UTC offset (e.g. '+08:00' or '-05:00')."""
+            if router is None:
+                raise RuntimeError("Web search router has not been configured")
+            res = await router.execute_codex_command("time", [{"utc_offset": utc_offset}])
+            return res.get("output", "")
+
+    if cfg.tavily_keys:
+        @app.tool(name="research")
+        async def tavily_research(task: str) -> str:
+            """Run deeper live-web research when a question needs multiple sources, corroboration, or synthesis. Return source URLs and distinguish measured results from estimates."""
+            if not task.strip():
+                raise ValueError("task must not be empty")
+            if router is None:
+                raise RuntimeError("Web search router has not been configured")
+            return await router.research(task)
+
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -747,6 +936,7 @@ def main() -> None:
 
     global router
     router = SearchRouter(config)
+    register_tools(mcp, config)
     mcp.run(transport="stdio", show_banner=False)
 
 
