@@ -40,7 +40,7 @@ SQL
 
 records="$(
   docker exec "$postgres_container" sh -c \
-    'psql -X -q -A -t -F "|" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$1"' \
+    'psql -X -q -A -t -F "|" -U "${POSTGRES_USER:-cliproxyapi}" -d "${POSTGRES_DB:-cliproxyapi}" -c "$1"' \
     sh "$query"
 )"
 

@@ -88,6 +88,7 @@ def update_config(config_path: Path, model_ids: list[str]) -> int:
 
 def run_recent_errors(project_dir: Path) -> None:
     candidates = [
+        project_dir / "scripts" / "view-failure-logs.sh",
         project_dir / "view-failure-logs.sh",
         Path(__file__).resolve().parent / "view-failure-logs.sh",
     ]
@@ -96,7 +97,10 @@ def run_recent_errors(project_dir: Path) -> None:
         return
 
     print("=== Top 2 recent errors ===", flush=True)
-    subprocess.run([str(script_path), "60", "2"], cwd=project_dir, check=True)
+    try:
+        subprocess.run([str(script_path), "60", "2"], cwd=project_dir, check=True)
+    except Exception as exc:
+        print(f"Failed to fetch recent errors: {exc}")
     print(flush=True)
 
 
@@ -125,8 +129,15 @@ def deployed_version(
         text=True,
     ).stdout.strip()
     if not container:
-        return "not running"
-
+        fallback = subprocess.run(
+            ["docker", "ps", "-q", "-f", f"name={service}"],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if fallback:
+            container = fallback.split()[0]
+        else:
+            return "not running"
     result = subprocess.run(
         [
             "docker",
@@ -147,24 +158,9 @@ def deployed_version(
 
 def restart_stacks(
     project_dir: Path,
-    management_dir: Path,
-    management_compose_file: Path,
 ) -> None:
-    print("=== Restarting Docker Compose stacks ===", flush=True)
-    compose_command(project_dir, None, "down")
-    compose_command(management_dir, management_compose_file, "down")
-    compose_command(
-        management_dir,
-        management_compose_file,
-        "up",
-        "-d",
-        "postgres",
-        "docker-proxy",
-        "cliproxyapi",
-    )
+    print("=== Restarting CLIProxyAPI ===", flush=True)
     compose_command(project_dir, None, "up", "-d")
-    compose_command(management_dir, management_compose_file, "up", "-d")
-
 
 def print_version_result(name: str, before: str, after: str) -> None:
     if before == after:
@@ -191,12 +187,6 @@ def main() -> int:
     parser.add_argument("--project-dir", type=Path, default=project_dir, help="CLIProxyAPI project directory")
     parser.add_argument("--config", type=Path, default=None, help="Path to config.yaml")
     parser.add_argument(
-        "--management-dir",
-        type=Path,
-        default=project_dir.parent / "Dashboard_CPA",
-        help="Path to the CLIProxyAPI management dashboard repository",
-    )
-    parser.add_argument(
         "--no-restart",
         action="store_true",
         help="Update config without restarting Docker Compose",
@@ -205,13 +195,8 @@ def main() -> int:
 
     project_dir = args.project_dir.resolve()
     config_path = (args.config or (project_dir / "config.yaml")).resolve()
-    management_dir = args.management_dir.resolve()
-    management_compose_file = management_dir / "docker-compose.local.yml"
     if not config_path.is_file():
         print(f"Config file not found: {config_path}", file=sys.stderr)
-        return 1
-    if not management_compose_file.is_file():
-        print(f"Management Compose file not found: {management_compose_file}", file=sys.stderr)
         return 1
 
     try:
@@ -225,14 +210,8 @@ def main() -> int:
 
         if not args.no_restart:
             project_before = deployed_version(project_dir, None, "cli-proxy-api")
-            management_before = deployed_version(
-                management_dir, management_compose_file, "dashboard"
-            )
-            restart_stacks(project_dir, management_dir, management_compose_file)
+            restart_stacks(project_dir)
             project_after = deployed_version(project_dir, None, "cli-proxy-api")
-            management_after = deployed_version(
-                management_dir, management_compose_file, "dashboard"
-            )
     except (OSError, subprocess.CalledProcessError, ValueError) as error:
         print(f"Update failed: {error}", file=sys.stderr)
         return 1
@@ -242,8 +221,7 @@ def main() -> int:
     else:
         print()
         print_version_result("CLIProxyAPI", project_before, project_after)
-        print_version_result("CLIProxyAPI management", management_before, management_after)
-        print("Successfully updated and restarted both services.")
+        print("Successfully updated and restarted CLIProxyAPI.")
     return 0
 
 

@@ -1,13 +1,19 @@
 ---
 name: acad-help
-description: Research and review academic work against the applicable official syllabus, assessment objectives, rubrics, examiner guidance, past papers and answer material. Use when Codex needs to inspect a student's files, identify the correct Singapore-Cambridge GCE A-Level subject/level (default to H2 unless the subject exists only at H1), gather authoritative and reputable supporting documents into the workspace, diagnose gaps, improve an approximation or draft, or build a reusable model/checklist that directly addresses syllabus requirements.
+description: Research and review academic work against official syllabi, assessment objectives, rubrics, and examiner guidance, OR guide structured conceptual learning from a seed topic using hierarchical topic trees, chain-of-proof derivations, and interactive syllabus-grounded progression.
 ---
 
 # Acad Help
 
 Ground advice in the governing assessment documents and the student's actual artifact. Distinguish official requirements from teacher guidance, community heuristics, and inference.
 
-## Workflow
+## Modes of Operation
+- **Workflow A: Academic Artifact Review & Diagnosis** — Inspect and critique student drafts, solutions, and coursework against official syllabi and rubrics.
+- **Workflow B: Guided Concept Tree & Chain-of-Proof Learning** — Guide a student from a "seed" topic through structured topic trees, mathematical/economic/scientific proofs of mechanisms, and progressive exploration.
+
+---
+
+## Workflow A: Academic Artifact Review & Diagnosis
 
 ### 1. Establish the assessment context
 
@@ -95,3 +101,29 @@ End with a compact model the student can reapply, such as:
 - a prioritized revision plan.
 
 Name the official documents used, identify important unavailable material, and point to `./references/SOURCES.md`. If asked to edit files, make changes only after the diagnosis is grounded and preserve an unchanged source copy unless the user explicitly requests in-place editing.
+
+---
+
+## Workflow B: Guided Concept Tree & Chain-of-Proof Learning
+
+Use when guiding a student through a topic from a seed prompt.
+
+### 1. Establish Syllabus & Domain References
+1. Search for official curriculum frameworks covering the topic (e.g., Cambridge GCE A-Level H2 Economics/Math/Physics, IB HL/SL, AP, undergraduate standard curriculum).
+2. Identify key syllabus codes, core learning outcomes, and foundational textbooks/papers.
+
+### 2. Generate the Hierarchical Subject/Topic Tree
+Generate a comprehensive, beautifully formatted ASCII/Unicode concept tree mapping the topic in context:
+- Format: Clear branch structure (`├──`, `└──`, `│`) with generous spacing and alignment.
+- Explicit Marker: Clearly mark the seed topic with `◀── YOU ARE HERE`.
+- Annotations: Include concise, intuitive definitions/explanations for every node on the tree so students understand unfamiliar jargon immediately.
+- Comprehensive Scope: Display upstream prerequisites (what comes before), siblings/adjacent branches (related topics at the same level), and downstream extensions (advanced/applied topics).
+
+### 3. Deliver the Deep Dive & Chain of Proof for the Seed Topic
+1. **Fundamental Problem & Motivation**: What puzzle or economic/physical problem does this concept solve?
+2. **Step-by-Step Chain of Proof / Mechanism**: Explain the complete derivation or logical chain from first principles. Show *why* the mathematical or theoretical result holds so the student discovers how the proof came about rather than simply receiving a conclusion.
+3. **Empirical / Institutional Grounding**: Connect the theory to real-world mechanisms, historical context, or policy implementation.
+
+### 4. Interactive Learning Guidance & Checkpoints
+1. **Foundational Remediation**: If the user finds the topic difficult, identify prerequisite nodes on the tree and offer to step back to build core intuition first.
+2. **Lateral & Advanced Horizons**: If the user understands the core concept, provide bridges and teaser explanations to adjacent branches and deeper extensions on the tree.

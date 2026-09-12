@@ -851,7 +851,7 @@ def register_tools(app: FastMCP, cfg: RouterConfig) -> None:
             return res.get("results", [])
 
         @app.tool(name="finance")
-        async def finance_lookup(ticker: str, asset_type: str = "equity", market: str | None = None) -> str:
+        async def finance(ticker: str, asset_type: str = "equity", market: str | None = None) -> str:
             """Look up financial quotes for a given ticker (type: equity, fund, crypto, index)."""
             if router is None:
                 raise RuntimeError("Web search router has not been configured")
@@ -862,7 +862,7 @@ def register_tools(app: FastMCP, cfg: RouterConfig) -> None:
             return res.get("output", "")
 
         @app.tool(name="weather")
-        async def weather_lookup(location: str, start_date: str | None = None, duration_days: int | None = None) -> str:
+        async def weather(location: str, start_date: str | None = None, duration_days: int | None = None) -> str:
             """Look up weather forecast for location (e.g. 'City, Country')."""
             if router is None:
                 raise RuntimeError("Web search router has not been configured")
@@ -875,7 +875,7 @@ def register_tools(app: FastMCP, cfg: RouterConfig) -> None:
             return res.get("output", "")
 
         @app.tool(name="sports")
-        async def sports_lookup(league: str, fn: str = "schedule", team: str | None = None) -> str:
+        async def sports(league: str, fn: str = "schedule", team: str | None = None) -> str:
             """Look up sports schedules and standings (league: nba, wnba, nfl, nhl, mlb, epl, ncaamb, ncaawb, ipl; fn: schedule or standings)."""
             if router is None:
                 raise RuntimeError("Web search router has not been configured")
