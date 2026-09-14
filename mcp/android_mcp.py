@@ -62,7 +62,7 @@ class Target(Model):
 
 
 Point = tuple[Annotated[int, Field(ge=0)], Annotated[int, Field(ge=0)]]
-Seconds = Annotated[float, Field(ge=0, le=60)]
+Seconds = Annotated[float, Field(ge=0)]
 
 
 class Tap(Model):
@@ -109,7 +109,7 @@ class Swipe(Model):
     op: Literal["swipe", "drag"]
     start: Point
     end: Point
-    duration: Annotated[float, Field(gt=0, le=10)] = 0.3
+    duration: Annotated[float, Field(gt=0, le=10)] = 0.05
 
 
 class Scroll(Model):
@@ -139,7 +139,7 @@ class Wait(Model):
                 self.target = Target(text=self.text)
             else:
                 raise ValueError("Provide target (ref or selector) or text to wait for")
-        elif self.text is not None and self.target.text is None:
+        elif self.text is not None and self.target.text is None and self.target.ref is None:
             self.target.text = self.text
         return self
 
@@ -368,6 +368,30 @@ class Phone:
             self.device.implicitly_wait(self.wait_timeout)
             self.device.settings["operation_delay"] = (0, 0)
         return self.device
+    def reconnect(self):
+        try:
+            if self.device is not None:
+                try:
+                    self.device.reset_uiautomator()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self.device = None
+        return self.get()
+
+    def dump_hierarchy_safe(self, max_retries: int = 2) -> str:
+        for attempt in range(max_retries + 1):
+            try:
+                d = self.get()
+                xml = d.dump_hierarchy()
+                if xml and xml.strip().startswith("<"):
+                    return xml
+            except Exception:
+                if attempt < max_retries:
+                    time.sleep(0.3)
+                    self.reconnect()
+        return ""
     def screenshot(
         self,
         max_edge: int | None = None,
@@ -418,7 +442,8 @@ class Phone:
         include_system=False,
     ):
         d = self.get()
-        entries = hierarchy(d.dump_hierarchy())
+        xml = self.dump_hierarchy_safe() or d.dump_hierarchy()
+        entries = hierarchy(xml)
         width, height = d.window_size()
         if not include_system:
             entries = [
@@ -483,7 +508,7 @@ class Phone:
             entry = self.refs.get(target.ref)
             if entry is None:
                 raise ToolError("Unknown or expired ref; call screen again")
-            xml = d.dump_hierarchy()
+            xml = self.dump_hierarchy_safe() or d.dump_hierarchy()
             current = matching_entry(entry, hierarchy(xml))
             if current is None:
                 raise ToolError(
@@ -512,17 +537,55 @@ class Phone:
             )
         return obj
     def target_exists(self, xml: str, target: Target, exact: bool = False) -> bool:
-        if target.ref is not None:
-            entry = self.refs.get(target.ref)
-            if entry is None:
-                raise ToolError(f"Unknown or expired ref '{target.ref}'; call screen again")
-            return matching_entry(entry, hierarchy(xml)) is not None
-
-        entries = hierarchy(xml)
+        try:
+            entries = hierarchy(xml)
+        except Exception:
+            entries = []
         try:
             root = ET.fromstring(xml)
         except Exception:
             root = None
+
+        if target.ref is not None:
+            entry = self.refs.get(target.ref)
+            if entry is not None:
+                if matching_entry(entry, entries) is not None:
+                    return True
+                if entry.label:
+                    if any((e.label or "").strip() == entry.label.strip() for e in entries):
+                        return True
+                if entry.resource_id:
+                    if any((e.resource_id or "").strip() == entry.resource_id.strip() for e in entries):
+                        return True
+                if root is not None and (entry.label or entry.resource_id):
+                    for node in root.iter():
+                        n_text = (node.attrib.get("text") or "").strip()
+                        n_desc = (node.attrib.get("content-desc") or "").strip()
+                        n_res = (node.attrib.get("resource-id") or "").strip()
+                        if entry.resource_id and (n_res == entry.resource_id or n_res.endswith("/" + entry.resource_id.rsplit("/", 1)[-1])):
+                            return True
+                        if entry.label and (n_text == entry.label or n_desc == entry.label):
+                            return True
+                return False
+
+            ref_str = str(target.ref).strip()
+            if not ref_str:
+                return False
+            for e in entries:
+                cand_label = (e.label or "").strip()
+                cand_res = (e.resource_id or "").strip()
+                if cand_label.lower() == ref_str.lower() or cand_res.endswith("/" + ref_str) or cand_res == ref_str:
+                    return True
+            if root is not None:
+                for node in root.iter():
+                    n_text = (node.attrib.get("text") or "").strip()
+                    n_desc = (node.attrib.get("content-desc") or "").strip()
+                    n_res = (node.attrib.get("resource-id") or "").strip()
+                    if n_text.lower() == ref_str.lower() or n_desc.lower() == ref_str.lower():
+                        return True
+                    if n_res == ref_str or n_res.endswith("/" + ref_str):
+                        return True
+            return False
 
         target_text = (target.text or "").strip()
         target_desc = (target.description or "").strip()
@@ -543,10 +606,10 @@ class Phone:
 
             if target_text:
                 if exact:
-                    if cand_label.lower() == target_text.lower():
+                    if cand_label.lower() == target_text.lower() or cand_res.lower() == target_text.lower():
                         return True
                 else:
-                    if target_text.lower() in cand_label.lower():
+                    if target_text.lower() in cand_label.lower() or target_text.lower() in cand_res.lower():
                         return True
 
             if target_desc:
@@ -582,12 +645,12 @@ class Phone:
                             continue
 
                 if target_text:
+                    t_low = target_text.lower()
                     if exact:
-                        if target_text.lower() != n_text.lower() and target_text.lower() != n_desc.lower():
+                        if t_low != n_text.lower() and t_low != n_desc.lower() and t_low != n_res.lower():
                             continue
                     else:
-                        t_low = target_text.lower()
-                        if t_low not in n_text.lower() and t_low not in n_desc.lower():
+                        if t_low not in n_text.lower() and t_low not in n_desc.lower() and t_low not in n_res.lower():
                             continue
 
                 if any([target_text, target_desc, target_res, target_cls]):
@@ -714,17 +777,24 @@ class Phone:
             if target is None:
                 raise ToolError("Wait requires target (ref or selector) or text")
 
-            timeout = max(0.1, min(float(action.timeout), 25.0))
+            timeout = max(0.1, float(action.timeout))
             deadline = time.monotonic() + timeout
             poll_interval = 0.4
 
             while True:
-                xml = d.dump_hierarchy()
-                exists = self.target_exists(xml, target, exact=action.exact)
-                if action.gone and not exists:
-                    return
-                if not action.gone and exists:
-                    return
+                try:
+                    xml = self.dump_hierarchy_safe()
+                    has_valid_xml = bool(xml and xml.strip().startswith("<"))
+                    exists = self.target_exists(xml, target, exact=action.exact) if has_valid_xml else False
+                except Exception:
+                    has_valid_xml = False
+                    exists = False
+
+                if has_valid_xml:
+                    if action.gone and not exists:
+                        return
+                    if not action.gone and exists:
+                        return
 
                 now = time.monotonic()
                 if now >= deadline:
@@ -733,13 +803,16 @@ class Phone:
                 time.sleep(min(poll_interval, max(0.05, deadline - now)))
 
             verb = "disappear" if action.gone else "appear"
-            target_desc = f"ref {target.ref}" if target.ref else (target.text or target.description or "target")
-            obs = self.observe()
+            target_desc = f"ref {target.ref}" if target.ref else (target.text or target.description or target.resource_id or "target")
+            try:
+                obs = self.observe()
+            except Exception:
+                obs = "Unable to observe screen after timeout."
             raise ToolError(
                 f"Timed out waiting {timeout:.1f}s for {target_desc} to {verb}.\n{obs}"
             )
         elif isinstance(action, Pause):
-            time.sleep(min(float(action.seconds), 25.0))
+            time.sleep(max(0.0, float(action.seconds)))
         elif isinstance(action, Editor):
             if d.current_ime() != "com.github.uiautomator/.AdbKeyboard":
                 raise ToolError(
@@ -810,10 +883,11 @@ mcp = FastMCP(
         'Every act action requires an "op" field, e.g. '
         'act(actions=[{"op":"tap","target":{"ref":"2"}}]). '
         "Prefer tap, input, key, open_app, swipe, drag and scroll for single actions; act is for batches. "
+        "Do not use or specify duration unless strictly necessary (default durations are sufficient for drag, swipe, etc.; omit duration unless an explicit hold or drag timing is specifically required). "
         "Refs are plain numbers, retained for unchanged controls and never reassigned to different controls. "
         "Use the latest screen refs; removed controls and device selection invalidate refs. "
         "Always prefer conditional wait (wait(text='...') or wait(target=ref, gone=true)) over blind sleeps/pauses; "
-        "wait for specific buttons, moves, text, or loading spinners to appear/disappear instead of guessing durations. "
+        "duration is optional. Wait for specific buttons, moves, text, or loading spinners to appear/disappear instead of guessing durations. "
         "Input accepts Unicode and newlines verbatim; never shell-escape it. Key sequences use "
         "Android numeric keycodes with optional meta bitmask (CTRL=4096, SHIFT=1, ALT=2), or "
         "uiautomator2 names: home, back, left, right, up, down, center, menu, search, enter, "
@@ -1215,11 +1289,13 @@ def macro(
     else:  # run
         return act(macro=name, actions=actions, vars=vars, feedback=feedback)
 
-def target_value(target: str | int | Target | None) -> Target | None:
+def target_value(target: str | int | Target | dict | None) -> Target | None:
     if target is None:
         return None
     if isinstance(target, Target):
         return target
+    if isinstance(target, dict):
+        return Target(**target)
     if isinstance(target, int) or (isinstance(target, str) and target.isdecimal()):
         return Target(ref=str(target))
     return Target(text=str(target))
@@ -1230,10 +1306,18 @@ def target_value(target: str | int | Target | None) -> Target | None:
 def tap(
     target: str | int | None = None,
     point: Point | None = None,
-    duration: Annotated[float, Field(gt=0, le=10)] | None = None,
+    duration: Annotated[
+        float,
+        Field(
+            gt=0,
+            le=10,
+            description="Hold duration in seconds for long press. Do not specify duration unless a long press is necessary; omit for a normal tap.",
+        ),
+    ]
+    | None = None,
     double: bool = False,
 ) -> str:
-    """Tap a numeric ref/exact label or point. duration=0.8 holds for 0.8 seconds; double=true double-taps. Omit both for a normal tap. Target wins over point, never coordinate fallback. Returns screen. Examples: tap(target=2), tap(point=[540,600]), tap(target=2,duration=0.8)."""
+    """Tap a numeric ref/exact label or point. Do not specify duration unless a long press is necessary (duration=0.8 holds for 0.8s; double=true double-taps; omit both for a normal tap). Target wins over point, never coordinate fallback. Returns screen. Examples: tap(target=2), tap(point=[540,600])."""
     if double and duration is not None:
         raise ToolError("Choose a hold duration or double=true, not both")
     op = "double_tap" if double else "long_press" if duration is not None else "tap"
@@ -1296,18 +1380,36 @@ def open_app(package: str, activity: str | None = None) -> str:
 @mcp.tool()
 @serialized
 def swipe(
-    start: Point, end: Point, duration: Annotated[float, Field(gt=0, le=10)] = 0.3
+    start: Point,
+    end: Point,
+    duration: Annotated[
+        float,
+        Field(
+            gt=0,
+            le=10,
+            description="Duration in seconds. Do not specify duration unless strictly necessary; default 50ms is sufficient.",
+        ),
+    ] = 0.05,
 ) -> str:
-    """Swipe from start=[x,y] to end=[x,y] in device pixels, origin top-left. Up: end y smaller; down: larger. Returns resulting screen."""
+    """Swipe from start=[x,y] to end=[x,y] in device pixels (default duration 50ms). Do not specify duration unless strictly necessary. Returns resulting screen."""
     return execute([Swipe(op="swipe", start=start, end=end, duration=duration)])
 
 
 @mcp.tool()
 @serialized
 def drag(
-    start: Point, end: Point, duration: Annotated[float, Field(gt=0, le=10)] = 0.5
+    start: Point,
+    end: Point,
+    duration: Annotated[
+        float,
+        Field(
+            gt=0,
+            le=10,
+            description="Duration in seconds. Do not specify duration unless strictly necessary; default 50ms is sufficient.",
+        ),
+    ] = 0.05,
 ) -> str:
-    """Drag from start=[x,y] to end=[x,y] in device pixels. Returns resulting screen."""
+    """Drag from start=[x,y] to end=[x,y] in device pixels (default duration 50ms). Do not specify duration unless strictly necessary. Returns resulting screen."""
     return execute([Swipe(op="drag", start=start, end=end, duration=duration)])
 
 
@@ -1335,38 +1437,90 @@ def system(action: SystemAction) -> str:
 @mcp.tool()
 @serialized
 def wait(
-    text: str | None = None,
-    target: str | int | None = None,
-    seconds: Seconds | None = None,
-    duration: Seconds | None = None,
-    timeout: Seconds = 10,
-    gone: bool = False,
-    exact: bool = False,
+    text: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="Text to wait for (optional). PREFER conditional wait over fixed duration sleeps.",
+        ),
+    ] = None,
+    target: Annotated[
+        str | int | None,
+        Field(
+            default=None,
+            description="Screen ref (e.g. 2 or '2') or label/selector to wait for (optional).",
+        ),
+    ] = None,
+    seconds: Annotated[
+        Seconds | None,
+        Field(
+            default=None,
+            description="Optional pause duration or wait timeout in seconds (duration/seconds is optional).",
+        ),
+    ] = None,
+    duration: Annotated[
+        Seconds | None,
+        Field(
+            default=None,
+            description="Optional pause duration or wait timeout in seconds (duration is entirely optional).",
+        ),
+    ] = None,
+    timeout: Annotated[
+        Seconds,
+        Field(
+            default=10,
+            description="Max seconds to wait for conditional change before timing out (optional, default 10).",
+        ),
+    ] = 10,
+    gone: Annotated[
+        bool,
+        Field(
+            default=False,
+            description="If true, wait for element or text to disappear instead of appear (optional, default false).",
+        ),
+    ] = False,
+    exact: Annotated[
+        bool,
+        Field(
+            default=False,
+            description="If true, match text exactly instead of substring (optional, default false).",
+        ),
+    ] = False,
 ) -> str:
     """Conditional wait for on-screen state changes: wait for text or an element to appear or disappear (gone=true).
+    Duration and seconds are completely OPTIONAL.
     PREFER conditional wait (e.g. wait(text="...") or wait(target=ref, gone=true)) over fixed duration sleeps.
     AVOID blind duration sleeps; wait for specific moves, buttons, text, or loading indicators to appear/disappear instead.
-    Matching inspects all on-screen content (labels, text, content-description, child text). Returns resulting screen."""
-    sleep_duration = seconds if seconds is not None else duration
+    Matching inspects all on-screen content (labels, text, content-description, child text, resource-id).
+    If no text or target is provided, wait acts as a pause for duration/seconds/timeout. Returns resulting screen."""
+    if isinstance(text, (int, float)) and not isinstance(text, bool):
+        if duration is None and seconds is None:
+            seconds = float(text)
+        text = None
+
+    sleep_duration = duration if duration is not None else seconds
+
     if text is None and target is None:
-        if sleep_duration is not None:
-            return execute([Pause(op="pause", seconds=min(float(sleep_duration), 25.0))])
-        # If neither provided, default to pause with timeout
-        return execute([Pause(op="pause", seconds=min(float(timeout), 25.0))])
+        pause_time = float(sleep_duration) if sleep_duration is not None else float(timeout)
+        return execute([Pause(op="pause", seconds=pause_time)])
 
     resolved_target = None
     if target is not None:
         resolved_target = target_value(target)
     elif text is not None:
-        resolved_target = Target(text=text)
+        resolved_target = Target(text=str(text))
+
+    effective_timeout = (
+        float(sleep_duration) if sleep_duration is not None else float(timeout)
+    )
 
     return execute(
         [
             Wait(
                 op="wait",
                 target=resolved_target,
-                text=text,
-                timeout=min(float(timeout), 25.0),
+                text=str(text) if text is not None else None,
+                timeout=effective_timeout,
                 gone=gone,
                 exact=exact,
             )
