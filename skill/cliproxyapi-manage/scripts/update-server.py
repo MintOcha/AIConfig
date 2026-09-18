@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Refresh CLIProxyAPI configuration and restart both Docker Compose stacks."""
+"""Refresh CLIProxyAPI configuration, keep Postgres alive, and update CLIProxyAPI and Dashboard stacks."""
 
 import argparse
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 from urllib.request import Request, urlopen
 
 import yaml
@@ -13,6 +14,10 @@ import yaml
 
 MODELS_URL = "https://opencode.ai/zen/go/v1/models"
 OPENCODE_BASE_URL = "https://opencode.ai/zen/go/v1"
+
+CLI_PROXY_CONTAINER = "cli-proxy-api"
+POSTGRES_CONTAINER = "cliproxyapi-postgres"
+DASHBOARD_CONTAINER = "cliproxyapi-dashboard"
 
 
 def fetch_models() -> list[str]:
@@ -143,7 +148,7 @@ def deployed_version(
             "docker",
             "inspect",
             "--format",
-            "{{index .Config.Labels \"org.opencontainers.image.version\"}}|{{.Image}}",
+            '{{index .Config.Labels "org.opencontainers.image.version"}}|{{.Image}}',
             container,
         ],
         check=True,
@@ -156,11 +161,85 @@ def deployed_version(
     return image_id.removeprefix("sha256:")[:12] or "unknown"
 
 
-def restart_stacks(
-    project_dir: Path,
-) -> None:
+def running_container_names() -> set[str]:
+    result = subprocess.run(
+        ["docker", "ps", "--format", "{{.Names}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return set(result.stdout.split())
+
+
+def wait_until_healthy(container: str, timeout_seconds: int = 60) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        result = subprocess.run(
+            ["docker", "inspect", "--format", "{{.State.Health.Status}}", container],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip() == "healthy":
+            return True
+        time.sleep(3)
+    return False
+
+
+def ensure_postgres_running() -> None:
+    if POSTGRES_CONTAINER in running_container_names():
+        return
+    print(f"{POSTGRES_CONTAINER} is stopped; starting it...", flush=True)
+    subprocess.run(["docker", "start", POSTGRES_CONTAINER], check=True)
+    if not wait_until_healthy(POSTGRES_CONTAINER):
+        raise RuntimeError(f"{POSTGRES_CONTAINER} did not become healthy in time")
+    print(f"{POSTGRES_CONTAINER} is healthy.", flush=True)
+
+
+def discover_dashboard_dir(project_dir: Path) -> Path | None:
+    candidates = [
+        project_dir.parent / "Dashboard_CPA",
+        Path("/home/nas/Projects/Dashboard_CPA"),
+        Path.cwd(),
+    ]
+    for c in candidates:
+        if (c / "compose.yaml").is_file() or (c / "docker-compose.yml").is_file():
+            return c
+    return None
+
+
+def resolve_compose_file(directory: Path) -> Path | None:
+    for name in ("compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"):
+        p = directory / name
+        if p.is_file():
+            return p
+    return None
+
+
+def update_dashboard(dashboard_dir: Path) -> tuple[str, str]:
+    compose_file = resolve_compose_file(dashboard_dir)
+    before_version = deployed_version(dashboard_dir, compose_file, "dashboard")
+    print("=== Updating Dashboard ===", flush=True)
+    compose_command(dashboard_dir, compose_file, "pull", "dashboard")
+    compose_command(dashboard_dir, compose_file, "up", "-d", "dashboard")
+    after_version = deployed_version(dashboard_dir, compose_file, "dashboard")
+    return before_version, after_version
+
+
+def restart_stacks(project_dir: Path) -> None:
     print("=== Restarting CLIProxyAPI ===", flush=True)
     compose_command(project_dir, None, "up", "-d")
+
+
+def verify_containers_running(include_dashboard: bool = True) -> None:
+    running = running_container_names()
+    required = [CLI_PROXY_CONTAINER, POSTGRES_CONTAINER]
+    if include_dashboard:
+        required.append(DASHBOARD_CONTAINER)
+    missing = [name for name in required if name not in running]
+    if missing:
+        raise RuntimeError(f"container(s) not running after update: {', '.join(missing)}")
+    print(f"Verified running: {', '.join(required)}.", flush=True)
+
 
 def print_version_result(name: str, before: str, after: str) -> None:
     if before == after:
@@ -185,6 +264,7 @@ def main() -> int:
     project_dir = resolve_default_project_dir()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-dir", type=Path, default=project_dir, help="CLIProxyAPI project directory")
+    parser.add_argument("--dashboard-dir", type=Path, default=None, help="Dashboard_CPA project directory")
     parser.add_argument("--config", type=Path, default=None, help="Path to config.yaml")
     parser.add_argument(
         "--no-restart",
@@ -195,9 +275,14 @@ def main() -> int:
 
     project_dir = args.project_dir.resolve()
     config_path = (args.config or (project_dir / "config.yaml")).resolve()
+    dashboard_dir = (args.dashboard_dir.resolve() if args.dashboard_dir else discover_dashboard_dir(project_dir))
+
     if not config_path.is_file():
         print(f"Config file not found: {config_path}", file=sys.stderr)
         return 1
+
+    dashboard_before = "unknown"
+    dashboard_after = "unknown"
 
     try:
         run_recent_errors(project_dir)
@@ -208,11 +293,20 @@ def main() -> int:
         else:
             print(f"Synchronized models for {updated_providers} OpenCode provider(s).")
 
+        ensure_postgres_running()
+
         if not args.no_restart:
             project_before = deployed_version(project_dir, None, "cli-proxy-api")
             restart_stacks(project_dir)
             project_after = deployed_version(project_dir, None, "cli-proxy-api")
-    except (OSError, subprocess.CalledProcessError, ValueError) as error:
+
+            if dashboard_dir:
+                dashboard_before, dashboard_after = update_dashboard(dashboard_dir)
+            else:
+                print("Dashboard directory not found; skipping Dashboard update.", flush=True)
+
+        verify_containers_running(include_dashboard=dashboard_dir is not None and not args.no_restart)
+    except (OSError, subprocess.CalledProcessError, ValueError, RuntimeError) as error:
         print(f"Update failed: {error}", file=sys.stderr)
         return 1
 
@@ -221,7 +315,9 @@ def main() -> int:
     else:
         print()
         print_version_result("CLIProxyAPI", project_before, project_after)
-        print("Successfully updated and restarted CLIProxyAPI.")
+        if dashboard_dir:
+            print_version_result("Dashboard", dashboard_before, dashboard_after)
+        print("Successfully updated and restarted CLIProxyAPI and Dashboard.")
     return 0
 
 
