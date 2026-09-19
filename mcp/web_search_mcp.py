@@ -440,6 +440,18 @@ class SearchRouter:
         self._brave_client_factory = brave_client_factory
         self._duckduckgo_client_factory = duckduckgo_client_factory
         self._codex_client_factory = codex_client_factory
+        self.session_id = str(uuid.uuid4())
+        self._url_to_view_ref: dict[str, str] = {}
+
+    def record_view_ref(self, ref_id: str, output: str) -> None:
+        m = re.search(r"cite(turn\d+view\d+)", output)
+        if m:
+            view_ref = m.group(1)
+            self._url_to_view_ref[ref_id] = view_ref
+            self._url_to_view_ref[view_ref] = view_ref
+
+    def resolve_view_ref(self, ref_id: str) -> str:
+        return self._url_to_view_ref.get(ref_id, ref_id)
 
     def _duckduckgo_client(self) -> Client:
         transport = StdioTransport(
@@ -531,6 +543,7 @@ class SearchRouter:
                             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
                         },
                         json={
+                            "id": str(uuid.uuid4()),
                             "model": self.config.codex_standalone_model,
                             "commands": {"search_query": [{"q": query}]},
                         },
@@ -759,7 +772,7 @@ class SearchRouter:
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
                 },
                 json={
-                    "id": str(uuid.uuid4()),
+                    "id": self.session_id,
                     "model": self.config.codex_standalone_model,
                     "commands": {command_name: command_payload},
                 },
@@ -811,31 +824,33 @@ def register_tools(app: FastMCP, cfg: RouterConfig) -> None:
             if router is None:
                 raise RuntimeError("Web search router has not been configured")
             res = await router.execute_codex_command("open", [{"ref_id": ref_id, "lineno": lineno}])
-            return res.get("output", "")
+            output = res.get("output", "")
+            router.record_view_ref(ref_id, output)
+            return output
 
         @app.tool(name="click-link")
         async def click_link(ref_id: str, link_id: int) -> str:
             """Open the link `link_id` (numbered link `【{id}†.*】`) from previously opened page `ref_id`."""
             if router is None:
                 raise RuntimeError("Web search router has not been configured")
-            res = await router.execute_codex_command("click", [{"ref_id": ref_id, "id": link_id}])
-            return res.get("output", "")
+            resolved_ref = router.resolve_view_ref(ref_id)
+            res = await router.execute_codex_command("click", [{"ref_id": resolved_ref, "id": link_id}])
+            output = res.get("output", "")
+            router.record_view_ref(ref_id, output)
+            router.record_view_ref(resolved_ref, output)
+            return output
 
         @app.tool(name="find-in-page")
         async def find_in_page(ref_id: str, pattern: str) -> str:
             """Find text pattern in page indicated by `ref_id` or URL."""
             if router is None:
                 raise RuntimeError("Web search router has not been configured")
-            res = await router.execute_codex_command("find", [{"ref_id": ref_id, "pattern": pattern}])
-            return res.get("output", "")
-
-        @app.tool(name="screenshot-pdf")
-        async def screenshot_pdf(ref_id: str, pageno: int) -> str:
-            """Take a screenshot of page `pageno` (0-indexed) indicated by `ref_id` or URL (works on PDFs)."""
-            if router is None:
-                raise RuntimeError("Web search router has not been configured")
-            res = await router.execute_codex_command("screenshot", [{"ref_id": ref_id, "pageno": pageno}])
-            return res.get("output", "")
+            resolved_ref = router.resolve_view_ref(ref_id)
+            res = await router.execute_codex_command("find", [{"ref_id": resolved_ref, "pattern": pattern}])
+            output = res.get("output", "")
+            router.record_view_ref(ref_id, output)
+            router.record_view_ref(resolved_ref, output)
+            return output
 
         @app.tool(name="image-search")
         async def image_search(query: str, recency_days: int | None = None, domains: list[str] | None = None) -> list[dict[str, Any]]:
@@ -848,7 +863,40 @@ def register_tools(app: FastMCP, cfg: RouterConfig) -> None:
             if domains is not None:
                 payload["domains"] = domains
             res = await router.execute_codex_command("image_query", [payload])
-            return res.get("results", [])
+            raw_output = res.get("output", "")
+            if not raw_output:
+                return res.get("results", [])
+            results: list[dict[str, Any]] = []
+            for block in re.split(r"-{20,}", raw_output):
+                block = block.strip()
+                if not block:
+                    continue
+                lines = block.splitlines()
+                first_line = lines[0] if lines else ""
+                title = first_line
+                page_url = ""
+                m_page = re.match(r"^(.*?)\s*\((https?://[^\s)]+)\)$", first_line)
+                if m_page:
+                    title = m_page.group(1).strip()
+                    page_url = m_page.group(2).strip()
+                image_url = ""
+                m_img = re.search(r"Image URL:\s*(https?://[^\s#]+)", block)
+                if m_img:
+                    image_url = m_img.group(1)
+                desc_lines = [
+                    line.strip()
+                    for line in lines[1:]
+                    if not line.startswith("Image URL:")
+                    and not line.startswith("\ue200cite")
+                    and line.strip()
+                ]
+                results.append({
+                    "title": title,
+                    "page_url": page_url,
+                    "image_url": image_url,
+                    "description": "\n".join(desc_lines),
+                })
+            return results or res.get("results", [])
 
         @app.tool(name="finance")
         async def finance(ticker: str, asset_type: str = "equity", market: str | None = None) -> str:
