@@ -2050,24 +2050,28 @@ async def upload_dataset(
     MCP returns after 29 seconds with a PID and log if still running. The upload
     continues: monitor its log, do NOT restart it. Use CLI for future long uploads.
     """
-    import tempfile
-    deadline = asyncio.get_running_loop().time() + 29
     options = dict(title=title, dataset_slug=dataset_slug, private=private,
                    version_notes=version_notes, keep_tabular=keep_tabular, dir_mode=dir_mode)
-    with tempfile.NamedTemporaryFile(prefix="kaggle-upload-", suffix=".log", delete=False) as log:
-        command = [sys.executable, str(Path(__file__).resolve()), "--workspace-root",
-                   str(get_workspace_root()), "upload", path, "--options", json.dumps(options)]
+    return await _transfer("upload", path, options)
+
+
+async def _transfer(operation: str, source: str, options: dict) -> str:
+    import tempfile
+    deadline = asyncio.get_running_loop().time() + 29
+    with tempfile.NamedTemporaryFile(prefix=f"kaggle-{operation}-", suffix=".log", delete=False) as log:
+        command = [sys.executable, "-u", str(Path(__file__).resolve()), "--workspace-root",
+                   str(get_workspace_root()), operation, source, "--options", json.dumps(options)]
         proc = await asyncio.create_subprocess_exec(*command, env=_cli_env(),
                    stdout=log, stderr=log, start_new_session=True)
         try:
             await asyncio.wait_for(proc.wait(), timeout=max(0, deadline - asyncio.get_running_loop().time()))
         except TimeoutError:
-            return (f"Please run as CLI for long uploads. This upload is still running as PID {proc.pid}. "
+            return (f"Please run as CLI for long transfers. This {operation} is still running as PID {proc.pid}. "
                     f"Log: {log.name}. Do not restart it; inspect the log for completion or errors. "
-                    "Future uploads: uv run --script mcp/kaggle_mcp.py upload PATH --options JSON")
+                    f"Future transfers: uv run --script mcp/kaggle_mcp.py {operation} SOURCE --options JSON")
     output = Path(log.name).read_text()
     if proc.returncode:
-        raise RuntimeError(f"Upload failed ({proc.returncode}). Log: {log.name}\n{output}")
+        raise RuntimeError(f"{operation.capitalize()} failed ({proc.returncode}). Log: {log.name}\n{output}")
     return output
 
 
@@ -2157,10 +2161,17 @@ async def download_dataset(
     target_dir: str | None = None,
     unzip: bool = True,
 ) -> str:
-    """Download a Kaggle dataset into the local workspace.
+    """Download a dataset. Please run as CLI for long downloads:
 
-    Target directory defaults to ./kaggle/datasets/<dataset_name>/.
+    uv run --script mcp/kaggle_mcp.py download OWNER/SLUG --options '{"unzip":true}'
+
+    Options: target_dir, unzip. Default destination: ./kaggle/datasets/<slug>/.
+    After 29 seconds MCP returns the PID and log; download continues. Do not restart it.
     """
+    return await _transfer("download", dataset, dict(target_dir=target_dir, unzip=unzip))
+
+
+def _download_dataset(dataset: str, target_dir: str | None = None, unzip: bool = True) -> str:
     clean_ref = dataset.strip()
     slug = clean_ref.split("/")[-1]
     if target_dir:
@@ -2182,7 +2193,7 @@ async def download_dataset(
     tree_text = compact_directory_tree(dest)
 
     return (
-        f"Downloaded dataset '{clean_ref}' into `{dest.relative_to(get_workspace_root())}`:\n"
+        f"Downloaded dataset '{clean_ref}' into `{dest}`:\n"
         f"- Files: {file_count} ({human_size(total_size)})\n\n"
         f"```text\n{tree_text}\n```"
     )
@@ -2297,6 +2308,9 @@ def parse_args() -> argparse.Namespace:
     upload = subparsers.add_parser("upload", help="Upload dataset without the MCP call timeout")
     upload.add_argument("path")
     upload.add_argument("--options", default="{}", help="JSON upload options")
+    download = subparsers.add_parser("download", help="Download dataset without the MCP call timeout")
+    download.add_argument("dataset")
+    download.add_argument("--options", default="{}", help="JSON download options")
 
     return parser.parse_args()
 
@@ -2348,6 +2362,8 @@ def main() -> None:
             print(asyncio.run(fetch_output(args.notebook, run_number=args.run)))
         elif cmd == "upload":
             print(_upload_dataset(args.path, **json.loads(args.options)))
+        elif cmd == "download":
+            print(_download_dataset(args.dataset, **json.loads(args.options)))
         return
 
     # MCP server mode
