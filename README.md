@@ -235,14 +235,18 @@ Choose **Kaggle** under **Install MCPs** in `./scripts/install.py`.
 - `init_notebook`: initializes a brand new notebook experiment under `./kaggle/<notebook>/` with starter code (`train.py` or `notebook.ipynb`) and fresh `kernel-metadata.json`.
 - `save_notebook`: saves code and updates `kernel-metadata.json` locally and syncs to Kaggle cloud WITHOUT starting execution. If a `.py` script is present, automatically wraps it into `notebook.ipynb` (%%writefile + !python) for safe DDP/GPU multiprocessing.
 - `push_notebook`: pushes code to Kaggle and QUEUES EXECUTION (starts a new version/run on Kaggle Cloud). Increments run tracking (`total_runs`, `last_version_number`) in `kernel-metadata.json`.
-- `wait_for_complete`: waits for long-running executions (which can take hours) to finish without polling in tight loops. Automatically downloads outputs and builds compressed summaries upon completion.
-- `view_status`: fast execution status check (`QUEUED`, `RUNNING`, `COMPLETE`, `CANCEL_ACKNOWLEDGED`) in ~1.5s. Set `fetch_logs=True` to download and tail execution logs.
-- `fetch_output`: downloads output artifacts into `./kaggle/<notebook>/runs/<version>/output/`, parses `metrics.json`, and generates compact summaries (`summary.txt`, `tree.txt`, `logs.compressed.txt`).
-- `upload_dataset`: creates or updates Kaggle datasets from local files or directories, preserving tabular data (`.parquet`, `.csv`).
-- `download_dataset`: downloads Kaggle datasets into `./kaggle/datasets/<dataset_name>/`.
-- `list_datasets` / `list_notebook_names` / `list_active_runs`: browses account resources and active jobs.
-- `get_quota`: shows weekly GPU and TPU hours remaining, used, and refresh dates.
-- `cancel_run`: cancels active remote kernel sessions.
+- `wait_for_notebook`: waits for completion or matching log text with an explicit timeout; output retrieval is separate.
+- `view_notebook`: shows execution state, hardware, and recent logs.
+- `pull_outputs`: retrieves notebook output artifacts and builds compressed summaries.
+- `push_dataset` / `pull_dataset`: publish or retrieve dataset files. Long transfers return a PID and log after 29 seconds and continue without restarting.
+- `view_dataset` / `view_model`: inspect resource details; dataset details include visibility and processing state.
+- `update_dataset` / `update_notebook`: edit remote dataset presentation or local notebook presentation, respectively.
+- `search_datasets` / `search_notebooks` / `search_models` / `search_competitions`: discover public resources.
+- `list_datasets` / `list_notebooks` / `list_notebook_runs`: browse account resources and active jobs.
+- `list_dataset_files` / `preview_dataset`: inspect filenames or a bounded text sample.
+- `view_quota`: shows accelerator allowance.
+- `cancel_notebook`: cancels an active notebook session.
+- `delete_dataset` / `delete_notebook`: permanently remove the specified resource.
 
 CLI Usage:
 The script is also directly runnable from the command line:

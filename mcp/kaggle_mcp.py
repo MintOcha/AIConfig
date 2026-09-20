@@ -52,10 +52,10 @@ CANONICAL WORKFLOW:
    - `push_notebook(notebook="...")`: pushes to Kaggle and QUEUES EXECUTION (starts a new run/version).
 4. Long-Running Execution & Waiting:
    - Kaggle training runs frequently take 10 minutes to several hours.
-   - NEVER poll `view_status` in tight loops.
-   - Use `wait(notebook="owner/slug", until="complete", timeout=20)` or `until="log", text="epoch 1"`.
-   - Longer waits require a matching client timeout; output download is explicit via fetch_output.
-   - When finished, `fetch_output` downloads all artifacts into `./kaggle/<notebook>/runs/<version>/output/` and generates `summary.txt` with compressed logs.
+   - NEVER poll `view_notebook` in tight loops.
+   - Use `wait_for_notebook(notebook="owner/slug", until="complete", timeout=20)` or `until="log", text="epoch 1"`.
+   - Longer waits require a matching client timeout; output download is explicit via pull_outputs.
+   - When finished, `pull_outputs` retrieves artifacts and compressed summaries.
 """
 )
 
@@ -393,7 +393,6 @@ print(json.dumps(dict(dataset=dataset, file=filename, columns=columns, rows=resu
     return await _query_process([sys.executable, "-c", code, dataset, file_name, str(rows)])
 
 
-@app.tool()
 async def search_library(
     query: str,
     kind: str = "datasets",
@@ -431,6 +430,18 @@ async def search_library(
     return await _query_kaggle(cmd)
 
 
+def _register_search(resource: str) -> None:
+    async def search(query: str, page: int = 1, page_token: str | None = None,
+                     owner: str | None = None, sort_by: str | None = None) -> str:
+        return await search_library(query, resource, page, page_token, owner, sort_by)
+    search.__doc__ = f"Search Kaggle {resource} without downloading or changing anything. Models use page_token instead of page."
+    app.tool(name=f"search_{resource}")(search)
+
+
+for _resource in ("datasets", "notebooks", "models", "competitions"):
+    _register_search(_resource)
+
+
 @app.tool()
 async def list_dataset_files(dataset: str, page_token: str | None = None, page_size: int = 20) -> str:
     """Inspect dataset filenames and sizes without downloading. Pass owner/slug.
@@ -445,7 +456,6 @@ async def list_dataset_files(dataset: str, page_token: str | None = None, page_s
     return await _query_kaggle(cmd)
 
 
-@app.tool()
 async def read_metadata(reference: str, kind: str = "datasets") -> str:
     """Read dataset or model metadata by owner/slug without downloading files or weights."""
     if kind not in {"datasets", "models"}:
@@ -478,7 +488,29 @@ with api.build_kaggle_client() as client:
     return await _query_process([sys.executable, "-c", code, kind, reference])
 
 
-@app.tool()
+@app.tool(name="view_dataset")
+async def read_dataset(dataset: str) -> str:
+    """Read dataset details, explicit visibility, and upload processing state."""
+    details, status = await asyncio.gather(read_metadata(dataset, "datasets"),
+                                         _query_kaggle(["datasets", "status", dataset]),
+                                         return_exceptions=True)
+    if isinstance(details, BaseException):
+        raise details
+    result = json.loads(details)
+    if isinstance(status, BaseException):
+        result["status_error"] = str(status)
+    else:
+        result["status"] = status.strip()
+    return json.dumps(result)
+
+
+@app.tool(name="view_model")
+async def read_model(model: str) -> str:
+    """Read model details and available variations without downloading weights."""
+    return await read_metadata(model, "models")
+
+
+@app.tool(name="update_dataset")
 async def update_dataset_metadata(dataset: str, changes: dict[str, Any]) -> str:
     """Edit dataset presentation without uploading files. Preserves unspecified metadata.
 
@@ -538,7 +570,7 @@ async def delete_dataset(dataset: str) -> str:
     return await _query_kaggle(["datasets", "delete", dataset, "--yes"])
 
 
-@app.tool()
+@app.tool(name="update_notebook")
 async def update_notebook_presentation(notebook: str, title: str | None = None,
                                        markdown_path: str | None = None) -> str:
     """Edit local notebook title and introductory Markdown without running it.
@@ -1575,7 +1607,7 @@ async def push_notebook(
     )
 
 
-@app.tool()
+@app.tool(name="wait_for_notebook")
 async def wait(
     notebook: str,
     until: str = "complete",
@@ -1646,7 +1678,7 @@ async def delete_notebook(notebook: str) -> str:
     return out
 
 
-@app.tool()
+@app.tool(name="list_notebooks")
 async def list_notebook_names(limit: int = 100, head: int = 15) -> str:
     """List notebook names and slugs from your Kaggle account."""
     output = await _query_kaggle(["kernels", "list", "--mine", "--page-size", str(max(1, min(limit, 200))), "--sort-by", "dateRun", "--csv"])
@@ -1664,7 +1696,7 @@ async def list_notebook_names(limit: int = 100, head: int = 15) -> str:
     return "\n".join(lines)
 
 
-@app.tool()
+@app.tool(name="list_notebook_runs")
 async def list_active_runs(limit: int = 50, head: int = 15) -> str:
     """List active or currently running Kaggle notebooks."""
     output = await _query_kaggle(["kernels", "list", "--mine", "--page-size", str(max(1, min(limit, 200))), "--sort-by", "dateRun", "--csv"], timeout=8)
@@ -1832,7 +1864,7 @@ def _fetch_live_logs_stream(owner: str, slug: str) -> list[str]:
     return clean_lines
 
 
-@app.tool()
+@app.tool(name="view_notebook")
 async def view_status(notebook: str, tail: int = 10, fetch_logs: bool = True) -> str:
     """Check Kaggle notebook status with rich live execution telemetry.
 
@@ -1951,7 +1983,7 @@ async def view_status(notebook: str, tail: int = 10, fetch_logs: bool = True) ->
 
     return "\n".join(lines)
 
-@app.tool()
+@app.tool(name="pull_outputs")
 async def fetch_output(notebook: str, run_number: int | None = None) -> str:
     """Download notebook output into ./kaggle/<notebook>/runs/<n>/output/ and build compressed summaries."""
     name, _, _ = _source_path(notebook)
@@ -2004,7 +2036,7 @@ async def fetch_output(notebook: str, run_number: int | None = None) -> str:
     )
 
 
-@app.tool()
+@app.tool(name="cancel_notebook")
 async def cancel_run(notebook: str) -> str:
     """Cancel the active/running session for a Kaggle notebook."""
     name, path, _ = _source_path(notebook)
@@ -2130,7 +2162,7 @@ async def pull_notebook(notebook: str, fetch_latest_output: bool = True) -> str:
 # Dataset Tools
 # ---------------------------------------------------------------------------
 
-@app.tool()
+@app.tool(name="push_dataset")
 async def upload_dataset(
     path: str,
     title: str | None = None,
@@ -2267,7 +2299,7 @@ def _upload_dataset(path: str, title: str | None = None, dataset_slug: str | Non
     return f"{action_msg}\nURL: https://www.kaggle.com/datasets/{ref}"
 
 
-@app.tool()
+@app.tool(name="pull_dataset")
 async def download_dataset(
     dataset: str,
     target_dir: str | None = None,
@@ -2349,14 +2381,8 @@ async def list_datasets(
     return "\n".join(lines)
 
 
-@app.tool()
-async def get_dataset_status(dataset: str) -> str:
-    """Check the creation/processing status of a Kaggle dataset."""
-    output = await _query_kaggle(["datasets", "status", dataset.strip()])
-    status_text = output.strip() or "UNKNOWN"
-    return f"Dataset '{dataset}' status: {status_text}"
 
-@app.tool()
+@app.tool(name="view_quota")
 async def get_quota() -> str:
     """Show your weekly Kaggle GPU and TPU accelerator quota (used, remaining, total, refresh date)."""
     try:
