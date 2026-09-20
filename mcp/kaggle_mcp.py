@@ -1834,6 +1834,10 @@ async def push_notebook(
         f"uv run --script /home/nas/Projects/AIConfig/mcp/kaggle_mcp.py status {canonical_ref} --logs --log-timeout 60]"
     )
 
+ACTIVE_RUN_STATUSES = {"RUNNING", "QUEUED", "PREPARING", "PENDING", "STARTING", "CANCEL_REQUESTED"}
+TERMINAL_RUN_STATUSES = {"COMPLETE", "CANCEL_ACKNOWLEDGED", "CANCELLED", "CANCELED", "ERROR", "FAILED"}
+
+
 @app.tool(name="wait_for_notebook")
 async def wait(
     notebook: str,
@@ -1877,8 +1881,10 @@ async def wait(
                     index = matches[-1]
                     context = lines[max(0, index - 2):index + 3]
                     return _format_run(ref, snapshot, context, reason="matched") + "\nLiteral log-text match; may include traceback/source text, not evidence of training progress."
-                if snapshot["status"] in {"COMPLETE", "ERROR", "CANCELLED", "CANCELED", "CANCEL_ACKNOWLEDGED"}:
-                    return _format_run(ref, snapshot, lines[-5:], reason="terminal")
+                status = snapshot.get("status")
+                if status in TERMINAL_RUN_STATUSES or status not in ACTIVE_RUN_STATUSES:
+                    reason = "terminal" if status in TERMINAL_RUN_STATUSES else "not_running"
+                    return _format_run(ref, snapshot, lines[-5:], reason=reason)
                 await asyncio.sleep(min(poll_interval, max(0, deadline - asyncio.get_running_loop().time())))
     except TimeoutError:
         last_logs = snapshot.get("logs", [])
@@ -2116,9 +2122,6 @@ with api.build_kaggle_client() as client:
 '''
     return json.loads(await _query_process([sys.executable, "-c", code, ref, str(version) if version else "", "1" if logs else "0", str(log_timeout)], timeout=proc_timeout))
 
-
-ACTIVE_RUN_STATUSES = {"RUNNING", "QUEUED", "PREPARING", "PENDING", "STARTING", "CANCEL_REQUESTED"}
-TERMINAL_RUN_STATUSES = {"COMPLETE", "CANCEL_ACKNOWLEDGED", "CANCELLED", "CANCELED", "ERROR", "FAILED"}
 
 
 class RunVersion(int):
