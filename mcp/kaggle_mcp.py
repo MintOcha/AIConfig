@@ -53,8 +53,8 @@ CANONICAL WORKFLOW:
 4. Long-Running Execution & Waiting:
    - Kaggle training runs frequently take 10 minutes to several hours.
    - NEVER poll `view_status` in tight loops.
-   - Use `wait_for_complete(notebook="...", timeout=3600)` which blocks cleanly, or run in the background via CLI:
-     `uv run --script mcp/kaggle_mcp.py wait <notebook>`
+   - Use `wait(notebook="owner/slug", until="complete", timeout=20)` or `until="log", text="epoch 1"`.
+   - Longer waits require a matching client timeout; output download is explicit via fetch_output.
    - When finished, `fetch_output` downloads all artifacts into `./kaggle/<notebook>/runs/<version>/output/` and generates `summary.txt` with compressed logs.
 """
 )
@@ -320,6 +320,158 @@ def _run_kaggle(args: list[str], timeout: int = 300) -> subprocess.CompletedProc
     proc.stdout = _strip_cli_warnings(proc.stdout)
     proc.stderr = _strip_cli_warnings(proc.stderr)
     return proc
+
+
+async def _query_kaggle(args: list[str], timeout: float = 20) -> str:
+    """Run read-only CLI queries without blocking the MCP event loop."""
+    return await _query_process([*_resolve_kaggle_cmd(), *args], timeout)
+
+
+async def _query_process(command: list[str], timeout: float = 20) -> str:
+    proc = await asyncio.create_subprocess_exec(
+        *command,
+        cwd=get_workspace_root(), env=_cli_env(),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout)
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+    if proc.returncode:
+        raise RuntimeError(f"Kaggle query failed ({proc.returncode}): {_strip_cli_warnings(stderr.decode(errors='replace'))}")
+    return _strip_cli_warnings(stdout.decode())
+
+
+@app.tool()
+async def preview_dataset(dataset: str, file_name: str, rows: int = 10) -> str:
+    """Read first 1–100 rows of an uncompressed CSV/TSV/JSONL dataset file.
+
+    Uses Kaggle's authenticated raw-file stream, not a full dataset download.
+    Reads at most 1 MiB into memory, writes nothing to disk, and closes the stream.
+    This is a prefix sample, not random sampling or a full schema inference.
+    Archives, Parquet, and binary formats are explicitly unsupported.
+    """
+    if not re.fullmatch(r"[\w-]+/[\w.-]+", dataset) or not 1 <= rows <= 100:
+        raise ValueError("Expected owner/dataset-slug and rows between 1 and 100")
+    suffix = Path(file_name).suffix.lower()
+    if suffix not in {".csv", ".tsv", ".jsonl", ".ndjson"}:
+        raise ValueError("Preview supports uncompressed CSV, TSV, JSONL, and NDJSON only")
+    code = '''
+import csv, io, itertools, json, sys
+from kaggle.api.kaggle_api_extended import KaggleApi
+from kagglesdk.datasets.types.dataset_api_service import ApiDownloadDatasetRequest
+dataset, filename, count = sys.argv[1], sys.argv[2], int(sys.argv[3])
+api = KaggleApi(); api.authenticate()
+with api.build_kaggle_client() as client:
+    req = ApiDownloadDatasetRequest()
+    req.owner_slug, req.dataset_slug = dataset.split('/')
+    req.file_name = filename
+    req.raw = True
+    response = client.datasets.dataset_api_client.download_dataset(req)
+    try:
+        response.raise_for_status()
+        data = response.raw.read(1048576, decode_content=True)
+    finally:
+        response.close()
+if data.startswith(b'PK') or data.startswith(b'\\x1f\\x8b'):
+    raise ValueError('Server returned an archive instead of a raw text file')
+bounded = len(data) == 1048576
+if bounded:
+    data = data[:data.rfind(b'\\n')] if b'\\n' in data else b''
+text = data.decode('utf-8-sig')
+if filename.lower().endswith(('.csv', '.tsv')):
+    reader = csv.DictReader(io.StringIO(text), delimiter='\\t' if filename.lower().endswith('.tsv') else ',', strict=True)
+    columns = reader.fieldnames
+    result = list(itertools.islice(reader, count))
+else:
+    result = [json.loads(line) for line in itertools.islice((line for line in text.splitlines() if line.strip()), count)]
+    columns = None
+print(json.dumps(dict(dataset=dataset, file=filename, columns=columns, rows=result, byte_limit_reached=bounded, sample='file prefix', max_bytes=1048576)))
+'''
+    return await _query_process([sys.executable, "-c", code, dataset, file_name, str(rows)])
+
+
+@app.tool()
+async def search_library(
+    query: str,
+    kind: str = "datasets",
+    page: int = 1,
+    page_token: str | None = None,
+    owner: str | None = None,
+    sort_by: str | None = None,
+) -> str:
+    """Search public Kaggle datasets, notebooks, models, or competitions.
+
+    Returns native JSON metadata (including references, titles, popularity and
+    timestamps where available). Notebooks accepts dataset/competition terms in
+    the query. Page numbers work for datasets/notebooks/competitions; models
+    require page_token for subsequent pages. CLI page sizes differ by resource.
+    Does not download, upload, or run anything.
+    """
+    resources = {"datasets": "datasets", "notebooks": "kernels", "models": "models", "competitions": "competitions"}
+    if kind not in resources:
+        raise ValueError(f"kind must be one of {', '.join(resources)}")
+    if not query.strip() or page < 1:
+        raise ValueError("A nonempty query and positive page are required")
+    if owner and kind == "competitions":
+        raise ValueError("Competitions do not support owner filtering")
+    if page != 1 and (kind == "models" or page_token):
+        raise ValueError("Use page_token instead of page for models; do not combine pagination modes")
+    cmd = [resources[kind], "list", "--search", query.strip(), "--format", "json"]
+    if page_token:
+        cmd.extend(["--page-token", page_token])
+    elif page != 1:
+        cmd.extend(["--page", str(page)])
+    if owner:
+        cmd.extend(["--owner" if kind == "models" else "--user", owner])
+    if sort_by:
+        cmd.extend(["--sort-by", sort_by])
+    return await _query_kaggle(cmd)
+
+
+@app.tool()
+async def list_dataset_files(dataset: str, page_token: str | None = None, page_size: int = 20) -> str:
+    """Inspect dataset filenames and sizes without downloading. Pass owner/slug.
+
+    Returns native JSON and any pagination information emitted by Kaggle.
+    """
+    if not re.fullmatch(r"[\w-]+/[\w.-]+", dataset) or not 1 <= page_size <= 200:
+        raise ValueError("Expected owner/dataset-slug and page_size between 1 and 200")
+    cmd = ["datasets", "files", dataset, "--format", "json", "--page-size", str(page_size)]
+    if page_token:
+        cmd.extend(["--page-token", page_token])
+    return await _query_kaggle(cmd)
+
+
+@app.tool()
+async def read_metadata(reference: str, kind: str = "datasets") -> str:
+    """Read dataset or model metadata by owner/slug without downloading files or weights."""
+    if kind not in {"datasets", "models"}:
+        raise ValueError("kind must be datasets or models")
+    if not re.fullmatch(r"[\w-]+/[\w.-]+", reference):
+        raise ValueError("Expected owner/slug")
+    code = '''
+import sys
+from kaggle.api.kaggle_api_extended import KaggleApi
+from kagglesdk.datasets.types.dataset_api_service import ApiGetDatasetRequest
+from kagglesdk.models.types.model_api_service import ApiGetModelRequest
+kind, reference = sys.argv[1:]
+owner, slug = reference.split('/')
+api = KaggleApi(); api.authenticate()
+with api.build_kaggle_client() as client:
+    if kind == 'datasets':
+        request = ApiGetDatasetRequest()
+        request.owner_slug, request.dataset_slug = owner, slug
+        result = client.datasets.dataset_api_client.get_dataset(request)
+    else:
+        request = ApiGetModelRequest()
+        request.owner_slug, request.model_slug = owner, slug
+        result = client.models.model_api_client.get_model(request)
+    print(result.to_json())
+'''
+    return await _query_process([sys.executable, "-c", code, kind, reference])
 
 
 def _parse_kernel_csv(output: str) -> list[dict[str, str]]:
@@ -1326,57 +1478,58 @@ async def push_notebook(
 
 
 @app.tool()
-async def wait_for_complete(
+async def wait(
     notebook: str,
-    timeout: int = 3600,
-    poll_interval: int = 30,
-    fetch_output_on_complete: bool = True,
+    until: str = "complete",
+    text: str | None = None,
+    timeout: int = 20,
+    poll_interval: int = 5,
 ) -> str:
-    """Wait for a running Kaggle notebook to finish execution (COMPLETE, ERROR, or CANCELLED).
+    """Wait until notebook terminates or a literal string appears in available logs.
 
-    NOTE: Kaggle training/inference runs frequently take 10 minutes to several hours.
-    AI agents: do NOT poll repeatedly in tight tool loops. Use wait_for_complete or run
-    `python mcp/kaggle_mcp.py wait <notebook>` in the background.
-
-    Args:
-        notebook: Notebook name or directory.
-        timeout: Maximum seconds to wait before returning status (default: 3600s / 1hr).
-        poll_interval: Seconds between status checks (default: 30s).
-        fetch_output_on_complete: Whether to automatically download outputs and compress logs when finished.
+    until: complete or log. log requires text (case-sensitive literal substring).
+    Existing log text also matches; this is not restricted to new log lines.
+    Returns JSON with reason matched, terminal, or timeout. Terminal errors stop
+    either wait mode. No output download. Default 20s fits short MCP deadlines;
+    longer waits require a client timeout greater than timeout. Reissue after a
+    timeout instead of tight polling. Log queries inspect the current run.
     """
-    name, folder = _resolve_notebook_folder(notebook)
-    meta = _read_metadata(folder)
-    owner = _default_owner()
-    existed, kernel = await _find_kernel(meta.get("title", name), name)
-    ref = meta.get("id") or _full_slug(kernel) or f"{owner}/{_slugify(name)}"
-
-    start_time = asyncio.get_event_loop().time()
-    while True:
-        status_proc = _run_kaggle(["kernels", "status", ref], timeout=30)
-        status_text = status_proc.stdout.strip()
-        match = re.search(r'has status "([^"]+)"', status_text)
-        status_label = _clean_status_label(match.group(1) if match else "UNKNOWN")
-
-        version_match = re.search(r"version\s+(\d+)", status_text, re.I)
-        version = int(version_match.group(1)) if version_match else meta.get("last_version_number")
-
-        _write_metadata(folder, {"last_status": status_label})
-
-        if status_label in ("COMPLETE", "ERROR", "CANCEL_ACKNOWLEDGED"):
-            msg = f"Notebook '{name}' finished with status: {status_label} (version {version})."
-            if status_label == "COMPLETE" and fetch_output_on_complete:
-                try:
-                    out_res = await fetch_output(notebook, run_number=version)
-                    msg += f"\n\nOutput download result:\n{out_res}"
-                except Exception as err:
-                    msg += f"\n(Auto-fetch output encountered error: {err})"
-            return msg
-
-        elapsed = asyncio.get_event_loop().time() - start_time
-        if elapsed >= timeout:
-            return f"Wait timeout reached after {int(elapsed)}s. Current status: {status_label} (version {version})."
-
-        await asyncio.sleep(max(5, poll_interval))
+    if until not in {"complete", "log"} or (until == "log" and not text):
+        raise ValueError("until must be complete or log; log requires nonempty text")
+    if timeout < 1 or poll_interval < 1:
+        raise ValueError("timeout and poll_interval must be positive")
+    if re.fullmatch(r"[\w-]+/[\w.-]+", notebook):
+        ref = notebook
+    else:
+        name, folder = _resolve_notebook_folder(notebook)
+        ref = _read_metadata(folder).get("id")
+        if not ref:
+            raise ValueError("Notebook metadata has no id; pass owner/notebook-slug")
+    deadline = asyncio.get_running_loop().time() + timeout
+    status = "UNKNOWN"
+    try:
+        async with asyncio.timeout(timeout):
+            while True:
+                output = await _query_kaggle(["kernels", "status", ref])
+                match = re.search(r'has status "([^"]+)"', output)
+                if not match:
+                    raise RuntimeError("Unrecognized Kaggle status response")
+                status = _clean_status_label(match.group(1)).upper()
+                if until == "log":
+                    logs = await _query_kaggle(["kernels", "logs", ref])
+                    try:
+                        entries = json.loads(logs)
+                    except json.JSONDecodeError:
+                        entries = None
+                    if isinstance(entries, list):
+                        logs = "\n".join(str(entry.get("data", entry.get("message", ""))) if isinstance(entry, dict) else str(entry) for entry in entries)
+                    if text in logs:
+                        return json.dumps(dict(reason="matched", notebook=ref, status=status, text=text))
+                if status in {"COMPLETE", "ERROR", "CANCELLED", "CANCELED", "CANCEL_ACKNOWLEDGED"}:
+                    return json.dumps(dict(reason="terminal", notebook=ref, status=status, matched=False if until == "log" else None))
+                await asyncio.sleep(min(poll_interval, max(0, deadline - asyncio.get_running_loop().time())))
+    except TimeoutError:
+        return json.dumps(dict(reason="timeout", notebook=ref, status=status))
 
 @app.tool()
 async def delete_notebook(notebook: str) -> str:
@@ -1398,8 +1551,8 @@ async def delete_notebook(notebook: str) -> str:
 @app.tool()
 async def list_notebook_names(limit: int = 100, head: int = 15) -> str:
     """List notebook names and slugs from your Kaggle account."""
-    proc = _run_kaggle(["kernels", "list", "--mine", "--page-size", str(max(1, limit)), "--sort-by", "dateRun", "--csv"], timeout=60)
-    rows = _parse_kernel_csv(proc.stdout)
+    output = await _query_kaggle(["kernels", "list", "--mine", "--page-size", str(max(1, min(limit, 200))), "--sort-by", "dateRun", "--csv"])
+    rows = _parse_kernel_csv(output)
     if not rows:
         return "No notebooks found on Kaggle account."
 
@@ -1416,33 +1569,46 @@ async def list_notebook_names(limit: int = 100, head: int = 15) -> str:
 @app.tool()
 async def list_active_runs(limit: int = 50, head: int = 15) -> str:
     """List active or currently running Kaggle notebooks."""
-    proc = _run_kaggle(["kernels", "list", "--mine", "--page-size", str(max(1, limit)), "--sort-by", "dateRun", "--csv"], timeout=60)
-    rows = _parse_kernel_csv(proc.stdout)
+    output = await _query_kaggle(["kernels", "list", "--mine", "--page-size", str(max(1, min(limit, 200))), "--sort-by", "dateRun", "--csv"], timeout=8)
+    rows = _parse_kernel_csv(output)
     if not rows:
         return "No notebooks found."
 
     active_statuses = {"RUNNING", "QUEUED", "PREPARING", "PENDING", "STARTING", "CANCEL_REQUESTED"}
-    active: list[str] = []
+    semaphore = asyncio.Semaphore(8)
 
-    for row in rows:
+    async def query(row):
         ref = row.get("ref", "")
         if not ref:
-            continue
-        try:
-            st_proc = _run_kaggle(["kernels", "status", ref], timeout=20)
-            status_text = st_proc.stdout.strip()
-            match = re.search(r'has status "([^"]+)"', status_text)
-            status_label = _clean_status_label(match.group(1) if match else "")
-            if status_label in active_statuses:
-                active.append(f"- {row.get('title', ref)} | {ref} | status={status_label}")
-        except Exception:
-            continue
+            return None, "Missing notebook reference"
+        async with semaphore:
+            try:
+                output = await _query_kaggle(["kernels", "status", ref], timeout=8)
+                match = re.search(r'has status "([^"]+)"', output)
+                if not match:
+                    return None, f"{ref}: unrecognized status response"
+                status = _clean_status_label(match.group(1))
+                return (f"- {row.get('title', ref)} | {ref} | status={status}" if status in active_statuses else None), None
+            except Exception as err:
+                return None, f"{ref}: {type(err).__name__}"
 
-    if not active:
-        return "No active/running notebook jobs found."
-    lines = [f"{len(active)} active notebook runs:"] + active[:head]
+    tasks = [asyncio.create_task(query(row)) for row in rows]
+    try:
+        done, pending = await asyncio.wait(tasks, timeout=16)
+        results = [task.result() for task in done]
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    active = sorted(value for value, error in results if value)
+    failures = [error for value, error in results if error]
+    lines = ([f"{len(active)} active notebook runs:"] + active[:head]) if active else ["No active runs found among successfully checked notebooks."]
     if len(active) > head:
         lines.append(f"... {len(active) - head} more active")
+    if pending or failures:
+        lines.append(f"Incomplete status scan: {len(pending)} unfinished, {len(failures)} failed; these notebooks may still be active.")
+        lines.extend(failures[:head])
     return "\n".join(lines)
 
 def _fetch_live_kernel_telemetry(owner: str, slug: str) -> dict[str, Any]:
@@ -1876,13 +2042,38 @@ async def upload_dataset(
     keep_tabular: bool = True,
     dir_mode: str = "zip",
 ) -> str:
-    """Upload or update a dataset on Kaggle.
+    """Upload or update a dataset. Please run as CLI for long uploads:
 
-    Can take a directory or a single file (CSV, parquet, zip, etc.).
-    If the dataset already exists on your Kaggle account, pushes a new version.
-    If it is new, creates the dataset on Kaggle.
-    Local dataset folder is maintained under ./kaggle/datasets/<dataset_slug>/.
+    uv run --script mcp/kaggle_mcp.py upload PATH --options '{"dataset_slug":"slug"}'
+
+    Options are title, dataset_slug, private, version_notes, keep_tabular, dir_mode.
+    MCP returns after 29 seconds with a PID and log if still running. The upload
+    continues: monitor its log, do NOT restart it. Use CLI for future long uploads.
     """
+    import tempfile
+    deadline = asyncio.get_running_loop().time() + 29
+    options = dict(title=title, dataset_slug=dataset_slug, private=private,
+                   version_notes=version_notes, keep_tabular=keep_tabular, dir_mode=dir_mode)
+    with tempfile.NamedTemporaryFile(prefix="kaggle-upload-", suffix=".log", delete=False) as log:
+        command = [sys.executable, str(Path(__file__).resolve()), "--workspace-root",
+                   str(get_workspace_root()), "upload", path, "--options", json.dumps(options)]
+        proc = await asyncio.create_subprocess_exec(*command, env=_cli_env(),
+                   stdout=log, stderr=log, start_new_session=True)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=max(0, deadline - asyncio.get_running_loop().time()))
+        except TimeoutError:
+            return (f"Please run as CLI for long uploads. This upload is still running as PID {proc.pid}. "
+                    f"Log: {log.name}. Do not restart it; inspect the log for completion or errors. "
+                    "Future uploads: uv run --script mcp/kaggle_mcp.py upload PATH --options JSON")
+    output = Path(log.name).read_text()
+    if proc.returncode:
+        raise RuntimeError(f"Upload failed ({proc.returncode}). Log: {log.name}\n{output}")
+    return output
+
+
+def _upload_dataset(path: str, title: str | None = None, dataset_slug: str | None = None,
+                    private: bool = True, version_notes: str | None = None,
+                    keep_tabular: bool = True, dir_mode: str = "zip") -> str:
     raw_path = Path(path)
     source_path = raw_path if raw_path.is_absolute() else get_workspace_root() / raw_path
     if not source_path.exists():
@@ -2007,7 +2198,7 @@ async def list_datasets(
 ) -> str:
     """List Kaggle datasets (your own datasets, or search public datasets)."""
     cmd = ["datasets", "list", "--csv"]
-    if mine and not search:
+    if mine:
         cmd.append("--mine")
     if search:
         cmd.extend(["--search", search])
@@ -2015,8 +2206,8 @@ async def list_datasets(
         cmd.extend(["-p", str(page)])
     if sort_by in {"hottest", "votes", "updated", "active"}:
         cmd.extend(["--sort-by", sort_by])
-    proc = _run_kaggle(cmd, timeout=60)
-    rows = _parse_kernel_csv(proc.stdout)
+    output = await _query_kaggle(cmd)
+    rows = _parse_kernel_csv(output)
     if not rows:
         return f"No datasets found{' matching ' + search if search else ''}."
 
@@ -2038,18 +2229,18 @@ async def list_datasets(
 @app.tool()
 async def get_dataset_status(dataset: str) -> str:
     """Check the creation/processing status of a Kaggle dataset."""
-    proc = _run_kaggle(["datasets", "status", dataset.strip()], timeout=30)
-    status_text = proc.stdout.strip() or "UNKNOWN"
+    output = await _query_kaggle(["datasets", "status", dataset.strip()])
+    status_text = output.strip() or "UNKNOWN"
     return f"Dataset '{dataset}' status: {status_text}"
 
 @app.tool()
 async def get_quota() -> str:
     """Show your weekly Kaggle GPU and TPU accelerator quota (used, remaining, total, refresh date)."""
     try:
-        proc = _run_kaggle(["quota", "--csv"], timeout=30)
-        rows = _parse_kernel_csv(proc.stdout)
+        output = await _query_kaggle(["quota", "--csv"])
+        rows = _parse_kernel_csv(output)
         if not rows:
-            return proc.stdout.strip() or "Quota information unavailable."
+            return output.strip() or "Quota information unavailable."
         lines = ["Weekly Accelerator Quota:"]
         for row in rows:
             res = row.get("resource", "Unknown")
@@ -2084,10 +2275,12 @@ def parse_args() -> argparse.Namespace:
     p_save.add_argument("notebook", help="Notebook name or directory")
 
     # wait
-    p_wait = subparsers.add_parser("wait", help="Wait for running notebook to complete")
-    p_wait.add_argument("notebook", help="Notebook name or directory")
-    p_wait.add_argument("--timeout", type=int, default=3600, help="Max wait seconds (default: 3600)")
-    p_wait.add_argument("--poll-interval", type=int, default=30, help="Poll interval in seconds")
+    p_wait = subparsers.add_parser("wait", help="Wait for notebook completion or log text")
+    p_wait.add_argument("notebook", help="Notebook name or owner/slug")
+    p_wait.add_argument("--timeout", type=int, default=20)
+    p_wait.add_argument("--poll-interval", type=int, default=5)
+    p_wait.add_argument("--until", choices=("complete", "log"), default="complete")
+    p_wait.add_argument("--text")
 
     # status
     p_status = subparsers.add_parser("status", help="Check notebook status")
@@ -2101,6 +2294,9 @@ def parse_args() -> argparse.Namespace:
 
     # quota
     subparsers.add_parser("quota", help="Check accelerator quota")
+    upload = subparsers.add_parser("upload", help="Upload dataset without the MCP call timeout")
+    upload.add_argument("path")
+    upload.add_argument("--options", default="{}", help="JSON upload options")
 
     return parser.parse_args()
 
@@ -2147,9 +2343,11 @@ def main() -> None:
         elif cmd == "save":
             print(asyncio.run(save_notebook(args.notebook)))
         elif cmd == "wait":
-            print(asyncio.run(wait_for_complete(args.notebook, timeout=args.timeout, poll_interval=args.poll_interval)))
+            print(asyncio.run(wait(args.notebook, until=args.until, text=args.text, timeout=args.timeout, poll_interval=args.poll_interval)))
         elif cmd == "output":
             print(asyncio.run(fetch_output(args.notebook, run_number=args.run)))
+        elif cmd == "upload":
+            print(_upload_dataset(args.path, **json.loads(args.options)))
         return
 
     # MCP server mode

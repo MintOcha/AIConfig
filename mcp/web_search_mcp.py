@@ -13,6 +13,7 @@ import json
 import re
 import time
 import uuid
+import traceback
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from pathlib import Path
@@ -491,7 +492,7 @@ class SearchRouter:
             results = _normalize_search_results(
                 payload, url_field="url", snippet_field="description"
             )
-            if not results:
+            if not results and not (isinstance(payload, dict) and (payload.get("results") == [] or isinstance(payload.get("web"), dict) and payload["web"].get("results") == [])):
                 raise ProviderRequestError("Brave returned no usable results")
             return results
         except Exception as error:
@@ -513,8 +514,6 @@ class SearchRouter:
                     )
                 )
             results = _normalize_duckduckgo_results(payload)
-            if not results:
-                raise DuckDuckGoUnavailable("DuckDuckGo returned no results")
             return results
         except Exception as error:
             await self._duckduckgo_gate.defer()
@@ -555,6 +554,8 @@ class SearchRouter:
                 )[:max_results]
                 if results:
                     return results
+                if isinstance(payload, dict) and payload.get("results") == []:
+                    return []
                 raise ProviderRequestError(
                     "Codex standalone search returned no usable results"
                 )
@@ -681,7 +682,7 @@ class SearchRouter:
         results = _normalize_search_results(
             payload, url_field="url", snippet_field="content"
         )
-        if not results:
+        if not results and not (isinstance(payload, dict) and payload.get("results") == []):
             raise ProviderRequestError("Tavily returned no usable results")
         return results
 
@@ -695,27 +696,35 @@ class SearchRouter:
             self._next_provider_index = (start_index + 1) % len(SEARCH_PROVIDERS)
 
         providers = SEARCH_PROVIDERS[start_index:] + SEARCH_PROVIDERS[:start_index]
-        last_error: Exception | None = None
+        failures: list[str] = []
         for provider in providers:
             try:
                 if provider == "duckduckgo":
-                    return await self._search_duckduckgo(query, max_results)
-                if provider == "brave":
-                    return await self._search_brave(
-                        query, max_results, wait_for_cooldown=False
-                    )
-                if provider == "codex_standalone":
-                    return await self._search_codex_standalone(query, max_results)
-                return await self._search_tavily(query, max_results)
+                    results = await self._search_duckduckgo(query, max_results)
+                elif provider == "brave":
+                    results = await self._search_brave(query, max_results, wait_for_cooldown=False)
+                elif provider == "codex_standalone":
+                    results = await self._search_codex_standalone(query, max_results)
+                else:
+                    results = await self._search_tavily(query, max_results)
+                if results:
+                    return results
             except (
                 BraveCooldown,
                 ConfigurationError,
                 DuckDuckGoUnavailable,
                 ProviderRequestError,
             ) as error:
-                last_error = error
-
-        raise ProviderRequestError("All web search providers failed") from last_error
+                detail = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+                for secret in (*self.config.brave_keys, *self.config.codex_standalone_keys, *self.config.tavily_keys):
+                    if secret:
+                        detail = detail.replace(secret, "[REDACTED]")
+                detail = re.sub(r"(?i)(bearer\s+)[^\s\"']+", r"\1[REDACTED]", detail)
+                detail = re.sub(r"(?i)((?:api[_-]?key|token|key)=)[^&\s\"']+", r"\1[REDACTED]", detail)
+                failures.append(f"[{provider}]\n{detail}")
+        if failures:
+            raise ProviderRequestError("Search exhausted without results; provider errors (credentials redacted):\n" + "\n".join(failures)) from None
+        return []
 
     async def fetch_content(self, urls: list[str]) -> list[dict[str, str]]:
         """Fetch page content through Codex native open command, with DuckDuckGo failover."""
@@ -799,7 +808,7 @@ def register_tools(app: FastMCP, cfg: RouterConfig) -> None:
     async def web_search(
         query: str,
         max_results: int = 10,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, str]] | str:
         "REQUIRED live-web search for current or externally verifiable information, including benchmark scores, specifications, prices, news, documentation, and comparisons. Prefer this over model memory; return source URLs, distinguish measured results from estimates, and use automatic provider routing and failover. This is the single entry point; do not use provider-specific MCPs directly."
         if not query.strip():
             raise ValueError("query must not be empty")
@@ -807,7 +816,8 @@ def register_tools(app: FastMCP, cfg: RouterConfig) -> None:
             raise ValueError("max_results must be between 1 and 20")
         if router is None:
             raise RuntimeError("Web search router has not been configured")
-        return await router.search(query, max_results)
+        results = await router.search(query, max_results)
+        return results if results else "No results found."
 
     if cfg.codex_standalone_keys or cfg.duckduckgo_enabled:
         @app.tool(name="fetch")
