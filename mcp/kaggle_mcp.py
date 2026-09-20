@@ -1845,7 +1845,7 @@ async def wait(
     text: str | None = None,
     version: int | str | None = None,
     versions: list[int | str] | None = None,
-    timeout: int = 30,
+    timeout: int = 600,
     poll_interval: int = 5,
 ) -> str:
     """Wait until notebook terminates or a literal string appears in available logs.
@@ -1855,9 +1855,10 @@ async def wait(
     versions: list of versions (e.g. ['v3', 'v4'] or [3, 4]); returns when the FIRST one settles.
     Existing log text also matches; this is not restricted to new log lines.
     Returns concise text with reason matched, terminal, or timeout. Terminal errors stop
-    either wait mode. No output download. Default 20s fits short MCP deadlines;
-    longer waits require a client timeout greater than timeout. Reissue after a
-    timeout instead of tight polling. Log queries inspect the current run.
+    either wait mode. No output download. Default timeout is 600s (10 minutes).
+    IMPORTANT: When choosing timeout, inspect initial training logs first to check reported
+    ETA / epoch durations, or estimate total runtime (e.g. eta_training_seconds) and set
+    timeout accordingly to avoid premature timeout returns.
     """
     if until not in {"complete", "log"} or (until == "log" and not text):
         raise ValueError("until must be complete or log; log requires nonempty text")
