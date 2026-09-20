@@ -786,35 +786,82 @@ async def delete_dataset(dataset: str) -> str:
 @app.tool(name="edit_notebook")
 async def update_notebook_presentation(notebook: str, title: str | None = None,
                                        markdown_path: str | None = None) -> str:
-    """Edit local notebook title and introductory Markdown without running it.
+    """Publish notebook title and introductory Markdown using Kaggle Quick Save.
 
-    markdown_path is an agent-written description file. Preserves code and outputs.
-    Use push_notebook to publish and run. Kaggle manages author and dates; dataset
-    update-frequency and license fields are not notebook metadata fields.
+    Never executes the notebook. Fetches current remote source and settings,
+    preserving code, embedded outputs, privacy and attached inputs. notebook may
+    be owner/slug or a local notebook folder. markdown_path supplies introductory
+    Markdown; it does not replace code. Existing run artifacts are not downloaded.
     """
-    _, folder = _resolve_notebook_folder(notebook)
-    metadata = _read_metadata(folder)
+    if title is None and markdown_path is None:
+        raise ValueError("Provide title or markdown_path")
+    if title is not None and len(title.strip()) < 5:
+        raise ValueError("Title must be at least five characters")
+    raw = Path(notebook)
+    if "/" in notebook and not raw.exists() and not notebook.startswith("/"):
+        ref = notebook.strip("/")
+    else:
+        _, folder = _resolve_notebook_folder(notebook)
+        metadata = _read_metadata(folder)
+        ref = metadata.get("id") or metadata.get("slug")
+    if not ref or len(ref.split("/")) != 2:
+        raise ValueError("An existing notebook reference owner/slug is required")
+    markdown = None
     if markdown_path is not None:
         source = Path(markdown_path)
         if not source.is_absolute():
             source = get_workspace_root() / source
-        code = folder / metadata.get("code_file", "notebook.ipynb")
-        if code.suffix != ".ipynb":
-            raise ValueError("Markdown presentation requires an ipynb notebook")
-        document = json.loads(code.read_text())
-        cell = dict(cell_type="markdown", metadata={"tags": ["kaggle-description"]},
-                    source=source.read_text().splitlines(keepends=True))
-        cells = document["cells"]
+        markdown = source.read_text()
+    code = '''
+import sys, json
+from kaggle.api.kaggle_api_extended import KaggleApi
+from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelRequest, ApiSaveKernelRequest
+from kagglesdk.kernels.types.kernels_enums import KernelExecutionType
+ref, title, markdown = json.loads(sys.argv[1])
+api = KaggleApi(); api.authenticate()
+with api.build_kaggle_client() as client:
+    lookup = ApiGetKernelRequest()
+    lookup.user_name, lookup.kernel_slug = ref.split('/')
+    current = client.kernels.kernels_api_client.get_kernel(lookup)
+    metadata = current.metadata
+    text = current.blob.source
+    if markdown is not None:
+        if metadata.kernel_type != 'notebook':
+            raise ValueError('Markdown presentation requires an ipynb notebook')
+        document = json.loads(text)
+        cell = dict(cell_type='markdown', metadata={'tags': ['kaggle-description']}, source=markdown)
+        cells = document['cells']
         previous = next((i for i, item in enumerate(cells)
-                         if "kaggle-description" in item.get("metadata", {}).get("tags", [])), None)
+                         if 'kaggle-description' in item.get('metadata', {}).get('tags', [])), None)
         if previous is None:
             cells.insert(0, cell)
         else:
             cells[previous] = cell
-        code.write_text(json.dumps(document, indent=2))
-    if title is not None:
-        _write_metadata(folder, {"title": title})
-    return f"Updated local presentation for {notebook}; not published or executed."
+        text = json.dumps(document)
+    request = ApiSaveKernelRequest()
+    request.id = metadata.id
+    request.slug = metadata.ref
+    request.new_title = title if title is not None else metadata.title
+    request.text = text
+    for field in ('language', 'kernel_type', 'is_private', 'enable_gpu', 'enable_tpu',
+                  'enable_internet', 'dataset_data_sources', 'kernel_data_sources',
+                  'competition_data_sources', 'model_data_sources', 'category_ids',
+                  'docker_image', 'machine_shape'):
+        setattr(request, field, getattr(metadata, field))
+    request.kernel_execution_type = KernelExecutionType.QUICK_SAVE
+    response = client.kernels.kernels_api_client.save_kernel(request)
+    if response.error:
+        raise RuntimeError(response.error)
+    print(json.dumps({'notebook': response.ref.strip('/').removeprefix('code/'), 'title': request.new_title,
+                      'execution_type': 'QUICK_SAVE', 'response': response.to_dict()}))
+'''
+    result = json.loads(await _query_process([sys.executable, "-c", code,
+                                             json.dumps([ref, title, markdown])], timeout=90))
+    for candidate in get_kaggle_root().iterdir():
+        if candidate.is_dir() and _read_metadata(candidate).get("id") == ref:
+            _write_metadata(candidate, {"id": result["notebook"], "slug": result["notebook"],
+                                        "title": result["title"]})
+    return json.dumps(result)
 
 
 def _parse_kernel_csv(output: str) -> list[dict[str, str]]:
@@ -1838,6 +1885,56 @@ ACTIVE_RUN_STATUSES = {"RUNNING", "QUEUED", "PREPARING", "PENDING", "STARTING", 
 TERMINAL_RUN_STATUSES = {"COMPLETE", "CANCEL_ACKNOWLEDGED", "CANCELLED", "CANCELED", "ERROR", "FAILED"}
 
 
+def _notebook_ref(notebook: str) -> str:
+    value = notebook.strip().removeprefix("https://www.kaggle.com/code/").rstrip("/")
+    if re.fullmatch(r"[\w-]+/[\w.-]+", value):
+        return value
+    _, folder = _resolve_notebook_folder(value)
+    ref = _read_metadata(folder).get("id")
+    if not ref:
+        owner = _default_owner()
+        ref = f"{owner}/{_slugify(value)}" if owner else None
+    if not ref:
+        raise ValueError("Pass a notebook reference owner/slug or a configured local notebook")
+    return ref
+
+
+async def _discover_runs(ref: str, version: int | None = None) -> list[dict]:
+    if version is not None:
+        return [await _run_snapshot(ref, version)]
+    code = '''
+import sys, json
+from concurrent.futures import ThreadPoolExecutor
+from kaggle.api.kaggle_api_extended import KaggleApi
+from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelRequest, ApiGetKernelSessionStatusRequest
+api = KaggleApi(); api.authenticate()
+owner, slug = sys.argv[1].split('/')
+with api.build_kaggle_client() as client:
+    request = ApiGetKernelRequest()
+    request.user_name, request.kernel_slug = owner, slug
+    metadata = client.kernels.kernels_api_client.get_kernel(request).metadata
+latest = metadata.current_version_number
+if latest < 1:
+    print(json.dumps([dict(version=None, status='NO_SAVED_VERSION', logs=[], logs_error=None)]))
+else:
+    def inspect(version):
+        with api.build_kaggle_client() as client:
+            request = ApiGetKernelSessionStatusRequest()
+            request.user_name, request.kernel_slug, request.version_label = owner, slug, f'v{version}'
+            status = client.kernels.kernels_api_client.get_kernel_session_status(request).status.name
+            return dict(version=version, status=status, hardware=metadata.machine_shape or 'unknown',
+                        logs=[], logs_error=None, training_outcome='unknown')
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        runs = list(pool.map(inspect, range(latest, 0, -1)))
+    active = {'RUNNING', 'QUEUED', 'PREPARING', 'PENDING', 'STARTING', 'CANCEL_REQUESTED'}
+    print(json.dumps([run for run in runs if run['status'] in active] or runs[:1]))
+'''
+    try:
+        return json.loads(await _query_process([sys.executable, "-c", code, ref], timeout=60))
+    except asyncio.TimeoutError as error:
+        raise RuntimeError(f"Run discovery timed out for {ref}; no complete active-run inventory is available") from error
+
+
 @app.tool(name="wait_for_notebook")
 async def wait(
     notebook: str,
@@ -1864,13 +1961,7 @@ async def wait(
         raise ValueError("until must be complete or log; log requires nonempty text")
     if timeout < 1 or poll_interval < 1:
         raise ValueError("timeout and poll_interval must be positive")
-    if re.fullmatch(r"[\w-]+/[\w.-]+", notebook):
-        ref = notebook
-    else:
-        name, folder = _resolve_notebook_folder(notebook)
-        ref = _read_metadata(folder).get("id")
-        if not ref:
-            raise ValueError("Notebook metadata has no id; pass owner/notebook-slug")
+    ref = _notebook_ref(notebook)
 
     # Parse targets
     target_versions: list[int] = []
@@ -1890,14 +1981,20 @@ async def wait(
     deadline = asyncio.get_running_loop().time() + timeout
     snapshot = dict(version=None, status="UNKNOWN", logs=[], logs_error="Not queried", training_outcome="unknown")
     cli_tip = f"\n\n[Tip: Kaggle is notoriously slow. Please switch to using CLI for reliable long waits/logs:\nuv run --script /home/nas/Projects/AIConfig/mcp/kaggle_mcp.py wait {ref} --until {until}{f' --text {text!r}' if text else ''} --timeout 3600\nor check logs with:\nuv run --script /home/nas/Projects/AIConfig/mcp/kaggle_mcp.py status {ref} --logs --log-timeout 60]"
+    wait_deadline = asyncio.timeout(timeout)
     try:
-        async with asyncio.timeout(timeout):
+        async with wait_deadline:
+            if not target_versions:
+                inferred = await _discover_runs(ref)
+                target_versions = [run["version"] for run in inferred if run["version"] is not None]
+                if not target_versions:
+                    return _format_run(ref, inferred[0], [], reason="not_running")
             while True:
                 rem_time = max(5, int(deadline - asyncio.get_running_loop().time()))
                 # If target versions specified, check each in order
                 v_to_check: list[int | None] = target_versions if target_versions else [snapshot.get("version")]
                 for target_v in v_to_check:
-                    snapshot = await _run_snapshot(ref, target_v, logs=True, log_timeout=min(30, rem_time))
+                    snapshot = await _run_snapshot(ref, target_v, logs=until == "log", log_timeout=min(30, rem_time))
                     lines = snapshot["logs"]
                     matches = [index for index, line in enumerate(lines) if text and text in line]
                     if until == "log" and matches:
@@ -1909,11 +2006,13 @@ async def wait(
                         reason = "terminal" if status in TERMINAL_RUN_STATUSES else "not_running"
                         return _format_run(ref, snapshot, lines[-5:], reason=reason)
                 await asyncio.sleep(min(poll_interval, max(0, deadline - asyncio.get_running_loop().time())))
-    except TimeoutError:
+    except TimeoutError as error:
+        if not wait_deadline.expired():
+            raise RuntimeError(f"Kaggle request timed out while waiting for {ref}; the {timeout}s wait deadline was not reached. Completion was not observed.") from error
         last_logs = snapshot.get("logs", [])
-        if last_logs:
-            return _format_run(ref, snapshot, last_logs[-5:], reason="waited") + cli_tip
-        return _format_run(ref, snapshot, [], reason="waited") + f"\nNo log lines collected before timeout.{cli_tip}"
+        return (_format_run(ref, snapshot, last_logs[-5:], reason="timeout")
+                + f"\nWait deadline reached ({timeout}s); requested condition was not observed. Last observed status only; the remote run was not cancelled."
+                + cli_tip)
 @app.tool()
 async def delete_notebook(notebook: str) -> str:
     """Delete a notebook and its remote runs from your Kaggle account.
@@ -1966,12 +2065,10 @@ async def list_active_runs(limit: int = 50, head: int = 15) -> str:
             return None, "Missing notebook reference"
         async with semaphore:
             try:
-                output = await _query_kaggle(["kernels", "status", ref], timeout=8)
-                match = re.search(r'has status "([^"]+)"', output)
-                if not match:
-                    return None, f"{ref}: unrecognized status response"
-                status = _clean_status_label(match.group(1))
-                return (f"- {row.get('title', ref)} | {ref} | status={status}" if status in active_statuses else None), None
+                runs = await _discover_runs(ref)
+                lines = [f"- {row.get('title', ref)} | {ref} | version={run['version']} | status={run['status']}"
+                         for run in runs if run['status'] in active_statuses]
+                return ("\n".join(lines) if lines else None), None
             except Exception as err:
                 return None, f"{ref}: {type(err).__name__}"
 
@@ -1984,7 +2081,7 @@ async def list_active_runs(limit: int = 50, head: int = 15) -> str:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-    active = sorted(value for value, error in results if value)
+    active = sorted(line for value, error in results if value for line in value.splitlines())
     failures = [error for value, error in results if error]
     lines = ([f"{len(active)} active notebook runs:"] + active[:head]) if active else ["No active runs found among successfully checked notebooks."]
     if len(active) > head:
@@ -2037,9 +2134,11 @@ async def view_status(
     grep: str | None = None,
     context: int = 3,
     log_timeout: int = 30,
+    version: int | None = None,
 ) -> str:
     """Inspect actual remote version/status with bounded log collection. COMPLETE is notebook status, not training success.
 
+    Omit version to report every active saved version, or latest if none is active.
     grep: regex matching raw or formatted logs. tail limits matching lines; context adds
     this many surrounding lines on each side (default 3), merging overlapping ranges.
     Filtering operates only on the recent bounded collection buffer (up to 200 lines collected within the snapshot window)
@@ -2056,14 +2155,18 @@ async def view_status(
         except re.error as err:
             raise ValueError(f"Invalid regex pattern for grep: {err}") from err
 
-    if re.fullmatch(r"[\w-]+/[\w.-]+", notebook):
-        ref = notebook
-    else:
-        _, folder = _resolve_notebook_folder(notebook)
-        ref = _read_metadata(folder).get("id")
-        if not ref:
-            raise ValueError("Notebook metadata has no id; pass owner/notebook-slug")
-    snapshot = await _run_snapshot(ref, logs=fetch_logs or bool(grep), log_timeout=log_timeout)
+    ref = _notebook_ref(notebook)
+    if version is None:
+        runs = await _discover_runs(ref)
+        if not (fetch_logs or grep):
+            return "\n\n".join(_format_run(ref, run, []) for run in runs)
+        reports = await asyncio.gather(*(
+            view_status(ref, tail, fetch_logs, grep, context, log_timeout, run["version"])
+            if run["version"] is not None else asyncio.sleep(0, result=_format_run(ref, run, []))
+            for run in runs
+        ))
+        return "\n\n".join(reports)
+    snapshot = await _run_snapshot(ref, version, logs=fetch_logs or bool(grep), log_timeout=log_timeout)
     raw_logs = snapshot.get("logs", [])
     if pattern is not None:
         matches = [index for index, line in enumerate(raw_logs) if _matches_log_line(pattern, line)][-tail:]
@@ -2079,13 +2182,16 @@ async def view_status(
     else:
         selected_logs = raw_logs[-tail:]
     out = _format_run(ref, snapshot, selected_logs)
-    if snapshot.get("logs_error") and "reached bound" in str(snapshot.get("logs_error")):
-        out += f"\n\n[Tip: Kaggle live stream is slow. Please switch to using CLI for full logs:\nuv run --script /home/nas/Projects/AIConfig/mcp/kaggle_mcp.py status {ref} --logs --log-timeout 60]"
+    if snapshot.get("logs_error"):
+        out += "\nStatus is available; log retrieval was incomplete. Use fetch_logs=false for a status-only request."
     return out
 
 async def _run_snapshot(ref: str, version: int | None = None, logs: bool = False, log_timeout: int = 30) -> dict:
     if version is not None and version < 1:
         raise ValueError("Run number must be a positive Kaggle version")
+    if log_timeout < 1:
+        raise ValueError("log_timeout must be positive")
+    baseline = await _run_snapshot(ref, version) if logs else None
     proc_timeout = max(35, log_timeout + 15)
     code = '''
 import sys, json, threading
@@ -2142,7 +2248,19 @@ with api.build_kaggle_client() as client:
                 result['logs_error'] = 'Remote latest version changed during log retrieval; discarded ambiguous logs'
     print(json.dumps(result), flush=True)
 '''
-    return json.loads(await _query_process([sys.executable, "-c", code, ref, str(version) if version else "", "1" if logs else "0", str(log_timeout)], timeout=proc_timeout))
+    try:
+        return json.loads(await _query_process([sys.executable, "-c", code, ref, str(version) if version else "", "1" if logs else "0", str(log_timeout)], timeout=proc_timeout))
+    except (asyncio.TimeoutError, RuntimeError) as error:
+        if baseline is None:
+            if isinstance(error, asyncio.TimeoutError):
+                raise RuntimeError(f"Kaggle status request for {ref} timed out after {proc_timeout}s") from error
+            raise
+        baseline["logs_error"] = (
+            f"Log request timed out after {proc_timeout}s; showing status captured before log retrieval"
+            if isinstance(error, asyncio.TimeoutError)
+            else f"Log request failed; showing status captured before log retrieval: {error}"
+        )
+        return baseline
 
 
 
@@ -2314,49 +2432,59 @@ async def fetch_output(
 
 
 @app.tool(name="cancel_notebook")
-async def cancel_run(notebook: str) -> str:
-    """Cancel the active/running session for a Kaggle notebook."""
-    name, path, _ = _source_path(notebook)
-    existed, kernel = await _find_kernel(name, name)
-    ref = _full_slug(kernel)
-    if not ref:
-        owner = _default_owner()
-        ref = f"{owner}/{_slugify(name)}" if owner else None
-    if not ref:
-        raise RuntimeError(f"Could not resolve Kaggle kernel for '{name}'.")
+async def cancel_run(notebook: str, version: int | None = None, dry_run: bool = False) -> str:
+    """Cancel a verified active notebook version, never an inferred numeric session ID.
 
-    owner, slug = _split_kernel_slug(ref)
-    if not owner or not slug:
-        raise RuntimeError(f"Invalid kernel ref: {ref}")
-
-    # Check status first
-    status_proc = _run_kaggle(["kernels", "status", ref], timeout=20)
-    status_text = status_proc.stdout.strip()
-    match = re.search(r'has status "([^"]+)"', status_text)
-    status_label = _clean_status_label(match.group(1) if match else "")
-
-    if status_label in {"COMPLETE", "ERROR", "CANCEL_ACKNOWLEDGED", "FAILED"}:
-        return f"{name} is already {status_label}; no active run to cancel."
-
-    # Cancel via Kaggle SDK
+    Omit version to select the sole active run. Multiple active runs require an
+    explicit version. dry_run resolves and verifies the target without cancelling.
+    """
+    ref = _notebook_ref(notebook)
+    runs = await _discover_runs(ref, version)
+    active = [run for run in runs if run["status"] in ACTIVE_RUN_STATUSES]
+    if not active:
+        return f"{ref}: no active run to cancel."
+    if len(active) != 1:
+        raise ValueError(f"Multiple active runs for {ref}: {[r['version'] for r in active]}; specify version")
+    target = active[0]["version"]
+    code = '''
+import sys, json, re
+from urllib.parse import urlparse
+from kaggle.api.kaggle_api_extended import KaggleApi
+from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelSessionStatusRequest, ApiCancelKernelSessionRequest
+ref, version, dry_run = json.loads(sys.argv[1])
+api = KaggleApi(); api.authenticate()
+with api.build_kaggle_client() as client:
+    http = client._http_client
+    http._init_session()
+    owner, slug = ref.split('/')
+    response = http._session.get(
+        f'https://api.kaggle.com/v1/kernels/output/download/{owner}/{slug}',
+        params={'versionNumber': version}, stream=True, allow_redirects=False, timeout=20)
     try:
-        from kaggle.api.kaggle_api_extended import KaggleApi
-        from kagglesdk.kernels.types.kernels_api_service import ApiCancelKernelSessionRequest
-
-        cache = _read_cache(name)
-        session_id = cache.get("kernel_session_id") or cache.get("kernelSessionId")
-        if not session_id:
-            raise RuntimeError(f"No active session ID found in cache for {name} to cancel.")
-
-        api = KaggleApi()
-        api.authenticate()
-        with api.build_kaggle_client() as client:
-            req = ApiCancelKernelSessionRequest()
-            req.kernel_session_id = int(session_id)
-            client.kernels.kernels_api_client.cancel_kernel_session(req)
-        return f"Cancel requested for {name} (session {session_id})."
-    except Exception as err:
-        raise RuntimeError(f"Failed to cancel session for {name}: {err}") from err
+        location = urlparse(response.headers.get('Location', ''))
+        match = re.fullmatch(r'/v1/kernels/output/download_zip/([1-9][0-9]*)', location.path)
+        if response.status_code != 302 or location.scheme != 'https' or location.hostname != 'api.kaggle.com' or not match:
+            raise RuntimeError(f'Cannot verify session identity for {ref} v{version}: HTTP {response.status_code}')
+        session_id = int(match[1])
+    finally:
+        response.close()
+    status_request = ApiGetKernelSessionStatusRequest()
+    status_request.user_name, status_request.kernel_slug = owner, slug
+    status_request.version_label = f'v{version}'
+    status = client.kernels.kernels_api_client.get_kernel_session_status(status_request).status.name
+    active = {'RUNNING', 'QUEUED', 'PREPARING', 'PENDING', 'STARTING', 'CANCEL_REQUESTED'}
+    result = dict(notebook=ref, version=version, session_id=session_id, status=status, cancellation_sent=False)
+    if status in active and not dry_run:
+        request = ApiCancelKernelSessionRequest()
+        request.kernel_session_id = session_id
+        cancelled = client.kernels.kernels_api_client.cancel_kernel_session(request)
+        if cancelled.error_message:
+            raise RuntimeError(cancelled.error_message)
+        result['cancellation_sent'] = True
+    result['dry_run'] = dry_run
+    print(json.dumps(result))
+'''
+    return await _query_process([sys.executable, "-c", code, json.dumps([ref, target, dry_run])], timeout=60)
 
 
 @app.tool()
@@ -2905,6 +3033,8 @@ def parse_args() -> argparse.Namespace:
     p_wait.add_argument("--poll-interval", type=int, default=5)
     p_wait.add_argument("--until", choices=("complete", "log"), default="complete")
     p_wait.add_argument("--text")
+    p_wait.add_argument("--version", type=int)
+    p_wait.add_argument("--versions", nargs="+", type=int)
 
     # status
     p_status = subparsers.add_parser("status", help="Check notebook status")
@@ -2914,6 +3044,17 @@ def parse_args() -> argparse.Namespace:
     p_status.add_argument("--grep", help="Regex pattern to filter log lines before tail")
     p_status.add_argument("--context", type=int, default=3, help="Lines before and after each grep match")
     p_status.add_argument("--log-timeout", type=int, default=60, help="Log streaming wait timeout in seconds for CLI mode (default 60)")
+    p_status.add_argument("--version", type=int)
+
+    p_cancel = subparsers.add_parser("cancel", help="Cancel a verified active notebook run")
+    p_cancel.add_argument("notebook")
+    p_cancel.add_argument("--version", type=int)
+    p_cancel.add_argument("--dry-run", action="store_true")
+
+    p_edit = subparsers.add_parser("edit-notebook", help="Publish title or Markdown without execution")
+    p_edit.add_argument("notebook")
+    p_edit.add_argument("--title")
+    p_edit.add_argument("--markdown-path")
 
     # output
     p_output = subparsers.add_parser("output", help="Download notebook outputs")
@@ -2994,13 +3135,17 @@ def main() -> None:
             _print_result(asyncio.run(read_metadata(args.dataset, "datasets")))
         elif cmd == "status":
             fetch_logs = args.logs or bool(args.grep)
-            _print_result(asyncio.run(view_status(args.notebook, tail=args.tail, fetch_logs=fetch_logs, grep=args.grep, context=args.context, log_timeout=args.log_timeout)))
+            _print_result(asyncio.run(view_status(args.notebook, tail=args.tail, fetch_logs=fetch_logs, grep=args.grep, context=args.context, log_timeout=args.log_timeout, version=args.version)))
+        elif cmd == "cancel":
+            _print_result(asyncio.run(cancel_run(args.notebook, version=args.version, dry_run=args.dry_run)))
+        elif cmd == "edit-notebook":
+            _print_result(asyncio.run(update_notebook_presentation(args.notebook, title=args.title, markdown_path=args.markdown_path)))
         elif cmd == "push":
             _print_result(asyncio.run(push_notebook(args.notebook, accelerator=args.accelerator)))
         elif cmd == "save":
             _print_result(asyncio.run(save_notebook(args.notebook)))
         elif cmd == "wait":
-            _print_result(asyncio.run(wait(args.notebook, until=args.until, text=args.text, timeout=args.timeout, poll_interval=args.poll_interval)))
+            _print_result(asyncio.run(wait(args.notebook, until=args.until, text=args.text, timeout=args.timeout, poll_interval=args.poll_interval, version=args.version, versions=args.versions)))
         elif cmd == "output":
             _print_result(asyncio.run(fetch_output(args.notebook, run_number=args.run, pattern=args.pattern, timeout=args.timeout)))
         elif cmd == "upload":

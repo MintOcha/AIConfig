@@ -235,17 +235,19 @@ Choose **Kaggle** under **Install MCPs** in `./scripts/install.py`.
 - `init_notebook`: initializes a brand new notebook experiment under `./kaggle/<notebook>/` with starter code (`train.py` or `notebook.ipynb`) and fresh `kernel-metadata.json`.
 - `save_notebook`: saves code and updates `kernel-metadata.json` locally and syncs to Kaggle cloud WITHOUT starting execution. If a `.py` script is present, automatically wraps it into `notebook.ipynb` (%%writefile + !python) for safe DDP/GPU multiprocessing.
 - `push_notebook`: pushes code to Kaggle and QUEUES EXECUTION (starts a new version/run on Kaggle Cloud). Increments run tracking (`total_runs`, `last_version_number`) in `kernel-metadata.json`.
-- `wait_for_notebook`: returns the actual remote version/status and recent logs on terminal states; literal log matches include surrounding context and do not imply training success. Queries are bounded; unavailable or partial logs are explicit.
-- `view_notebook`: returns remote version, execution state, hardware, and a bounded live-log snapshot. Notebook `COMPLETE` is distinct from training outcome.
+- `wait_for_notebook`: accepts `version` or `versions`; otherwise discovers active saved versions. Returns when the first selected version settles or log text matches. Completion waits use status-only queries; use `view_notebook` for logs. Literal matches do not imply training success.
+  An expired wait returns `timeout` with the last observed state, not completion. A request timeout before the overall deadline raises an error instead of masquerading as an expired wait.
+- `view_notebook`: accepts an explicit `version`; otherwise reports every active saved version, or latest if none is active. Log collection is bounded; a log timeout preserves observed status. Notebook `COMPLETE` is distinct from training outcome.
 - `pull_outputs`: requires the requested remote version to be `COMPLETE`, rejects empty artifact lists, and stages downloads before publishing to `runs/<remote-version>/output`. Existing output directories are rejected rather than merged. `pull_notebook` defaults to code-only; optional output retrieval uses the same gate.
 - `push_dataset` / `pull_dataset`: publish or retrieve dataset files. Long transfers return a PID and log after 29 seconds and continue without restarting.
 - `view_dataset` / `view_model`: inspect resource details; dataset details include visibility and processing state.
-- `edit_dataset` / `edit_notebook`: edit remote dataset presentation or local notebook presentation, respectively. Dataset edits preserve unspecified settings and read back changed fields, returning before/after verification, visibility, ref, and version; accepted-but-unverified updates and mismatches are explicit. `isPrivate` accepts a boolean; publishing requires authorization.
+- `edit_dataset`: edits remote dataset presentation while preserving unspecified settings, with before/after verification. `isPrivate` accepts a boolean; publishing requires authorization.
+- `edit_notebook`: publishes title or introductory Markdown using Quick Save, preserving code and remote settings. Kaggle can change the slug when the title changes; the returned reference and matching local metadata are updated. Quick Save may briefly report a running HTML-render job without executing notebook code.
 - `search_datasets` / `search_notebooks` / `search_models` / `search_competitions`: discover public resources.
 - `list_datasets` / `list_notebooks` / `list_notebook_runs`: browse account resources and active jobs.
 - `list_dataset_files` / `preview_dataset`: inspect filenames or a bounded text sample.
 - `view_quota`: shows accelerator allowance.
-- `cancel_notebook`: cancels an active notebook session.
+- `cancel_notebook`: resolves a notebook/version-specific session ID, rechecks status, and cancels only that session. Omit `version` only when a single active version exists; multiple active versions require selection. `dry_run=true` resolves the target without cancelling. Failure to verify identity sends no cancellation.
 - `delete_dataset` / `delete_notebook`: permanently remove the specified resource.
 - `create_model`: creates the parent model from a local `model-metadata.json` (model card, provenance, privacy).
 - `push_model`: creates a variation from `model-instance-metadata.json`, or publishes a new version when an existing variation handle is supplied.
