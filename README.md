@@ -56,6 +56,16 @@ into `~/.agents/mcp.json`, skills are linked under `~/.agents/skills`, and the
 selected prompt is inlined into `~/.AGENTS.md`. Freebuff reads user knowledge
 files directly and does not resolve `@path` imports, so prompt content is copied
 rather than referenced. Use `--freebuff-home PATH` for a different Freebuff home
+
+## Uninstall components
+
+To cleanly remove AIConfig MCPs, `@` prompt references, skills, or model configs from any harness:
+
+```bash
+./scripts/uninstall.py
+```
+
+Supports interactive harness selection or direct flags like `./scripts/uninstall.py --omp`, `./scripts/uninstall.py --codex`, or `./scripts/uninstall.py --dry-run`.
 directory.
 
 The main menu installs MCPs, the shared prompt, or skills as independent

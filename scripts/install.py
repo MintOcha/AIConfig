@@ -485,38 +485,18 @@ def install_prompt(h_id: str, target_home: Path, dry_run: bool) -> None:
         print(f"Dry run: would link/install {selected_prompt} into {h_id} ({target_home})")
         return
 
-    if h_id == "freebuff":
-        target = HOME / ".AGENTS.md"
-        marker = f"AIConfig prompt: {selected_prompt.stem}"
-        existing = target.read_text(encoding="utf-8") if target.exists() else ""
-        if marker in existing:
-            print(f"Already installed in {target}")
-            return
-        with open(target, "a", encoding="utf-8") as f:
-            f.write(f"\n# {marker}\n")
-            f.write(f"<!-- installed from {selected_prompt} by scripts/install.py -->\n\n")
-            f.write(selected_prompt.read_text(encoding="utf-8"))
-            f.write("\n")
-        success(f"Prompt inlined into {target}")
-    elif h_id == "claude":
-        target = target_home / "CLAUDE.md"
-        import_line = f"@{selected_prompt}"
-        existing = target.read_text(encoding="utf-8") if target.exists() else ""
-        if import_line not in existing:
-            with open(target, "a", encoding="utf-8") as f:
-                f.write(f"\n{import_line}\n")
-        success(f"Prompt linked in {target}")
-    else:
-        # OMP, Codex, OpenCode, KiloCode -> AGENTS.md
-        target = target_home / "AGENTS.md"
-        import_line = f"@{selected_prompt}"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        existing = target.read_text(encoding="utf-8") if target.exists() else ""
-        if import_line not in existing:
-            with open(target, "a", encoding="utf-8") as f:
-                f.write(f"\n{import_line}\n")
-        success(f"Prompt linked through {target}")
+    target = (HOME / ".AGENTS.md") if h_id == "freebuff" else (target_home / ("CLAUDE.md" if h_id == "claude" else "AGENTS.md"))
+    import_line = f"@{selected_prompt.resolve()}"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    existing = target.read_text(encoding="utf-8") if target.exists() else ""
+    if import_line in existing:
+        print(f"Already referenced in {target}")
+        return
 
+    block = f"\n# >>> AIConfig prompt: {selected_prompt.stem} >>>\n{import_line}\n# <<< AIConfig prompt: {selected_prompt.stem} <<<\n"
+    with open(target, "a", encoding="utf-8") as f:
+        f.write(block)
+    success(f"Prompt referenced via '@' in {target}")
 
 # ---------------------------------------------------------------------------
 # 3. Skill Installation
