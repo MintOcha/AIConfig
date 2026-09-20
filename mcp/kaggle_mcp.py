@@ -1836,7 +1836,7 @@ async def wait(
     notebook: str,
     until: str = "complete",
     text: str | None = None,
-    timeout: int = 20,
+    timeout: int = 30,
     poll_interval: int = 5,
 ) -> str:
     """Wait until notebook terminates or a literal string appears in available logs.
@@ -1875,7 +1875,10 @@ async def wait(
                     return _format_run(ref, snapshot, lines[-5:], reason="terminal")
                 await asyncio.sleep(min(poll_interval, max(0, deadline - asyncio.get_running_loop().time())))
     except TimeoutError:
-        return _format_run(ref, snapshot, snapshot["logs"][-5:], reason="timeout")
+        last_logs = snapshot.get("logs", [])
+        if last_logs:
+            return _format_run(ref, snapshot, last_logs[-5:], reason="waited")
+        return _format_run(ref, snapshot, [], reason="waited") + "\nNo log lines collected before timeout. Please rerun with CLI or extend timeout: uv run --script mcp/kaggle_mcp.py status " + ref + " --logs"
 
 @app.tool()
 async def delete_notebook(notebook: str) -> str:
@@ -1999,6 +2002,7 @@ async def view_status(
     fetch_logs: bool = True,
     grep: str | None = None,
     context: int = 3,
+    log_timeout: int = 25,
 ) -> str:
     """Inspect actual remote version/status with bounded log collection. COMPLETE is notebook status, not training success.
 
@@ -2025,7 +2029,7 @@ async def view_status(
         ref = _read_metadata(folder).get("id")
         if not ref:
             raise ValueError("Notebook metadata has no id; pass owner/notebook-slug")
-    snapshot = await _run_snapshot(ref, logs=fetch_logs or bool(grep))
+    snapshot = await _run_snapshot(ref, logs=fetch_logs or bool(grep), log_timeout=log_timeout)
     raw_logs = snapshot.get("logs", [])
     if pattern is not None:
         matches = [index for index, line in enumerate(raw_logs) if _matches_log_line(pattern, line)][-tail:]
@@ -2042,9 +2046,10 @@ async def view_status(
         selected_logs = raw_logs[-tail:]
     return _format_run(ref, snapshot, selected_logs)
 
-async def _run_snapshot(ref: str, version: int | None = None, logs: bool = False) -> dict:
+async def _run_snapshot(ref: str, version: int | None = None, logs: bool = False, log_timeout: int = 25) -> dict:
     if version is not None and version < 1:
         raise ValueError("Run number must be a positive Kaggle version")
+    proc_timeout = max(35, log_timeout + 15)
     code = '''
 import sys, json, threading
 from collections import deque
@@ -2085,10 +2090,11 @@ with api.build_kaggle_client() as client:
                         lines.extend((body or '').splitlines())
             except Exception as error:
                 errors.append(str(error))
+        limit_sec = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4].isdigit() else 25
         worker = threading.Thread(target=collect, daemon=True)
-        worker.start(); worker.join(5)
+        worker.start(); worker.join(limit_sec)
         result['logs'] = list(lines)
-        result['logs_error'] = '; '.join(errors) or ('Live log collection reached 5-second bound; snapshot may be partial' if worker.is_alive() else None)
+        result['logs_error'] = '; '.join(errors) or (f'Live log stream reached bound ({limit_sec}s); snapshot may be partial' if worker.is_alive() else None)
         if not result['logs'] and not result['logs_error']:
             result['logs_error'] = 'Kaggle returned no log events for this version'
         if version == latest:
@@ -2099,7 +2105,7 @@ with api.build_kaggle_client() as client:
                 result['logs_error'] = 'Remote latest version changed during log retrieval; discarded ambiguous logs'
     print(json.dumps(result), flush=True)
 '''
-    return json.loads(await _query_process([sys.executable, "-c", code, ref, str(version) if version else "", "1" if logs else "0"], timeout=15))
+    return json.loads(await _query_process([sys.executable, "-c", code, ref, str(version) if version else "", "1" if logs else "0", str(log_timeout)], timeout=proc_timeout))
 
 
 ACTIVE_RUN_STATUSES = {"RUNNING", "QUEUED", "PREPARING", "PENDING", "STARTING", "CANCEL_REQUESTED"}
@@ -2817,7 +2823,7 @@ def parse_args() -> argparse.Namespace:
     # wait
     p_wait = subparsers.add_parser("wait", help="Wait for notebook completion or log text")
     p_wait.add_argument("notebook", help="Notebook name or owner/slug")
-    p_wait.add_argument("--timeout", type=int, default=20)
+    p_wait.add_argument("--timeout", type=int, default=60, help="Wait timeout in seconds for CLI mode (default 60)")
     p_wait.add_argument("--poll-interval", type=int, default=5)
     p_wait.add_argument("--until", choices=("complete", "log"), default="complete")
     p_wait.add_argument("--text")
@@ -2829,6 +2835,7 @@ def parse_args() -> argparse.Namespace:
     p_status.add_argument("--tail", type=int, default=10, help="Number of log lines to show")
     p_status.add_argument("--grep", help="Regex pattern to filter log lines before tail")
     p_status.add_argument("--context", type=int, default=3, help="Lines before and after each grep match")
+    p_status.add_argument("--log-timeout", type=int, default=60, help="Log streaming wait timeout in seconds for CLI mode (default 60)")
 
     # output
     p_output = subparsers.add_parser("output", help="Download notebook outputs")
@@ -2907,7 +2914,7 @@ def main() -> None:
             _print_result(asyncio.run(read_metadata(args.dataset, "datasets")))
         elif cmd == "status":
             fetch_logs = args.logs or bool(args.grep)
-            _print_result(asyncio.run(view_status(args.notebook, tail=args.tail, fetch_logs=fetch_logs, grep=args.grep, context=args.context)))
+            _print_result(asyncio.run(view_status(args.notebook, tail=args.tail, fetch_logs=fetch_logs, grep=args.grep, context=args.context, log_timeout=args.log_timeout)))
         elif cmd == "push":
             _print_result(asyncio.run(push_notebook(args.notebook, accelerator=args.accelerator)))
         elif cmd == "save":
