@@ -510,6 +510,119 @@ async def read_model(model: str) -> str:
     return await read_metadata(model, "models")
 
 
+@app.tool()
+async def create_model(path: str) -> str:
+    """Create a model from local model-metadata.json, including its model card and privacy.
+    Does not upload weights. Use push_model to create variations and versions.
+    """
+    folder = Path(path)
+    if not folder.is_absolute():
+        folder = get_workspace_root() / folder
+    return await _query_kaggle(["models", "create", "-p", str(folder)])
+
+
+@app.tool()
+async def edit_model(path: str, variation: bool = False) -> str:
+    """Publish a complete local model-metadata.json or model-instance-metadata.json.
+    Pull existing metadata with Kaggle models get before editing to preserve settings.
+    Model cards describe research; variation metadata supplies usage and licensing.
+    Does not upload weights or run notebooks.
+    """
+    folder = Path(path)
+    if not folder.is_absolute():
+        folder = get_workspace_root() / folder
+    return await _query_kaggle(["models", *(["instances"] if variation else []),
+                                "update", "-p", str(folder)])
+
+
+@app.tool()
+async def push_model(path: str, variation: str | None = None, version_notes: str = "",
+                     dir_mode: str = "zip") -> str:
+    """Upload model weights. Omit variation to create one using model-instance-metadata.json.
+    Supply owner/model/framework/variation to publish a new version of an existing variation.
+    Create the parent model with create_model first. Files must be in a local directory.
+    After 29 seconds returns PID/log while upload continues; do not restart.
+    CLI: kaggle_mcp.py push-model PATH --options JSON.
+    """
+    return await _transfer("push-model", path, dict(variation=variation,
+                           version_notes=version_notes, dir_mode=dir_mode))
+
+
+@app.tool()
+async def pull_model(model: str, target_dir: str) -> str:
+    """Download weights for owner/model/framework/variation/version to target_dir.
+    After 29 seconds returns PID/log while download continues; do not restart.
+    CLI: kaggle_mcp.py pull-model HANDLE --options '{"target_dir":"path"}'.
+    """
+    return await _transfer("pull-model", model, dict(target_dir=target_dir))
+
+
+@app.tool()
+async def list_model_versions(variation: str, page_token: str | None = None, page_size: int = 20) -> str:
+    """List native version records for a variation. Returns Kaggle pagination tokens."""
+    if not 1 <= page_size <= 200:
+        raise ValueError("page_size must be 1–200")
+    command = ["models", "instances", "versions", "list", variation,
+               "--format", "json", "--page-size", str(page_size)]
+    if page_token:
+        command.extend(["--page-token", page_token])
+    return await _query_kaggle(command)
+
+
+@app.tool()
+async def list_model_files(variation: str) -> str:
+    """List files in the current version of owner/model/framework/variation."""
+    return await _query_kaggle(["models", "instances", "files", variation, "--format", "json"])
+
+
+@app.tool()
+async def pull_model_metadata(model: str, target_dir: str, variation: bool = False) -> str:
+    """Retrieve editable model or variation metadata without downloading weights.
+    Edit the generated JSON and use edit_model to publish it. Preserve privacy settings.
+    """
+    target = Path(target_dir)
+    if not target.is_absolute():
+        target = get_workspace_root() / target
+    target.mkdir(parents=True, exist_ok=True)
+    return await _query_kaggle(["models", *(["instances"] if variation else []),
+                               "get", model, "-p", str(target)])
+
+
+@app.tool()
+async def delete_model(model: str) -> str:
+    """Permanently delete a model (owner/model), variation (four parts), or version (five).
+    Deletes the selected resource and its children. Use only with explicit authorization.
+    """
+    parts = model.split("/")
+    if len(parts) not in (2, 4, 5) or not all(parts):
+        raise ValueError("Expected model, variation, or version handle")
+    group = ["models"] + (["instances"] if len(parts) >= 4 else [])
+    if len(parts) == 5:
+        group.append("versions")
+    return await _query_kaggle([*group, "delete", model, "--yes"])
+
+
+def _model_transfer(operation: str, source: str, options: dict) -> str:
+    if operation == "push-model":
+        folder = Path(source)
+        if not folder.is_absolute():
+            folder = get_workspace_root() / folder
+        variation = options.get("variation")
+        command = ["models", "instances"]
+        if variation:
+            command.extend(["versions", "create", variation, "-n", options.get("version_notes", "")])
+        else:
+            command.append("create")
+        command.extend(["-p", str(folder), "-r", options.get("dir_mode", "zip")])
+    else:
+        target = Path(options["target_dir"])
+        if not target.is_absolute():
+            target = get_workspace_root() / target
+        command = ["models", "instances", "versions", "download", source, "-p", str(target)]
+    result = _run_kaggle(command, timeout=3600)
+    return result.stdout
+
+
 @app.tool(name="edit_dataset")
 async def update_dataset_metadata(dataset: str, changes: dict[str, Any]) -> str:
     """Edit dataset presentation without uploading files. Preserves unspecified metadata.
@@ -2449,6 +2562,10 @@ def parse_args() -> argparse.Namespace:
     download = subparsers.add_parser("download", help="Download dataset without the MCP call timeout")
     download.add_argument("dataset")
     download.add_argument("--options", default="{}", help="JSON download options")
+    for operation in ("push-model", "pull-model"):
+        transfer = subparsers.add_parser(operation, help="Transfer model weights without MCP timeout")
+        transfer.add_argument("source")
+        transfer.add_argument("--options", default="{}")
 
     return parser.parse_args()
 
@@ -2502,6 +2619,8 @@ def main() -> None:
             print(_upload_dataset(args.path, **json.loads(args.options)))
         elif cmd == "download":
             print(_download_dataset(args.dataset, **json.loads(args.options)))
+        elif cmd in ("push-model", "pull-model"):
+            print(_model_transfer(cmd, args.source, json.loads(args.options)))
         return
 
     # MCP server mode

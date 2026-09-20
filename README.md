@@ -247,6 +247,15 @@ Choose **Kaggle** under **Install MCPs** in `./scripts/install.py`.
 - `view_quota`: shows accelerator allowance.
 - `cancel_notebook`: cancels an active notebook session.
 - `delete_dataset` / `delete_notebook`: permanently remove the specified resource.
+- `create_model`: creates the parent model from a local `model-metadata.json` (model card, provenance, privacy).
+- `push_model`: creates a variation from `model-instance-metadata.json`, or publishes a new version when an existing variation handle is supplied.
+- `pull_model`: downloads a specified version's weights. Model push/pull use the 29-second PID/log handoff.
+- `pull_model_metadata` / `edit_model`: retrieve editable model/variation JSON and publish metadata changes without transferring weights.
+- `list_model_files` / `list_model_versions`: inspect artifacts and versions.
+- `delete_model`: permanently deletes an explicitly selected model, variation, or version.
+
+Model transfer CLI: `kaggle_mcp.py push-model PATH --options JSON` or `kaggle_mcp.py pull-model HANDLE --options JSON`.
+Model creation and remote edits use native Kaggle metadata contracts; licenses belong to variations. Preserve all settings when editing downloaded metadata.
 
 CLI Usage:
 The script is also directly runnable from the command line:
