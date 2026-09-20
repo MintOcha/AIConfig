@@ -510,7 +510,7 @@ async def read_model(model: str) -> str:
     return await read_metadata(model, "models")
 
 
-@app.tool(name="update_dataset")
+@app.tool(name="edit_dataset")
 async def update_dataset_metadata(dataset: str, changes: dict[str, Any]) -> str:
     """Edit dataset presentation without uploading files. Preserves unspecified metadata.
 
@@ -570,7 +570,7 @@ async def delete_dataset(dataset: str) -> str:
     return await _query_kaggle(["datasets", "delete", dataset, "--yes"])
 
 
-@app.tool(name="update_notebook")
+@app.tool(name="edit_notebook")
 async def update_notebook_presentation(notebook: str, title: str | None = None,
                                        markdown_path: str | None = None) -> str:
     """Edit local notebook title and introductory Markdown without running it.

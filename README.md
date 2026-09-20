@@ -240,7 +240,7 @@ Choose **Kaggle** under **Install MCPs** in `./scripts/install.py`.
 - `pull_outputs`: retrieves notebook output artifacts and builds compressed summaries.
 - `push_dataset` / `pull_dataset`: publish or retrieve dataset files. Long transfers return a PID and log after 29 seconds and continue without restarting.
 - `view_dataset` / `view_model`: inspect resource details; dataset details include visibility and processing state.
-- `update_dataset` / `update_notebook`: edit remote dataset presentation or local notebook presentation, respectively.
+- `edit_dataset` / `edit_notebook`: edit remote dataset presentation or local notebook presentation, respectively.
 - `search_datasets` / `search_notebooks` / `search_models` / `search_competitions`: discover public resources.
 - `list_datasets` / `list_notebooks` / `list_notebook_runs`: browse account resources and active jobs.
 - `list_dataset_files` / `preview_dataset`: inspect filenames or a bounded text sample.
