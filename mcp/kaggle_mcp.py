@@ -2070,14 +2070,39 @@ with api.build_kaggle_client() as client:
     return json.loads(await _query_process([sys.executable, "-c", code, ref, str(version) if version else "", "1" if logs else "0"], timeout=15))
 
 
-async def _completed_run(ref: str, version: int | None = None) -> int:
+ACTIVE_RUN_STATUSES = {"RUNNING", "QUEUED", "PREPARING", "PENDING", "STARTING", "CANCEL_REQUESTED"}
+TERMINAL_RUN_STATUSES = {"COMPLETE", "CANCEL_ACKNOWLEDGED", "CANCELLED", "CANCELED", "ERROR", "FAILED"}
+
+
+class RunVersion(int):
+    status: str
+
+    def __new__(cls, version: int, status: str):
+        instance = super().__new__(cls, version)
+        instance.status = status
+        return instance
+
+    def __iter__(self):
+        yield int(self)
+        yield self.status
+
+
+async def _completed_run(ref: str, version: int | None = None) -> RunVersion:
     snapshot = await _run_snapshot(ref, version)
-    if snapshot["status"] != "COMPLETE":
-        raise RuntimeError(f"Run {snapshot['version']} is {snapshot['status']}; outputs require COMPLETE. No output directory created.")
-    return snapshot["version"]
+    status = snapshot.get("status") or "UNKNOWN"
+    ver = snapshot.get("version")
+    if ver is None or ver < 1:
+        raise RuntimeError(f"Cannot determine remote version for '{ref}'.")
+    if status in ACTIVE_RUN_STATUSES:
+        raise RuntimeError(f"Run {ver} is currently {status}; outputs cannot be downloaded while a run is active. No output directory created.")
+    if status in {"UNKNOWN", "UNPUSHED"}:
+        raise RuntimeError(f"Run {ver} has status {status}; cannot safely verify whether run is stopped. No output directory created.")
+    if status not in TERMINAL_RUN_STATUSES:
+        raise RuntimeError(f"Run {ver} has unrecognized status '{status}'; outputs require a stopped terminal run. No output directory created.")
+    return RunVersion(ver, status)
 
 
-async def _download_run(ref: str, version: int, output_dir: Path) -> None:
+async def _download_run(ref: str, version: int, output_dir: Path) -> int:
     code = '''
 import sys, os, tempfile
 from pathlib import Path
@@ -2100,7 +2125,8 @@ with api.build_kaggle_client() as client:
             break
         request.page_token = response.next_page_token
     if not files:
-        raise RuntimeError('Completed notebook version has no output artifacts; download not performed')
+        print(0)
+        sys.exit(0)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=destination.parent) as temporary:
         staging = Path(temporary)
@@ -2119,31 +2145,39 @@ with api.build_kaggle_client() as client:
         os.rename(staging, destination)
     print(len(files))
 '''
-    await _query_process([sys.executable, "-c", code, ref, str(version), str(output_dir)], timeout=300)
+    out = await _query_process([sys.executable, "-c", code, ref, str(version), str(output_dir)], timeout=300)
+    lines = [line.strip() for line in out.strip().splitlines() if line.strip()]
+    count_str = lines[-1] if lines else "0"
+    return int(count_str) if count_str.isdigit() else 0
 
 
 @app.tool(name="pull_outputs")
 async def fetch_output(notebook: str, run_number: int | None = None) -> str:
-    """Retrieve outputs only from a confirmed COMPLETE Kaggle version. run_number is the remote version, never a local counter."""
-    name, _, _ = _source_path(notebook)
-    existed, kernel = await _find_kernel(name, name)
-    ref = _full_slug(kernel)
-    if not ref:
-        owner = _default_owner()
-        ref = f"{owner}/{_slugify(name)}" if owner else None
-    if not ref:
-        raise RuntimeError(f"Could not resolve Kaggle kernel for '{name}'.")
+    """Retrieve outputs from a stopped Kaggle version (COMPLETE, CANCEL_ACKNOWLEDGED, ERROR). run_number is the remote version, never a local counter."""
+    if re.fullmatch(r"[\w-]+/[\w.-]+", notebook):
+        ref = notebook
+        name = notebook.split("/", 1)[1]
+    else:
+        name, _, _ = _source_path(notebook)
+        existed, kernel = await _find_kernel(name, name)
+        ref = _full_slug(kernel)
+        if not ref:
+            owner = _default_owner()
+            ref = f"{owner}/{_slugify(name)}" if owner else None
+        if not ref:
+            raise RuntimeError(f"Could not resolve Kaggle kernel for '{name}'.")
 
-    version = await _completed_run(ref, run_number)
+    version, status = await _completed_run(ref, run_number)
     target_dir = get_kaggle_root() / name / "runs" / str(version)
-
     output_dir = target_dir / "output"
 
     try:
-        await _download_run(ref, version, output_dir)
+        downloaded = await _download_run(ref, version, output_dir)
     except Exception as err:
         raise RuntimeError(f"Output download failed for version {version}: {err}") from err
 
+    if downloaded == 0:
+        return f"Empty output for '{name}' (version {version}, status {status}). No artifacts found."
 
     # 3. High-speed in-memory compression (generates summary.txt, tree.txt, logs.compressed.txt)
     summary_text = build_run_summary(target_dir)
@@ -2152,11 +2186,12 @@ async def fetch_output(notebook: str, run_number: int | None = None) -> str:
     files = list(output_dir.rglob("*"))
     file_count = sum(1 for f in files if f.is_file())
     if not file_count:
-        raise RuntimeError(f"Completed run {version} returned no output files; no successful download recorded")
+        return f"Empty output for '{name}' (version {version}, status {status}). No artifacts found."
     total_size = sum(f.stat().st_size for f in files if f.is_file())
 
     return (
         f"Fetched run outputs for '{name}' into `{target_dir.relative_to(get_workspace_root())}`:\n"
+        f"- Status: {status}\n"
         f"- Files downloaded: {file_count} ({human_size(total_size)})\n\n"
         f"{summary_text[:1000]}"
     )
@@ -2250,13 +2285,16 @@ async def pull_notebook(notebook: str, fetch_latest_output: bool = False) -> str
     status_label, version = snapshot["status"], snapshot["version"]
     output_msg = ""
     if fetch_latest_output:
-        version = await _completed_run(ref)
+        version, status_label = await _completed_run(ref)
         run_dir = folder / "runs" / str(version)
         out_dir = run_dir / "output"
         try:
-            await _download_run(ref, version, out_dir)
-            build_run_summary(run_dir)
-            output_msg = f"\nLatest output and compressed summary saved to `{run_dir.relative_to(get_workspace_root())}`."
+            downloaded = await _download_run(ref, version, out_dir)
+            if downloaded > 0:
+                build_run_summary(run_dir)
+                output_msg = f"\nLatest output and compressed summary saved to `{run_dir.relative_to(get_workspace_root())}`."
+            else:
+                output_msg = f"\nEmpty output for version {version} (status {status_label}). No artifacts found."
         except Exception as error:
             raise RuntimeError(f"Output download failed for version {version}: {error}") from error
 
