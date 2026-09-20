@@ -2163,20 +2163,29 @@ async def _completed_run(ref: str, version: int | None = None) -> RunVersion:
     return RunVersion(ver, status)
 
 
-async def _download_run(ref: str, version: int, output_dir: Path) -> int:
+async def _download_run(
+    ref: str,
+    version: int,
+    output_dir: Path,
+    pattern: str | None = None,
+    timeout: int = 1800,
+) -> int:
     code = '''
-import sys, os, tempfile
+import sys, os, tempfile, fnmatch
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 import requests
 from kaggle.api.kaggle_api_extended import KaggleApi
 from kagglesdk.kernels.types.kernels_api_service import ApiListKernelSessionOutputRequest
 api = KaggleApi(); api.authenticate()
 owner, slug = sys.argv[1].split('/')
+version_label = 'v' + sys.argv[2]
 destination = Path(sys.argv[3])
+pattern = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
 with api.build_kaggle_client() as client:
     request = ApiListKernelSessionOutputRequest()
     request.user_name, request.kernel_slug = owner, slug
-    request.version_label = 'v' + sys.argv[2]
+    request.version_label = version_label
     request.page_size = 200
     files = []
     while True:
@@ -2185,36 +2194,60 @@ with api.build_kaggle_client() as client:
         if not response.next_page_token:
             break
         request.page_token = response.next_page_token
+    if pattern:
+        files = [f for f in files if fnmatch.fnmatch(f.file_name, pattern)]
     if not files:
         print(0)
         sys.exit(0)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=destination.parent) as temporary:
         staging = Path(temporary)
-        for item in files:
+        session = requests.Session()
+        def download_file(item):
             target = staging / item.file_name
             if not target.resolve().is_relative_to(staging.resolve()):
-                raise RuntimeError('Unsafe output filename')
+                raise RuntimeError(f'Unsafe output filename: {item.file_name}')
             target.parent.mkdir(parents=True, exist_ok=True)
-            with requests.get(item.url, stream=True, timeout=30) as transfer:
+            with session.get(item.url, stream=True, timeout=60) as transfer:
                 transfer.raise_for_status()
                 with target.open('wb') as stream:
                     for chunk in transfer.iter_content(1024 * 1024):
                         stream.write(chunk)
-        if destination.exists():
-            raise RuntimeError('Output directory already exists; refusing to merge potentially misnumbered artifacts')
-        os.rename(staging, destination)
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(download_file, files))
+        destination.mkdir(parents=True, exist_ok=True)
+        for root, dirs, filenames in os.walk(staging):
+            rel_dir = Path(root).relative_to(staging)
+            target_sub = destination / rel_dir
+            target_sub.mkdir(parents=True, exist_ok=True)
+            for fn in filenames:
+                src_file = Path(root) / fn
+                dst_file = target_sub / fn
+                os.replace(src_file, dst_file)
     print(len(files))
 '''
-    out = await _query_process([sys.executable, "-c", code, ref, str(version), str(output_dir)], timeout=300)
+    proc_timeout = max(300, timeout)
+    out = await _query_process(
+        [sys.executable, "-c", code, ref, str(version), str(output_dir), pattern or ""],
+        timeout=proc_timeout,
+    )
     lines = [line.strip() for line in out.strip().splitlines() if line.strip()]
     count_str = lines[-1] if lines else "0"
     return int(count_str) if count_str.isdigit() else 0
 
-
 @app.tool(name="pull_outputs")
-async def fetch_output(notebook: str, run_number: int | None = None) -> str:
-    """Retrieve outputs from a stopped Kaggle version (COMPLETE, CANCEL_ACKNOWLEDGED, ERROR). run_number is the remote version, never a local counter."""
+async def fetch_output(
+    notebook: str,
+    run_number: int | None = None,
+    pattern: str | None = None,
+    timeout: int = 1800,
+) -> str:
+    """Retrieve outputs from a stopped Kaggle version (COMPLETE, CANCEL_ACKNOWLEDGED, ERROR).
+    
+    run_number is the remote version, never a local counter.
+    pattern is an optional fnmatch glob to download selectively (e.g. 'terminal-credit-output/*' or '*.pt').
+    timeout is download deadline in seconds (default 1800 / 30 mins).
+    """
     if re.fullmatch(r"[\w-]+/[\w.-]+", notebook):
         ref = notebook
         name = notebook.split("/", 1)[1]
@@ -2233,7 +2266,7 @@ async def fetch_output(notebook: str, run_number: int | None = None) -> str:
     output_dir = target_dir / "output"
 
     try:
-        downloaded = await _download_run(ref, version, output_dir)
+        downloaded = await _download_run(ref, version, output_dir, pattern=pattern, timeout=timeout)
     except Exception as err:
         raise RuntimeError(f"Output download failed for version {version}: {err}") from err
 
@@ -2864,6 +2897,8 @@ def parse_args() -> argparse.Namespace:
     p_output = subparsers.add_parser("output", help="Download notebook outputs")
     p_output.add_argument("notebook", help="Notebook name or directory")
     p_output.add_argument("--run", type=int, help="Specific run number")
+    p_output.add_argument("--pattern", help="Selective glob pattern to filter output files (e.g. 'terminal-credit-output/*')")
+    p_output.add_argument("--timeout", type=int, default=1800, help="Download timeout in seconds (default 1800)")
 
     # quota
     subparsers.add_parser("quota", help="Check accelerator quota")
@@ -2945,7 +2980,7 @@ def main() -> None:
         elif cmd == "wait":
             _print_result(asyncio.run(wait(args.notebook, until=args.until, text=args.text, timeout=args.timeout, poll_interval=args.poll_interval)))
         elif cmd == "output":
-            _print_result(asyncio.run(fetch_output(args.notebook, run_number=args.run)))
+            _print_result(asyncio.run(fetch_output(args.notebook, run_number=args.run, pattern=args.pattern, timeout=args.timeout)))
         elif cmd == "upload":
             _print_result(_upload_dataset(args.path, **json.loads(args.options)))
         elif cmd == "download":
