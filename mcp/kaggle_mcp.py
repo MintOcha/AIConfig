@@ -1947,11 +1947,45 @@ def _format_run(ref: str, snapshot: dict, logs: list[str], reason: str | None = 
     return "\n".join(lines)
 
 
+def _matches_log_line(pattern: re.Pattern[str], line: str) -> bool:
+    if pattern.search(line):
+        return True
+    try:
+        event = json.loads(line)
+        if isinstance(event, dict):
+            formatted = " ".join(f"{key}={value:.6g}" if isinstance(value, float) else f"{key}={value}" for key, value in event.items())
+            return bool(pattern.search(formatted))
+    except (ValueError, TypeError):
+        pass
+    return False
+
+
 @app.tool(name="view_notebook")
-async def view_status(notebook: str, tail: int = 10, fetch_logs: bool = True) -> str:
-    """Inspect actual remote version/status with bounded log collection. COMPLETE is notebook status, not training success."""
+async def view_status(
+    notebook: str,
+    tail: int = 10,
+    fetch_logs: bool = True,
+    grep: str | None = None,
+    context: int = 3,
+) -> str:
+    """Inspect actual remote version/status with bounded log collection. COMPLETE is notebook status, not training success.
+
+    grep: regex matching raw or formatted logs. tail limits matching lines; context adds
+    this many surrounding lines on each side (default 3), merging overlapping ranges.
+    Filtering operates only on the recent bounded collection buffer (up to 200 lines collected within the snapshot window)
+    and preserves chronological order. It does not search or retrieve unavailable historical logs.
+    """
     if tail < 1:
         raise ValueError("tail must be positive")
+    if context < 0:
+        raise ValueError("context must be nonnegative")
+    pattern: re.Pattern[str] | None = None
+    if grep is not None:
+        try:
+            pattern = re.compile(grep)
+        except re.error as err:
+            raise ValueError(f"Invalid regex pattern for grep: {err}") from err
+
     if re.fullmatch(r"[\w-]+/[\w.-]+", notebook):
         ref = notebook
     else:
@@ -1959,8 +1993,22 @@ async def view_status(notebook: str, tail: int = 10, fetch_logs: bool = True) ->
         ref = _read_metadata(folder).get("id")
         if not ref:
             raise ValueError("Notebook metadata has no id; pass owner/notebook-slug")
-    snapshot = await _run_snapshot(ref, logs=fetch_logs)
-    return _format_run(ref, snapshot, snapshot["logs"][-tail:])
+    snapshot = await _run_snapshot(ref, logs=fetch_logs or bool(grep))
+    raw_logs = snapshot.get("logs", [])
+    if pattern is not None:
+        matches = [index for index, line in enumerate(raw_logs) if _matches_log_line(pattern, line)][-tail:]
+        if not matches and raw_logs:
+            no_match_msg = f"No log lines matched pattern {grep!r} in available collection buffer ({len(raw_logs)} lines inspected)"
+            if snapshot.get("logs_error"):
+                snapshot["logs_error"] = f"{snapshot['logs_error']}; {no_match_msg}"
+            else:
+                snapshot["logs_error"] = no_match_msg
+        indices = sorted({index for match in matches
+                          for index in range(max(0, match - context), min(len(raw_logs), match + context + 1))})
+        selected_logs = [raw_logs[index] for index in indices]
+    else:
+        selected_logs = raw_logs[-tail:]
+    return _format_run(ref, snapshot, selected_logs)
 
 async def _run_snapshot(ref: str, version: int | None = None, logs: bool = False) -> dict:
     if version is not None and version < 1:
@@ -2508,6 +2556,9 @@ def parse_args() -> argparse.Namespace:
     p_status = subparsers.add_parser("status", help="Check notebook status")
     p_status.add_argument("notebook", help="Notebook name or directory")
     p_status.add_argument("--logs", action="store_true", help="Fetch logs")
+    p_status.add_argument("--tail", type=int, default=10, help="Number of log lines to show")
+    p_status.add_argument("--grep", help="Regex pattern to filter log lines before tail")
+    p_status.add_argument("--context", type=int, default=3, help="Lines before and after each grep match")
 
     # output
     p_output = subparsers.add_parser("output", help="Download notebook outputs")
@@ -2575,7 +2626,8 @@ def main() -> None:
         elif cmd == "view-dataset":
             _print_result(asyncio.run(read_metadata(args.dataset, "datasets")))
         elif cmd == "status":
-            _print_result(asyncio.run(view_status(args.notebook, fetch_logs=args.logs)))
+            fetch_logs = args.logs or bool(args.grep)
+            _print_result(asyncio.run(view_status(args.notebook, tail=args.tail, fetch_logs=fetch_logs, grep=args.grep, context=args.context)))
         elif cmd == "push":
             _print_result(asyncio.run(push_notebook(args.notebook, accelerator=args.accelerator)))
         elif cmd == "save":
