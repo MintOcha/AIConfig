@@ -67,7 +67,8 @@ def _format_result(value: str) -> str:
     if isinstance(data, dict) and "changes" not in data and ("ref" in data or "title" in data):
         fields = ("ref", "title", "subtitle", "visibility", "isPrivate", "currentVersionNumber",
                   "version", "status", "status_error", "licenseName", "totalBytes", "lastUpdated",
-                  "nextPageToken", "next_page_token", "error", "error_message")
+                  "nextPageToken", "next_page_token", "error", "error_message",
+                  "instances", "author", "slug", "description")
         data = {key: data[key] for key in fields if key in data}
     def render(item, prefix=""):
         if isinstance(item, dict):
@@ -624,10 +625,34 @@ async def list_model_versions(variation: str, page_token: str | None = None, pag
 
 @app.tool()
 async def list_model_files(variation: str) -> str:
-    """List files in the current version of owner/model/framework/variation."""
-    return await _query_kaggle(["models", "instances", "files", variation, "--format", "json"])
-
-
+    """List files in a model variation (owner/model/framework/variation or owner/model/framework/variation/version)."""
+    parts = variation.strip().strip("/").split("/")
+    if len(parts) == 4:
+        code = '''
+import sys, json
+from kaggle.api.kaggle_api_extended import KaggleApi
+api = KaggleApi(); api.authenticate()
+variation = sys.argv[1]
+try:
+    res = api.model_instance_get(variation)
+    ver = res.get("versionNumber", 1) if isinstance(res, dict) else getattr(res, "version_number", 1)
+except Exception:
+    ver = 1
+files_res = api.model_instance_version_files(f"{variation}/{ver}")
+print(files_res.to_json() if hasattr(files_res, "to_json") else json.dumps(files_res.to_dict()))
+'''
+        return await _query_process([sys.executable, "-c", code, variation])
+    elif len(parts) == 5:
+        code = '''
+import sys, json
+from kaggle.api.kaggle_api_extended import KaggleApi
+api = KaggleApi(); api.authenticate()
+files_res = api.model_instance_version_files(sys.argv[1])
+print(files_res.to_json() if hasattr(files_res, "to_json") else json.dumps(files_res.to_dict()))
+'''
+        return await _query_process([sys.executable, "-c", code, variation])
+    else:
+        raise ValueError("Expected variation handle: owner/model/framework/variation or owner/model/framework/variation/version")
 @app.tool()
 async def pull_model_metadata(model: str, target_dir: str, variation: bool = False) -> str:
     """Retrieve editable model or variation metadata without downloading weights.
