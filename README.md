@@ -235,12 +235,12 @@ Choose **Kaggle** under **Install MCPs** in `./scripts/install.py`.
 - `init_notebook`: initializes a brand new notebook experiment under `./kaggle/<notebook>/` with starter code (`train.py` or `notebook.ipynb`) and fresh `kernel-metadata.json`.
 - `save_notebook`: saves code and updates `kernel-metadata.json` locally and syncs to Kaggle cloud WITHOUT starting execution. If a `.py` script is present, automatically wraps it into `notebook.ipynb` (%%writefile + !python) for safe DDP/GPU multiprocessing.
 - `push_notebook`: pushes code to Kaggle and QUEUES EXECUTION (starts a new version/run on Kaggle Cloud). Increments run tracking (`total_runs`, `last_version_number`) in `kernel-metadata.json`.
-- `wait_for_notebook`: waits for completion or matching log text with an explicit timeout; output retrieval is separate.
-- `view_notebook`: shows execution state, hardware, and recent logs.
-- `pull_outputs`: retrieves notebook output artifacts and builds compressed summaries.
+- `wait_for_notebook`: returns the actual remote version/status and recent logs on terminal states; literal log matches include surrounding context and do not imply training success. Queries are bounded; unavailable or partial logs are explicit.
+- `view_notebook`: returns remote version, execution state, hardware, and a bounded live-log snapshot. Notebook `COMPLETE` is distinct from training outcome.
+- `pull_outputs`: requires the requested remote version to be `COMPLETE`, rejects empty artifact lists, and stages downloads before publishing to `runs/<remote-version>/output`. Existing output directories are rejected rather than merged. `pull_notebook` defaults to code-only; optional output retrieval uses the same gate.
 - `push_dataset` / `pull_dataset`: publish or retrieve dataset files. Long transfers return a PID and log after 29 seconds and continue without restarting.
 - `view_dataset` / `view_model`: inspect resource details; dataset details include visibility and processing state.
-- `edit_dataset` / `edit_notebook`: edit remote dataset presentation or local notebook presentation, respectively.
+- `edit_dataset` / `edit_notebook`: edit remote dataset presentation or local notebook presentation, respectively. Dataset edits preserve unspecified settings and read back changed fields, returning before/after verification, visibility, ref, and version; accepted-but-unverified updates and mismatches are explicit. `isPrivate` accepts a boolean; publishing requires authorization.
 - `search_datasets` / `search_notebooks` / `search_models` / `search_competitions`: discover public resources.
 - `list_datasets` / `list_notebooks` / `list_notebook_runs`: browse account resources and active jobs.
 - `list_dataset_files` / `preview_dataset`: inspect filenames or a bounded text sample.
@@ -256,6 +256,10 @@ Choose **Kaggle** under **Install MCPs** in `./scripts/install.py`.
 
 Model transfer CLI: `kaggle_mcp.py push-model PATH --options JSON` or `kaggle_mcp.py pull-model HANDLE --options JSON`.
 Model creation and remote edits use native Kaggle metadata contracts; licenses belong to variations. Preserve all settings when editing downloaded metadata.
+
+Dataset ZIPs may be expanded by Kaggle into mounted input files: the Showdown training set's `source.zip` appeared as extracted contents. Inspect `/kaggle/input` before loading and only unzip an archive that actually exists. Upload directory packaging (`dir_mode`) and local-download `unzip` do not guarantee that a ZIP is preserved on notebook mounts.
+
+After updating the MCP server, reconnect/reload its client connection to refresh tool discovery. A tool registered in the source is not automatically available to an already-connected session.
 
 CLI Usage:
 The script is also directly runnable from the command line:

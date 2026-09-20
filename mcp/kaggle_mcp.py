@@ -629,12 +629,14 @@ async def update_dataset_metadata(dataset: str, changes: dict[str, Any]) -> str:
 
     Fields: title, subtitle, description (Markdown), licenses, keywords,
     expectedUpdateFrequency, userSpecifiedSources. Dates and author are managed by Kaggle.
-    Licenses use [{"name":"LICENSE-ID"}]. Does not change privacy or collaborators.
+    Licenses use [{"name":"LICENSE-ID"}]. isPrivate changes visibility; publishing requires explicit user authorization. Collaborators are preserved.
     """
     allowed = {"title", "subtitle", "description", "licenses", "keywords",
-               "expectedUpdateFrequency", "userSpecifiedSources"}
+               "expectedUpdateFrequency", "userSpecifiedSources", "isPrivate"}
     if not changes or changes.keys() - allowed:
         raise ValueError(f"Supply presentation fields only: {sorted(allowed)}")
+    if "isPrivate" in changes and not isinstance(changes["isPrivate"], bool):
+        raise ValueError('isPrivate must be a boolean')
     if not re.fullmatch(r"[\w-]+/[\w.-]+", dataset):
         raise ValueError("Expected owner/slug")
     code = '''
@@ -660,7 +662,7 @@ with api.build_kaggle_client() as client:
         setattr(settings, name, getattr(info, name))
     patch = DatasetSettings.from_dict(changes)
     names = {'expectedUpdateFrequency': 'expected_update_frequency',
-             'userSpecifiedSources': 'user_specified_sources'}
+             'userSpecifiedSources': 'user_specified_sources', 'isPrivate': 'is_private'}
     for key in changes:
         name = names.get(key, key)
         setattr(settings, name, getattr(patch, name))
@@ -670,7 +672,27 @@ with api.build_kaggle_client() as client:
     result = client.datasets.dataset_api_client.update_dataset_metadata(update)
     if getattr(result, 'error_message', None):
         raise RuntimeError(result.error_message)
-    print(json.dumps(dict(dataset=dataset, updated=list(changes))))
+    report = dict(dataset=dataset, update_accepted=True, verification='unverified')
+    before = json.loads(info.to_json())
+    try:
+        readback = client.datasets.dataset_api_client.get_dataset_metadata(request)
+        if readback.error_message or readback.info is None:
+            raise RuntimeError(readback.error_message or 'Readback omitted metadata')
+        after = json.loads(readback.info.to_json())
+        expected = json.loads(settings.to_json())
+        fields = {key: dict(before=before.get(key), after=after.get(key), expected=expected.get(key),
+                           verified=after.get(key) == expected.get(key)) for key in changes}
+        report.update(verification='verified' if all(field['verified'] for field in fields.values()) else 'mismatch',
+                      changes=fields, visibility='private' if after.get('isPrivate') else 'public',
+                      ref=dataset)
+        from kagglesdk.datasets.types.dataset_api_service import ApiGetDatasetRequest
+        detail_request = ApiGetDatasetRequest()
+        detail_request.owner_slug, detail_request.dataset_slug = dataset.split('/')
+        detail = client.datasets.dataset_api_client.get_dataset(detail_request)
+        report['version'] = detail.current_version_number
+    except Exception as error:
+        report['verification_error'] = str(error)
+    print(json.dumps(report))
 '''
     return await _query_process([sys.executable, "-c", code, dataset, json.dumps(changes)])
 
@@ -1352,6 +1374,8 @@ async def init_notebook(
     - `./kaggle/<notebook>/runs/` and `./kaggle/<notebook>/working/` directories.
 
     You can then edit code and edit `kernel-metadata.json` before calling `push_notebook`.
+    Dataset ZIP contents may be expanded by Kaggle at mount time; inspect /kaggle/input
+    and use the mounted files rather than assuming an uploaded source.zip survives.
     """
     name, folder = _resolve_notebook_folder(notebook)
     folder.mkdir(parents=True, exist_ok=True)
@@ -1645,6 +1669,8 @@ async def push_notebook(
     EXECUTION:
     - Pushes to Kaggle, creating a new version/run on Kaggle Cloud.
     - Updates run tracking (`total_runs`, `last_version_number`, `last_status`) in `kernel-metadata.json`.
+    Dataset archives may mount as extracted directories/files, not as the uploaded ZIP.
+    Inspect the mounted input tree before loading; only unzip when the archive exists.
     """
     name, folder = _resolve_notebook_folder(notebook)
     # Save and lint first
@@ -1749,30 +1775,23 @@ async def wait(
         if not ref:
             raise ValueError("Notebook metadata has no id; pass owner/notebook-slug")
     deadline = asyncio.get_running_loop().time() + timeout
-    status = "UNKNOWN"
+    snapshot = dict(version=None, status="UNKNOWN", logs=[], logs_error="Not queried", training_outcome="unknown")
     try:
         async with asyncio.timeout(timeout):
             while True:
-                output = await _query_kaggle(["kernels", "status", ref])
-                match = re.search(r'has status "([^"]+)"', output)
-                if not match:
-                    raise RuntimeError("Unrecognized Kaggle status response")
-                status = _clean_status_label(match.group(1)).upper()
-                if until == "log":
-                    logs = await _query_kaggle(["kernels", "logs", ref])
-                    try:
-                        entries = json.loads(logs)
-                    except json.JSONDecodeError:
-                        entries = None
-                    if isinstance(entries, list):
-                        logs = "\n".join(str(entry.get("data", entry.get("message", ""))) if isinstance(entry, dict) else str(entry) for entry in entries)
-                    if text in logs:
-                        return json.dumps(dict(reason="matched", notebook=ref, status=status, text=text))
-                if status in {"COMPLETE", "ERROR", "CANCELLED", "CANCELED", "CANCEL_ACKNOWLEDGED"}:
-                    return json.dumps(dict(reason="terminal", notebook=ref, status=status, matched=False if until == "log" else None))
+                snapshot = await _run_snapshot(ref, snapshot["version"], logs=True)
+                lines = snapshot["logs"]
+                matches = [index for index, line in enumerate(lines) if text and text in line]
+                if until == "log" and matches:
+                    context = sorted({i for index in matches for i in range(max(0, index - 2), min(len(lines), index + 3))})
+                    return json.dumps(dict(snapshot, reason="matched", notebook=ref, text=text,
+                                           match_context=[lines[i] for i in context],
+                                           match_semantics="Literal log-text match; may include traceback/source text, not evidence of training progress"))
+                if snapshot["status"] in {"COMPLETE", "ERROR", "CANCELLED", "CANCELED", "CANCEL_ACKNOWLEDGED"}:
+                    return json.dumps(dict(snapshot, reason="terminal", notebook=ref, matched=False))
                 await asyncio.sleep(min(poll_interval, max(0, deadline - asyncio.get_running_loop().time())))
     except TimeoutError:
-        return json.dumps(dict(reason="timeout", notebook=ref, status=status))
+        return json.dumps(dict(snapshot, reason="timeout", notebook=ref))
 
 @app.tool()
 async def delete_notebook(notebook: str) -> str:
@@ -1854,251 +1873,142 @@ async def list_active_runs(limit: int = 50, head: int = 15) -> str:
         lines.extend(failures[:head])
     return "\n".join(lines)
 
-def _fetch_live_kernel_telemetry(owner: str, slug: str) -> dict[str, Any]:
-    """Query Kaggle midtier APIs directly for live kernel metadata and session status.
-
-    Returns dictionary with machine_shape, enable_gpu, enable_tpu, status, and failure_message.
-    """
-    from kaggle.api.kaggle_api_extended import KaggleApi
-    from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelRequest, ApiGetKernelSessionStatusRequest
-
-    telemetry: dict[str, Any] = {
-        "machine_shape": None,
-        "enable_gpu": False,
-        "enable_tpu": False,
-        "status": None,
-        "failure_message": None,
-    }
-    try:
-        api = KaggleApi()
-        api.authenticate()
-        with api.build_kaggle_client() as client:
-            # 1. Get live hardware config
-            try:
-                k_req = ApiGetKernelRequest()
-                k_req.user_name = owner
-                k_req.kernel_slug = slug
-                k_res = client.kernels.kernels_api_client.get_kernel(k_req)
-                meta = getattr(k_res, "metadata", None)
-                if meta:
-                    telemetry["machine_shape"] = getattr(meta, "machine_shape", None)
-                    telemetry["enable_gpu"] = bool(getattr(meta, "enable_gpu", False))
-                    telemetry["enable_tpu"] = bool(getattr(meta, "enable_tpu", False))
-            except Exception:
-                pass
-
-            # 2. Get live session status & failure message
-            try:
-                s_req = ApiGetKernelSessionStatusRequest()
-                s_req.user_name = owner
-                s_req.kernel_slug = slug
-                s_res = client.kernels.kernels_api_client.get_kernel_session_status(s_req)
-                if s_res:
-                    raw_status = getattr(s_res, "status", None)
-                    if raw_status:
-                        telemetry["status"] = _clean_status_label(str(raw_status))
-                    telemetry["failure_message"] = getattr(s_res, "failure_message", "")
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    return telemetry
 
 
-def _fetch_live_logs_stream(owner: str, slug: str) -> list[str]:
-    """Stream live logs via Kaggle midtier SSE/stream endpoint with CLI fallback."""
-    from kaggle.api.kaggle_api_extended import KaggleApi
-    from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelSessionLogsStreamRequest
-
-    clean_lines: list[str] = []
-    # Priority 1: SDK live log stream endpoint
-    try:
-        api = KaggleApi()
-        api.authenticate()
-        with api.build_kaggle_client() as client:
-            req = ApiGetKernelSessionLogsStreamRequest()
-            req.user_name = owner
-            req.kernel_slug = slug
-            res = client.kernels.kernels_api_client.get_kernel_session_logs_stream(req)
-            content_type = res.headers.get("Content-Type", "")
-            if "text/event-stream" in content_type:
-                for raw_line in res.iter_lines():
-                    if not raw_line:
-                        continue
-                    line_str = raw_line.decode("utf-8", errors="replace")
-                    if line_str.startswith("data:"):
-                        data_val = line_str[5:].strip()
-                        try:
-                            item = json.loads(data_val)
-                            text = item.get("data") or item.get("message") or ""
-                            for sub in text.splitlines():
-                                if sub.strip():
-                                    clean_lines.append(sub)
-                        except Exception:
-                            clean_lines.append(data_val)
-            else:
-                try:
-                    items = json.loads(res.text)
-                    if isinstance(items, list):
-                        for it in items:
-                            text = it.get("data") or it.get("message") or ""
-                            for sub in text.splitlines():
-                                if sub.strip():
-                                    clean_lines.append(sub)
-                    else:
-                        clean_lines = [l for l in res.text.splitlines() if l.strip()]
-                except Exception:
-                    clean_lines = [l for l in res.text.splitlines() if l.strip()]
-    except Exception:
-        pass
-
-    # Priority 2: CLI logs fallback if stream endpoint didn't return lines
-    if not clean_lines:
-        try:
-            logs_proc = _run_kaggle(["kernels", "logs", f"{owner}/{slug}"], timeout=60)
-            raw_stdout = logs_proc.stdout.strip()
-            if raw_stdout.startswith("[") or raw_stdout.startswith("{"):
-                try:
-                    parsed = json.loads(raw_stdout)
-                    if isinstance(parsed, list):
-                        for item in parsed:
-                            text_part = item.get("data") or item.get("message") or ""
-                            for sub in text_part.splitlines():
-                                if sub.strip():
-                                    clean_lines.append(sub)
-                except Exception:
-                    clean_lines = [l for l in raw_stdout.splitlines() if l.strip()]
-            else:
-                clean_lines = [l for l in raw_stdout.splitlines() if l.strip()]
-        except Exception:
-            pass
-
-    return clean_lines
 
 
 @app.tool(name="view_notebook")
 async def view_status(notebook: str, tail: int = 10, fetch_logs: bool = True) -> str:
-    """Check Kaggle notebook status with rich live execution telemetry.
-
-    Queries Kaggle midtier APIs directly for:
-    - Current status: QUEUED, RUNNING, COMPLETE, ERROR, or CANCEL_ACKNOWLEDGED
-    - Hardware / Accelerator: Actual GPU/TPU allocated on Kaggle Cloud (e.g. NvidiaTeslaT4, NvidiaTeslaP100, TPU, or CPU)
-    - Elapsed time: Wall time since the run started
-    - CPU/GPU usage: Extracted from live stdout/stderr telemetry markers
-    - Live logs: Latest 10 lines from Kaggle's live log stream endpoint
-    """
-    name, folder = _resolve_notebook_folder(notebook)
-    meta = _read_metadata(folder)
-    owner = _default_owner()
-    existed, kernel = await _find_kernel(meta.get("title", name), name)
-    ref = meta.get("id") or _full_slug(kernel) or f"{owner}/{_slugify(name)}"
-    owner_part, slug_part = _split_kernel_slug(ref)
-
-    # 1. Fetch live telemetry from Kaggle API
-    telemetry = _fetch_live_kernel_telemetry(owner_part, slug_part)
-
-    # Check status via CLI as well to ensure version capture
-    status_proc = _run_kaggle(["kernels", "status", ref], timeout=30)
-    status_text = status_proc.stdout.strip()
-    match = re.search(r'has status "([^"]+)"', status_text)
-    cli_status_label = _clean_status_label(match.group(1) if match else "UNKNOWN")
-    status_label = telemetry.get("status") or cli_status_label
-
-    version_match = re.search(r"version\s+(\d+)", status_text, re.I)
-    version = int(version_match.group(1)) if version_match else meta.get("last_version_number")
-
-    # 2. Hardware / Accelerator resolution from live Kaggle Cloud metadata
-    raw_shape = telemetry.get("machine_shape")
-    server_shape = raw_shape if raw_shape and str(raw_shape).strip().lower() not in ("none", "") else None
-    server_gpu = bool(telemetry.get("enable_gpu"))
-    server_tpu = bool(telemetry.get("enable_tpu"))
-
-    meta_acc = str(meta.get("accelerator") or "none").lower()
-    meta_gpu = meta.get("enable_gpu") in (True, "true")
-    meta_tpu = meta.get("enable_tpu") in (True, "true")
-
-    hardware_display = "CPU"
-    if server_shape:
-        hardware_display = f"GPU ({server_shape})"
-    elif server_gpu or meta_gpu or (meta_acc not in ("none", "cpu", "") and _is_gpu_accelerator(meta_acc)):
-        acc_name = server_shape or (meta_acc if meta_acc not in ("none", "cpu", "") else "NvidiaTeslaT4")
-        if acc_name in ("none", "cpu", None):
-            acc_name = "NvidiaTeslaT4"
-        hardware_display = f"GPU ({acc_name})"
-    elif server_tpu or meta_tpu or meta_acc == "tpu":
-        hardware_display = "TPU (v3-8)"
+    """Inspect actual remote version/status with bounded log collection. COMPLETE is notebook status, not training success."""
+    if tail < 1:
+        raise ValueError("tail must be positive")
+    if re.fullmatch(r"[\w-]+/[\w.-]+", notebook):
+        ref = notebook
     else:
-        hardware_display = "CPU"
-    # 3. Elapsed Time Calculation
-    last_pushed = meta.get("last_pushed_utc")
-    elapsed_str = "unknown"
-    if last_pushed:
-        try:
-            pushed_dt = datetime.fromisoformat(last_pushed)
-            elapsed_sec = int((datetime.now(timezone.utc) - pushed_dt).total_seconds())
-            mins, secs = divmod(elapsed_sec, 60)
-            hours, mins = divmod(mins, 60)
-            if hours > 0:
-                elapsed_str = f"{hours}h {mins}m {secs}s"
-            elif mins > 0:
-                elapsed_str = f"{mins}m {secs}s"
-            else:
-                elapsed_str = f"{secs}s"
-        except Exception:
-            pass
+        _, folder = _resolve_notebook_folder(notebook)
+        ref = _read_metadata(folder).get("id")
+        if not ref:
+            raise ValueError("Notebook metadata has no id; pass owner/notebook-slug")
+    snapshot = await _run_snapshot(ref, logs=fetch_logs)
+    snapshot["notebook"] = ref
+    snapshot["logs"] = snapshot["logs"][-tail:]
+    return json.dumps(snapshot)
 
-    run_dir = folder / "runs" / str(version or 0)
-    run_dir.mkdir(parents=True, exist_ok=True)
+async def _run_snapshot(ref: str, version: int | None = None, logs: bool = False) -> dict:
+    if version is not None and version < 1:
+        raise ValueError("Run number must be a positive Kaggle version")
+    code = '''
+import sys, json, threading
+from collections import deque
+from kaggle.api.kaggle_api_extended import KaggleApi
+from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelRequest, ApiGetKernelSessionStatusRequest, ApiListKernelSessionOutputRequest
+api = KaggleApi(); api.authenticate()
+owner, slug = sys.argv[1].split('/')
+with api.build_kaggle_client() as client:
+    request = ApiGetKernelRequest()
+    request.user_name, request.kernel_slug = owner, slug
+    metadata = client.kernels.kernels_api_client.get_kernel(request).metadata
+    latest = metadata.current_version_number
+    version = int(sys.argv[2]) if sys.argv[2] else latest
+    if not version or version < 1:
+        raise RuntimeError('Cannot determine remote version')
+    request = ApiGetKernelSessionStatusRequest()
+    request.user_name, request.kernel_slug, request.version_label = owner, slug, f'v{version}'
+    status = client.kernels.kernels_api_client.get_kernel_session_status(request).status.name
+    result = dict(version=version, status=status, logs=[], logs_error=None, training_outcome='unknown')
+    result['hardware'] = metadata.machine_shape or 'unknown'
+    if sys.argv[3] == '1':
+        lines = deque(maxlen=200)
+        errors = []
+        def collect():
+            try:
+                if version == latest:
+                    for event in api.kernels_logs_stream(owner + '/' + slug):
+                        lines.extend(str(event.get('data', '')).splitlines())
+                else:
+                    request = ApiListKernelSessionOutputRequest()
+                    request.user_name, request.kernel_slug, request.version_label = owner, slug, f'v{version}'
+                    body = client.kernels.kernels_api_client.list_kernel_session_output(request).log
+                    try:
+                        events = json.loads(body)
+                        for event in events:
+                            lines.extend(str(event.get('data', '')).splitlines())
+                    except (ValueError, TypeError):
+                        lines.extend((body or '').splitlines())
+            except Exception as error:
+                errors.append(str(error))
+        worker = threading.Thread(target=collect, daemon=True)
+        worker.start(); worker.join(5)
+        result['logs'] = list(lines)
+        result['logs_error'] = '; '.join(errors) or ('Live log collection reached 5-second bound; snapshot may be partial' if worker.is_alive() else None)
+        if not result['logs'] and not result['logs_error']:
+            result['logs_error'] = 'Kaggle returned no log events for this version'
+        if version == latest:
+            check = ApiGetKernelRequest()
+            check.user_name, check.kernel_slug = owner, slug
+            if client.kernels.kernels_api_client.get_kernel(check).metadata.current_version_number != version:
+                result['logs'] = []
+                result['logs_error'] = 'Remote latest version changed during log retrieval; discarded ambiguous logs'
+    print(json.dumps(result), flush=True)
+'''
+    return json.loads(await _query_process([sys.executable, "-c", code, ref, str(version) if version else "", "1" if logs else "0"], timeout=15))
 
-    # 4. Fetch live logs via Kaggle stream endpoint
-    log_snippet = ""
-    usage_telemetry = []
-    if fetch_logs:
-        clean_lines = _fetch_live_logs_stream(owner_part, slug_part)
-        if clean_lines:
-            (run_dir / "logs.txt").write_text("\n".join(clean_lines))
-            build_run_summary(run_dir)
 
-            tail_lines = clean_lines[-tail:]
-            log_snippet = "\n".join(tail_lines)
+async def _completed_run(ref: str, version: int | None = None) -> int:
+    snapshot = await _run_snapshot(ref, version)
+    if snapshot["status"] != "COMPLETE":
+        raise RuntimeError(f"Run {snapshot['version']} is {snapshot['status']}; outputs require COMPLETE. No output directory created.")
+    return snapshot["version"]
 
-            # Search for GPU/CPU usage markers in logs
-            for line in clean_lines:
-                l_lower = line.lower()
-                if any(k in l_lower for k in ("nvidia-smi", "cuda memory", "gpu memory", "gpu utilization", "vram", "cpu utilization", "ram used")):
-                    usage_telemetry.append(line.strip())
 
-    # Update metadata
-    _write_metadata(
-        folder,
-        {
-            "last_status": status_label,
-            "last_status_utc": datetime.now(timezone.utc).isoformat(),
-        },
-    )
+async def _download_run(ref: str, version: int, output_dir: Path) -> None:
+    code = '''
+import sys, os, tempfile
+from pathlib import Path
+import requests
+from kaggle.api.kaggle_api_extended import KaggleApi
+from kagglesdk.kernels.types.kernels_api_service import ApiListKernelSessionOutputRequest
+api = KaggleApi(); api.authenticate()
+owner, slug = sys.argv[1].split('/')
+destination = Path(sys.argv[3])
+with api.build_kaggle_client() as client:
+    request = ApiListKernelSessionOutputRequest()
+    request.user_name, request.kernel_slug = owner, slug
+    request.version_label = 'v' + sys.argv[2]
+    request.page_size = 200
+    files = []
+    while True:
+        response = client.kernels.kernels_api_client.list_kernel_session_output(request)
+        files.extend(response.files or [])
+        if not response.next_page_token:
+            break
+        request.page_token = response.next_page_token
+    if not files:
+        raise RuntimeError('Completed notebook version has no output artifacts; download not performed')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=destination.parent) as temporary:
+        staging = Path(temporary)
+        for item in files:
+            target = staging / item.file_name
+            if not target.resolve().is_relative_to(staging.resolve()):
+                raise RuntimeError('Unsafe output filename')
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with requests.get(item.url, stream=True, timeout=30) as transfer:
+                transfer.raise_for_status()
+                with target.open('wb') as stream:
+                    for chunk in transfer.iter_content(1024 * 1024):
+                        stream.write(chunk)
+        if destination.exists():
+            raise RuntimeError('Output directory already exists; refusing to merge potentially misnumbered artifacts')
+        os.rename(staging, destination)
+    print(len(files))
+'''
+    await _query_process([sys.executable, "-c", code, ref, str(version), str(output_dir)], timeout=300)
 
-    lines = [
-        f"Notebook: '{name}' ({ref})",
-        f"- Status: {status_label} (version {version or 'unknown'})",
-        f"- Hardware: {hardware_display}",
-        f"- Elapsed time: {elapsed_str}",
-    ]
-    if telemetry.get("failure_message"):
-        lines.append(f"- Failure reason: {telemetry['failure_message']}")
-    if usage_telemetry:
-        lines.append(f"- Resource usage detected: {usage_telemetry[-1]}")
-
-    if log_snippet:
-        lines.append(f"\nLatest {tail} lines of live logs:\n```text\n{log_snippet}\n```")
-    else:
-        lines.append(f"\n(No logs available yet)")
-
-    return "\n".join(lines)
 
 @app.tool(name="pull_outputs")
 async def fetch_output(notebook: str, run_number: int | None = None) -> str:
-    """Download notebook output into ./kaggle/<notebook>/runs/<n>/output/ and build compressed summaries."""
+    """Retrieve outputs only from a confirmed COMPLETE Kaggle version. run_number is the remote version, never a local counter."""
     name, _, _ = _source_path(notebook)
     existed, kernel = await _find_kernel(name, name)
     ref = _full_slug(kernel)
@@ -2108,31 +2018,16 @@ async def fetch_output(notebook: str, run_number: int | None = None) -> str:
     if not ref:
         raise RuntimeError(f"Could not resolve Kaggle kernel for '{name}'.")
 
-    # Resolve run directory
-    runs_dir = get_kaggle_root() / name / "runs"
-    runs_dir.mkdir(parents=True, exist_ok=True)
-    if run_number is not None:
-        target_dir = runs_dir / str(run_number)
-    else:
-        existing_nums = [int(p.name) for p in runs_dir.iterdir() if p.is_dir() and p.name.isdigit()]
-        next_num = max(existing_nums, default=0) + 1
-        target_dir = runs_dir / str(next_num)
+    version = await _completed_run(ref, run_number)
+    target_dir = get_kaggle_root() / name / "runs" / str(version)
 
     output_dir = target_dir / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Download outputs via Kaggle CLI
     try:
-        _run_kaggle(["kernels", "output", ref, "-p", str(output_dir), "--force"], timeout=300)
+        await _download_run(ref, version, output_dir)
     except Exception as err:
-        return f"Output download failed: {err}"
+        raise RuntimeError(f"Output download failed for version {version}: {err}") from err
 
-    # 2. Download execution logs
-    try:
-        logs_proc = _run_kaggle(["kernels", "logs", ref], timeout=120)
-        (target_dir / "logs.txt").write_text(logs_proc.stdout)
-    except Exception:
-        pass
 
     # 3. High-speed in-memory compression (generates summary.txt, tree.txt, logs.compressed.txt)
     summary_text = build_run_summary(target_dir)
@@ -2140,6 +2035,8 @@ async def fetch_output(notebook: str, run_number: int | None = None) -> str:
     # Calculate downloaded size
     files = list(output_dir.rglob("*"))
     file_count = sum(1 for f in files if f.is_file())
+    if not file_count:
+        raise RuntimeError(f"Completed run {version} returned no output files; no successful download recorded")
     total_size = sum(f.stat().st_size for f in files if f.is_file())
 
     return (
@@ -2196,7 +2093,7 @@ async def cancel_run(notebook: str) -> str:
 
 
 @app.tool()
-async def pull_notebook(notebook: str, fetch_latest_output: bool = True) -> str:
+async def pull_notebook(notebook: str, fetch_latest_output: bool = False) -> str:
     """Pull an existing Kaggle notebook and scaffold ./kaggle/<notebook>/ with runs and working directories."""
     proc = _run_kaggle(["kernels", "list", "--mine", "--page-size", "100", "--sort-by", "dateRun", "--csv"], timeout=60)
     rows = _parse_kernel_csv(proc.stdout)
@@ -2233,29 +2130,19 @@ async def pull_notebook(notebook: str, fetch_latest_output: bool = True) -> str:
     shutil.copy(pulled[0], target_path)
     shutil.rmtree(probe_dir, ignore_errors=True)
 
-    # Check status and version
-    status_proc = _run_kaggle(["kernels", "status", ref], timeout=30)
-    status_text = status_proc.stdout.strip()
-    match_st = re.search(r'has status "([^"]+)"', status_text)
-    status_label = _clean_status_label(match_st.group(1) if match_st else "UNKNOWN")
-
-    version_match = re.search(r"version\s+(\d+)", status_text, re.I)
-    version = int(version_match.group(1)) if version_match else 1
-
-    run_dir = folder / "runs" / str(version)
-    run_dir.mkdir(parents=True, exist_ok=True)
+    snapshot = await _run_snapshot(ref)
+    status_label, version = snapshot["status"], snapshot["version"]
     output_msg = ""
     if fetch_latest_output:
+        version = await _completed_run(ref)
+        run_dir = folder / "runs" / str(version)
         out_dir = run_dir / "output"
-        out_dir.mkdir(parents=True, exist_ok=True)
         try:
-            _run_kaggle(["kernels", "output", ref, "-p", str(out_dir), "--force"], timeout=180)
-            logs_proc = _run_kaggle(["kernels", "logs", ref], timeout=60)
-            (run_dir / "logs.txt").write_text(logs_proc.stdout)
+            await _download_run(ref, version, out_dir)
             build_run_summary(run_dir)
             output_msg = f"\nLatest output and compressed summary saved to `{run_dir.relative_to(get_workspace_root())}`."
-        except Exception:
-            output_msg = "\n(Output download skipped or not yet available)."
+        except Exception as error:
+            raise RuntimeError(f"Output download failed for version {version}: {error}") from error
 
     cache_update = {
         "title": title,
@@ -2293,6 +2180,11 @@ async def upload_dataset(
     Options are title, dataset_slug, private, version_notes, keep_tabular, dir_mode.
     MCP returns after 29 seconds with a PID and log if still running. The upload
     continues: monitor its log, do NOT restart it. Use CLI for future long uploads.
+    Kaggle may automatically expand uploaded ZIPs for notebook mounts. For the Showdown
+    training set, source.zip mounted as its contents, not a retained source.zip.
+    Do not confuse this server behavior with the local download unzip option or
+    dir_mode (upload directory packaging). Inspect actual mounted paths; do not
+    promise archive preservation merely because the local upload was a ZIP.
     """
     options = dict(title=title, dataset_slug=dataset_slug, private=private,
                    version_notes=version_notes, keep_tabular=keep_tabular, dir_mode=dir_mode, metadata=metadata)
@@ -2556,6 +2448,11 @@ def parse_args() -> argparse.Namespace:
 
     # quota
     subparsers.add_parser("quota", help="Check accelerator quota")
+    edit_dataset = subparsers.add_parser("edit-dataset", help="Edit dataset metadata and visibility without uploading files")
+    edit_dataset.add_argument("dataset")
+    edit_dataset.add_argument("--changes", required=True, help='JSON fields, including isPrivate true or false')
+    view_dataset = subparsers.add_parser("view-dataset", help="Read dataset metadata and visibility")
+    view_dataset.add_argument("dataset")
     upload = subparsers.add_parser("upload", help="Upload dataset without the MCP call timeout")
     upload.add_argument("path")
     upload.add_argument("--options", default="{}", help="JSON upload options")
@@ -2605,6 +2502,10 @@ def main() -> None:
         cmd = args.command
         if cmd == "quota":
             print(asyncio.run(get_quota()))
+        elif cmd == "edit-dataset":
+            print(asyncio.run(update_dataset_metadata(args.dataset, json.loads(args.changes))))
+        elif cmd == "view-dataset":
+            print(asyncio.run(read_metadata(args.dataset, "datasets")))
         elif cmd == "status":
             print(asyncio.run(view_status(args.notebook, fetch_logs=args.logs)))
         elif cmd == "push":
