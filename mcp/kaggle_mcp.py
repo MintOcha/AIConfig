@@ -1843,12 +1843,16 @@ async def wait(
     notebook: str,
     until: str = "complete",
     text: str | None = None,
+    version: int | str | None = None,
+    versions: list[int | str] | None = None,
     timeout: int = 30,
     poll_interval: int = 5,
 ) -> str:
     """Wait until notebook terminates or a literal string appears in available logs.
 
     until: complete or log. log requires text (case-sensitive literal substring).
+    version: specific version to wait for (int or 'v3').
+    versions: list of versions (e.g. ['v3', 'v4'] or [3, 4]); returns when the FIRST one settles.
     Existing log text also matches; this is not restricted to new log lines.
     Returns concise text with reason matched, terminal, or timeout. Terminal errors stop
     either wait mode. No output download. Default 20s fits short MCP deadlines;
@@ -1866,32 +1870,49 @@ async def wait(
         ref = _read_metadata(folder).get("id")
         if not ref:
             raise ValueError("Notebook metadata has no id; pass owner/notebook-slug")
+
+    # Parse targets
+    target_versions: list[int] = []
+    if version is not None:
+        v_int = int(str(version).lstrip("vV"))
+        if v_int < 1:
+            raise ValueError("version must be a positive integer")
+        target_versions.append(v_int)
+    if versions is not None:
+        for v in versions:
+            v_int = int(str(v).lstrip("vV"))
+            if v_int < 1:
+                raise ValueError("versions must be positive integers")
+            if v_int not in target_versions:
+                target_versions.append(v_int)
+
     deadline = asyncio.get_running_loop().time() + timeout
     snapshot = dict(version=None, status="UNKNOWN", logs=[], logs_error="Not queried", training_outcome="unknown")
     cli_tip = f"\n\n[Tip: Kaggle is notoriously slow. Please switch to using CLI for reliable long waits/logs:\nuv run --script /home/nas/Projects/AIConfig/mcp/kaggle_mcp.py wait {ref} --until {until}{f' --text {text!r}' if text else ''} --timeout 3600\nor check logs with:\nuv run --script /home/nas/Projects/AIConfig/mcp/kaggle_mcp.py status {ref} --logs --log-timeout 60]"
     try:
         async with asyncio.timeout(timeout):
             while True:
-                # Allocate remaining time in timeout budget (up to 30s) to wait for log streaming
                 rem_time = max(5, int(deadline - asyncio.get_running_loop().time()))
-                snapshot = await _run_snapshot(ref, snapshot["version"], logs=True, log_timeout=min(30, rem_time))
-                lines = snapshot["logs"]
-                matches = [index for index, line in enumerate(lines) if text and text in line]
-                if until == "log" and matches:
-                    index = matches[-1]
-                    context = lines[max(0, index - 2):index + 3]
-                    return _format_run(ref, snapshot, context, reason="matched") + "\nLiteral log-text match; may include traceback/source text, not evidence of training progress."
-                status = snapshot.get("status")
-                if status in TERMINAL_RUN_STATUSES or status not in ACTIVE_RUN_STATUSES:
-                    reason = "terminal" if status in TERMINAL_RUN_STATUSES else "not_running"
-                    return _format_run(ref, snapshot, lines[-5:], reason=reason)
+                # If target versions specified, check each in order
+                v_to_check: list[int | None] = target_versions if target_versions else [snapshot.get("version")]
+                for target_v in v_to_check:
+                    snapshot = await _run_snapshot(ref, target_v, logs=True, log_timeout=min(30, rem_time))
+                    lines = snapshot["logs"]
+                    matches = [index for index, line in enumerate(lines) if text and text in line]
+                    if until == "log" and matches:
+                        index = matches[-1]
+                        context = lines[max(0, index - 2):index + 3]
+                        return _format_run(ref, snapshot, context, reason="matched") + "\nLiteral log-text match; may include traceback/source text, not evidence of training progress."
+                    status = snapshot.get("status")
+                    if status in TERMINAL_RUN_STATUSES or status not in ACTIVE_RUN_STATUSES:
+                        reason = "terminal" if status in TERMINAL_RUN_STATUSES else "not_running"
+                        return _format_run(ref, snapshot, lines[-5:], reason=reason)
                 await asyncio.sleep(min(poll_interval, max(0, deadline - asyncio.get_running_loop().time())))
     except TimeoutError:
         last_logs = snapshot.get("logs", [])
         if last_logs:
             return _format_run(ref, snapshot, last_logs[-5:], reason="waited") + cli_tip
         return _format_run(ref, snapshot, [], reason="waited") + f"\nNo log lines collected before timeout.{cli_tip}"
-
 @app.tool()
 async def delete_notebook(notebook: str) -> str:
     """Delete a notebook and its remote runs from your Kaggle account.
