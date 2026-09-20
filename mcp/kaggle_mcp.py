@@ -1590,7 +1590,7 @@ async def save_notebook(
             "cells": [
                 {"cell_type": "markdown", "metadata": {}, "source": f"# {name}\n\nAuto-converted from `{script_name}`.\n"},
                 {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _as_cell_source(f"%%writefile {script_name}\n" + py_text)},
-                {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _as_cell_source(f"!python {script_name}")},
+                {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _as_cell_source(f"import sys, subprocess\nsubprocess.run([sys.executable, '{script_name}'], check=True)\n")},
             ],
             "metadata": {
                 "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
