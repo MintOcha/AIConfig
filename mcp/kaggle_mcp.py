@@ -59,6 +59,59 @@ CANONICAL WORKFLOW:
 """
 )
 
+def _format_result(value: str) -> str:
+    try:
+        data = json.loads(value)
+    except (ValueError, TypeError):
+        return value
+    if isinstance(data, dict) and "changes" not in data and ("ref" in data or "title" in data):
+        fields = ("ref", "title", "subtitle", "visibility", "isPrivate", "currentVersionNumber",
+                  "version", "status", "status_error", "licenseName", "totalBytes", "lastUpdated",
+                  "nextPageToken", "next_page_token", "error", "error_message")
+        data = {key: data[key] for key in fields if key in data}
+    def render(item, prefix=""):
+        if isinstance(item, dict):
+            rows = []
+            for key, child in item.items():
+                rows.extend(render(child, f"{prefix}.{key}" if prefix else key))
+            return rows
+        if isinstance(item, list):
+            rows = []
+            for index, child in enumerate(item[:10]):
+                rows.extend(render(child, f"{prefix}[{index + 1}]"))
+            if len(item) > 10:
+                rows.append(f"{prefix}: {len(item) - 10} more entries omitted; use pagination")
+            return rows or [f"{prefix}: none"]
+        text = "unknown" if item is None else str(item)
+        if len(text) > 400:
+            text = text[:397] + "... [truncated]"
+        return [f"{prefix}: {text}" if prefix else text]
+    return "\n".join(render(data))
+
+
+from fastmcp.server.middleware import Middleware
+from fastmcp.tools.tool import ToolResult
+
+
+class ResultPresentation(Middleware):
+    async def on_list_tools(self, context, call_next):
+        tools = await call_next(context)
+        return [tool.model_copy(update={"output_schema": None}) for tool in tools]
+
+    async def on_call_tool(self, context, call_next):
+        result = await call_next(context)
+        for block in result.content:
+            if block.type == "text":
+                block.text = _format_result(block.text)
+        return ToolResult(content=result.content, meta=result.meta, is_error=result.is_error)
+
+
+app.add_middleware(ResultPresentation())
+
+
+def _print_result(value: str) -> None:
+    print(_format_result(value))
+
 
 # ---------------------------------------------------------------------------
 # Path & Workspace Resolution
@@ -1758,7 +1811,7 @@ async def wait(
 
     until: complete or log. log requires text (case-sensitive literal substring).
     Existing log text also matches; this is not restricted to new log lines.
-    Returns JSON with reason matched, terminal, or timeout. Terminal errors stop
+    Returns concise text with reason matched, terminal, or timeout. Terminal errors stop
     either wait mode. No output download. Default 20s fits short MCP deadlines;
     longer waits require a client timeout greater than timeout. Reissue after a
     timeout instead of tight polling. Log queries inspect the current run.
@@ -1783,15 +1836,14 @@ async def wait(
                 lines = snapshot["logs"]
                 matches = [index for index, line in enumerate(lines) if text and text in line]
                 if until == "log" and matches:
-                    context = sorted({i for index in matches for i in range(max(0, index - 2), min(len(lines), index + 3))})
-                    return json.dumps(dict(snapshot, reason="matched", notebook=ref, text=text,
-                                           match_context=[lines[i] for i in context],
-                                           match_semantics="Literal log-text match; may include traceback/source text, not evidence of training progress"))
+                    index = matches[-1]
+                    context = lines[max(0, index - 2):index + 3]
+                    return _format_run(ref, snapshot, context, reason="matched") + "\nLiteral log-text match; may include traceback/source text, not evidence of training progress."
                 if snapshot["status"] in {"COMPLETE", "ERROR", "CANCELLED", "CANCELED", "CANCEL_ACKNOWLEDGED"}:
-                    return json.dumps(dict(snapshot, reason="terminal", notebook=ref, matched=False))
+                    return _format_run(ref, snapshot, lines[-5:], reason="terminal")
                 await asyncio.sleep(min(poll_interval, max(0, deadline - asyncio.get_running_loop().time())))
     except TimeoutError:
-        return json.dumps(dict(snapshot, reason="timeout", notebook=ref))
+        return _format_run(ref, snapshot, snapshot["logs"][-5:], reason="timeout")
 
 @app.tool()
 async def delete_notebook(notebook: str) -> str:
@@ -1877,6 +1929,24 @@ async def list_active_runs(limit: int = 50, head: int = 15) -> str:
 
 
 
+def _format_run(ref: str, snapshot: dict, logs: list[str], reason: str | None = None) -> str:
+    header = f"{ref} · version {snapshot.get('version') or 'unknown'} · {snapshot['status']}"
+    if reason:
+        header += f" · {reason}"
+    lines = [header, f"Hardware: {snapshot.get('hardware', 'unknown')} | Training outcome: unknown"]
+    for line in logs:
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            event = None
+        if isinstance(event, dict):
+            line = " ".join(f"{key}={value:.6g}" if isinstance(value, float) else f"{key}={value}" for key, value in event.items())
+        lines.append(line if len(line) <= 600 else line[:597] + "...")
+    if snapshot.get("logs_error"):
+        lines.append(f"Logs: {snapshot['logs_error']}")
+    return "\n".join(lines)
+
+
 @app.tool(name="view_notebook")
 async def view_status(notebook: str, tail: int = 10, fetch_logs: bool = True) -> str:
     """Inspect actual remote version/status with bounded log collection. COMPLETE is notebook status, not training success."""
@@ -1890,9 +1960,7 @@ async def view_status(notebook: str, tail: int = 10, fetch_logs: bool = True) ->
         if not ref:
             raise ValueError("Notebook metadata has no id; pass owner/notebook-slug")
     snapshot = await _run_snapshot(ref, logs=fetch_logs)
-    snapshot["notebook"] = ref
-    snapshot["logs"] = snapshot["logs"][-tail:]
-    return json.dumps(snapshot)
+    return _format_run(ref, snapshot, snapshot["logs"][-tail:])
 
 async def _run_snapshot(ref: str, version: int | None = None, logs: bool = False) -> dict:
     if version is not None and version < 1:
@@ -2501,27 +2569,27 @@ def main() -> None:
     if args.command:
         cmd = args.command
         if cmd == "quota":
-            print(asyncio.run(get_quota()))
+            _print_result(asyncio.run(get_quota()))
         elif cmd == "edit-dataset":
-            print(asyncio.run(update_dataset_metadata(args.dataset, json.loads(args.changes))))
+            _print_result(asyncio.run(update_dataset_metadata(args.dataset, json.loads(args.changes))))
         elif cmd == "view-dataset":
-            print(asyncio.run(read_metadata(args.dataset, "datasets")))
+            _print_result(asyncio.run(read_metadata(args.dataset, "datasets")))
         elif cmd == "status":
-            print(asyncio.run(view_status(args.notebook, fetch_logs=args.logs)))
+            _print_result(asyncio.run(view_status(args.notebook, fetch_logs=args.logs)))
         elif cmd == "push":
-            print(asyncio.run(push_notebook(args.notebook, accelerator=args.accelerator)))
+            _print_result(asyncio.run(push_notebook(args.notebook, accelerator=args.accelerator)))
         elif cmd == "save":
-            print(asyncio.run(save_notebook(args.notebook)))
+            _print_result(asyncio.run(save_notebook(args.notebook)))
         elif cmd == "wait":
-            print(asyncio.run(wait(args.notebook, until=args.until, text=args.text, timeout=args.timeout, poll_interval=args.poll_interval)))
+            _print_result(asyncio.run(wait(args.notebook, until=args.until, text=args.text, timeout=args.timeout, poll_interval=args.poll_interval)))
         elif cmd == "output":
-            print(asyncio.run(fetch_output(args.notebook, run_number=args.run)))
+            _print_result(asyncio.run(fetch_output(args.notebook, run_number=args.run)))
         elif cmd == "upload":
-            print(_upload_dataset(args.path, **json.loads(args.options)))
+            _print_result(_upload_dataset(args.path, **json.loads(args.options)))
         elif cmd == "download":
-            print(_download_dataset(args.dataset, **json.loads(args.options)))
+            _print_result(_download_dataset(args.dataset, **json.loads(args.options)))
         elif cmd in ("push-model", "pull-model"):
-            print(_model_transfer(cmd, args.source, json.loads(args.options)))
+            _print_result(_model_transfer(cmd, args.source, json.loads(args.options)))
         return
 
     # MCP server mode

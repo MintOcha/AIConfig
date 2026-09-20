@@ -261,6 +261,8 @@ Dataset ZIPs may be expanded by Kaggle into mounted input files: the Showdown tr
 
 After updating the MCP server, reconnect/reload its client connection to refresh tool discovery. A tool registered in the source is not automatically available to an already-connected session.
 
+All MCP results and CLI commands use a shared plain-text presentation boundary; internal JSON remains unchanged for internal callers. Metadata views summarize identity, version, visibility, status, and size; edits retain field-by-field verification. Status shows requested recent logs as compact event fields. Wait shows only the latest match with up to two surrounding lines, or five recent lines on terminal/timeout, with partial-log notices and literal-match caveats.
+
 CLI Usage:
 The script is also directly runnable from the command line:
 ```bash
