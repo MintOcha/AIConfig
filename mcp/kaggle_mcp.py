@@ -1861,10 +1861,13 @@ async def wait(
             raise ValueError("Notebook metadata has no id; pass owner/notebook-slug")
     deadline = asyncio.get_running_loop().time() + timeout
     snapshot = dict(version=None, status="UNKNOWN", logs=[], logs_error="Not queried", training_outcome="unknown")
+    cli_tip = f"\n\n[Tip: Kaggle is notoriously slow. Please switch to using CLI for reliable long waits/logs:\nuv run --script /home/nas/Projects/AIConfig/mcp/kaggle_mcp.py wait {ref} --until {until}{f' --text {text!r}' if text else ''} --timeout 3600\nor check logs with:\nuv run --script /home/nas/Projects/AIConfig/mcp/kaggle_mcp.py status {ref} --logs --log-timeout 60]"
     try:
         async with asyncio.timeout(timeout):
             while True:
-                snapshot = await _run_snapshot(ref, snapshot["version"], logs=True)
+                # Allocate remaining time in timeout budget (up to 30s) to wait for log streaming
+                rem_time = max(5, int(deadline - asyncio.get_running_loop().time()))
+                snapshot = await _run_snapshot(ref, snapshot["version"], logs=True, log_timeout=min(30, rem_time))
                 lines = snapshot["logs"]
                 matches = [index for index, line in enumerate(lines) if text and text in line]
                 if until == "log" and matches:
@@ -1877,8 +1880,8 @@ async def wait(
     except TimeoutError:
         last_logs = snapshot.get("logs", [])
         if last_logs:
-            return _format_run(ref, snapshot, last_logs[-5:], reason="waited")
-        return _format_run(ref, snapshot, [], reason="waited") + "\nNo log lines collected before timeout. Please rerun with CLI or extend timeout: uv run --script mcp/kaggle_mcp.py status " + ref + " --logs"
+            return _format_run(ref, snapshot, last_logs[-5:], reason="waited") + cli_tip
+        return _format_run(ref, snapshot, [], reason="waited") + f"\nNo log lines collected before timeout.{cli_tip}"
 
 @app.tool()
 async def delete_notebook(notebook: str) -> str:
@@ -2002,7 +2005,7 @@ async def view_status(
     fetch_logs: bool = True,
     grep: str | None = None,
     context: int = 3,
-    log_timeout: int = 25,
+    log_timeout: int = 30,
 ) -> str:
     """Inspect actual remote version/status with bounded log collection. COMPLETE is notebook status, not training success.
 
@@ -2044,9 +2047,12 @@ async def view_status(
         selected_logs = [raw_logs[index] for index in indices]
     else:
         selected_logs = raw_logs[-tail:]
-    return _format_run(ref, snapshot, selected_logs)
+    out = _format_run(ref, snapshot, selected_logs)
+    if snapshot.get("logs_error") and "reached bound" in str(snapshot.get("logs_error")):
+        out += f"\n\n[Tip: Kaggle live stream is slow. Please switch to using CLI for full logs:\nuv run --script /home/nas/Projects/AIConfig/mcp/kaggle_mcp.py status {ref} --logs --log-timeout 60]"
+    return out
 
-async def _run_snapshot(ref: str, version: int | None = None, logs: bool = False, log_timeout: int = 25) -> dict:
+async def _run_snapshot(ref: str, version: int | None = None, logs: bool = False, log_timeout: int = 30) -> dict:
     if version is not None and version < 1:
         raise ValueError("Run number must be a positive Kaggle version")
     proc_timeout = max(35, log_timeout + 15)
@@ -2090,11 +2096,11 @@ with api.build_kaggle_client() as client:
                         lines.extend((body or '').splitlines())
             except Exception as error:
                 errors.append(str(error))
-        limit_sec = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4].isdigit() else 25
+        limit_sec = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4].isdigit() else 30
         worker = threading.Thread(target=collect, daemon=True)
         worker.start(); worker.join(limit_sec)
         result['logs'] = list(lines)
-        result['logs_error'] = '; '.join(errors) or (f'Live log stream reached bound ({limit_sec}s); snapshot may be partial' if worker.is_alive() else None)
+        result['logs_error'] = '; '.join(errors) or (f'Live log stream reached bound ({limit_sec}s); Kaggle stream is slow' if worker.is_alive() else None)
         if not result['logs'] and not result['logs_error']:
             result['logs_error'] = 'Kaggle returned no log events for this version'
         if version == latest:
