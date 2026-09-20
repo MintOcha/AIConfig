@@ -811,12 +811,26 @@ def register_tools(app: FastMCP, cfg: RouterConfig) -> None:
 
     if cfg.codex_standalone_keys or cfg.duckduckgo_enabled:
         @app.tool(name="fetch")
-        async def fetch_content(urls: list[str]) -> list[dict[str, str]]:
-            "Fetch readable page content for given URLs using Codex native page extraction, with automatic DuckDuckGo failover."
+        async def fetch_content(
+            urls: list[str] | None = None,
+            url: str | None = None,
+        ) -> list[dict[str, str]]:
+            """Fetch readable page content for given URLs using Codex native page extraction, with automatic DuckDuckGo failover.
+
+            REQUIRED parameter: `urls` (list of URLs, e.g. ["https://example.com"]) or `url` (single string URL).
+            """
             if router is None:
                 raise RuntimeError("Web search router has not been configured")
-            return await router.fetch_content(_validate_urls(urls))
+            resolved_urls: list[str] = []
+            if urls:
+                resolved_urls.extend(urls)
+            if url:
+                resolved_urls.append(url)
 
+            if not resolved_urls:
+                raise ValueError("fetch requires either 'urls' (list of URLs) or 'url' (single URL string)")
+
+            return await router.fetch_content(_validate_urls(resolved_urls))
     if cfg.codex_standalone_keys:
         @app.tool(name="open-page")
         async def open_page(ref_id: str, lineno: int | None = None) -> str:
