@@ -1792,10 +1792,18 @@ async def push_notebook(
     version_match = re.search(r"Kernel version\s+(\d+)\s+successfully pushed", result.stdout, re.I)
     version = int(version_match.group(1)) if version_match else None
 
+    # Extract canonical ref and URL from CLI output if available
+    url_match = re.search(r"https?://(?:www\.)?kaggle\.com/(?:code/)?([^/\s]+/[^/\s]+)", result.stdout)
+    if url_match:
+        canonical_ref = url_match.group(1)
+    else:
+        canonical_ref = ref
+
     # Update metadata tracking
-    owner_slug, kernel_slug = _split_kernel_slug(ref)
+    owner_slug, kernel_slug = _split_kernel_slug(canonical_ref)
     current_runs = int(full_meta.get("total_runs", 0)) + 1
     meta_updates = {
+        "id": canonical_ref,
         "last_pushed_utc": datetime.now(timezone.utc).isoformat(),
         "last_status": "QUEUED",
         "total_runs": current_runs,
@@ -1803,7 +1811,6 @@ async def push_notebook(
     if version:
         meta_updates["last_version_number"] = version
     _write_metadata(folder, meta_updates)
-
     attached = []
     if full_meta.get("dataset_sources"):
         attached.append(f"datasets: {', '.join(full_meta['dataset_sources'])}")
@@ -1815,7 +1822,7 @@ async def push_notebook(
 
     return (
         f"Pushed '{title}' to Kaggle.\n"
-        f"slug: {ref}\n"
+        f"slug: {canonical_ref}\n"
         f"version: {version or 'latest'} (total runs: {current_runs})\n"
         f"accelerator: {acc} (gpu={full_meta.get('enable_gpu')}, tpu={full_meta.get('enable_tpu')})\n"
         f"internet: {full_meta.get('enable_internet')}"
