@@ -1,0 +1,11 @@
+# Kaggle MCP configuration
+#
+# workspace_root: Directory where the ./kaggle/ folder structure will be created.
+# Leave empty to automatically use the current working directory.
+workspace_root = ""
+
+# Kaggle username (optional; defaults to ~/.kaggle/kaggle.json or KAGGLE_USERNAME)
+username = ""
+
+# Kaggle API token or key (optional; defaults to ~/.kaggle/access_token, ~/.kaggle/kaggle.json, or KAGGLE_API_TOKEN)
+api_token = ""

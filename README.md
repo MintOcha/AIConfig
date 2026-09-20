@@ -217,6 +217,21 @@ ops. `home()` leaves apps running; `recent_apps()` opens the switcher;
 The legacy Menu key stays under `key(key="menu")`; modern apps may ignore it.
 
 
+### Kaggle workspace & experiments
+
+Choose **Kaggle** under **Install MCPs** in `./scripts/install.sh`.
+
+The MCP command is `uv run --script /path/to/AIConfig/mcp/kaggle_mcp.py --config /path/to/agent-home/kaggle.toml`. It automatically creates and scopes all notebooks, datasets, and run outputs under `./kaggle/` in the active project directory:
+
+- `save_notebook_file`: pushes code to Kaggle and starts execution. Automatically wraps local `.py` scripts into `notebook.ipynb` (`%%writefile` + `!python`) for safe DDP/GPU multiprocessing. Resolves and locks accelerators (T4, P100, TPU, CPU) and attaches datasets, competitions, and model weights.
+- `view_status`: fast execution status check (`QUEUED`, `RUNNING`, `COMPLETE`, `CANCEL_ACKNOWLEDGED`) in ~1.5s. Set `fetch_logs=True` to download and tail execution logs.
+- `fetch_output`: downloads output artifacts into `./kaggle/<notebook>/runs/<version>/output/`, parses `metrics.json`, and generates compact summaries (`summary.txt`, `tree.txt`, `logs.compressed.txt`).
+- `upload_dataset`: creates or updates Kaggle datasets from local files or directories, preserving tabular data (`.parquet`, `.csv`).
+- `download_dataset`: downloads Kaggle datasets into `./kaggle/datasets/<dataset_name>/`.
+- `list_datasets` / `list_notebook_names` / `list_active_runs`: browses account resources and active jobs.
+- `get_quota`: shows weekly GPU and TPU hours remaining, used, and refresh dates.
+- `cancel_run`: cancels active remote kernel sessions.
+
 ## Use with other coding agents
 
 Point the agent's global instruction file at `prompts/coding-rules.md`, or copy its contents when the agent does not support imported instruction files. Skill support and installation locations vary by agent, so treat each directory under `skill/` as a self-contained package and follow that agent's skill-loading convention.
