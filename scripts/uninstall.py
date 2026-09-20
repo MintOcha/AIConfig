@@ -139,16 +139,30 @@ def select_harness_interactive() -> tuple[str, str, Path]:
 
         warning(f"Please choose a number between 1 and {len(HARNESSES)}.")
 
+def get_mcp_folder_scripts() -> dict[str, Path]:
+    """Discover all python MCP scripts in the mcp folder and their canonical stems."""
+    mcp_dir = (REPO_ROOT / "mcp").resolve()
+    if not mcp_dir.is_dir():
+        return {}
+    return {p.name: p for p in mcp_dir.glob("*.py")}
 
-def get_aiconfig_mcps() -> list[str]:
-    mcp_file = REPO_ROOT / "mcp.toml"
-    if not mcp_file.is_file() or tomllib is None:
-        return ["web", "android", "kaggle"]
-    try:
-        data = tomllib.loads(mcp_file.read_text(encoding="utf-8"))
-        return list(data.get("mcp", {}).keys())
-    except Exception:
-        return ["web", "android", "kaggle"]
+
+def _is_aiconfig_mcp_entry(server_data: dict | str, mcp_scripts: dict[str, Path]) -> bool:
+    """Determine if a configured MCP server points to a script inside AIConfig/mcp."""
+    repo_mcp_dir = str((REPO_ROOT / "mcp").resolve()).replace("\\", "/")
+    raw_text = json.dumps(server_data).replace("\\", "/")
+
+    # Direct path match to AIConfig/mcp
+    if repo_mcp_dir in raw_text:
+        return True
+
+    # Match against known script filenames or their resolved symlinks
+    for fname, path in mcp_scripts.items():
+        resolved = str(path.resolve()).replace("\\", "/")
+        if fname in raw_text or resolved in raw_text:
+            return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -156,68 +170,90 @@ def get_aiconfig_mcps() -> list[str]:
 # ---------------------------------------------------------------------------
 
 def uninstall_mcps(h_id: str, target_home: Path, dry_run: bool) -> None:
-    aiconfig_mcps = get_aiconfig_mcps()
-    print(f"\n{BOLD}Uninstalling AIConfig MCPs ({', '.join(aiconfig_mcps)}) from {h_id}...{RESET}")
-
-    if dry_run:
-        print(f"Dry run: would remove {aiconfig_mcps} from {h_id}")
-        return
+    mcp_scripts = get_mcp_folder_scripts()
+    print(f"\n{BOLD}Scanning for installed MCPs originating from {REPO_ROOT / 'mcp'} in {h_id}...{RESET}")
 
     if h_id in ("omp", "freebuff"):
         mcp_file = target_home / "mcp.json"
         if mcp_file.is_file():
             data = read_json(mcp_file)
             servers = data.get("mcpServers", {})
-            removed = []
-            for sid in aiconfig_mcps:
-                if sid in servers:
-                    del servers[sid]
-                    removed.append(sid)
+            removed = [sid for sid, sdef in servers.items() if _is_aiconfig_mcp_entry(sdef, mcp_scripts)]
+
+            if dry_run:
+                print(f"Dry run: would remove {removed} from {mcp_file}")
+                return
+
             if removed:
+                for sid in removed:
+                    del servers[sid]
                 write_json(mcp_file, data)
                 success(f"Removed MCPs from {mcp_file}: {', '.join(removed)}")
             else:
                 print("No AIConfig MCPs found in mcp.json")
+
     elif h_id == "claude":
         settings_file = target_home / "settings.json"
         if settings_file.is_file():
             data = read_json(settings_file)
             servers = data.get("mcpServers", {})
-            removed = []
-            for sid in aiconfig_mcps:
-                if sid in servers:
-                    del servers[sid]
-                    removed.append(sid)
+            removed = [sid for sid, sdef in servers.items() if _is_aiconfig_mcp_entry(sdef, mcp_scripts)]
+
+            if dry_run:
+                print(f"Dry run: would remove {removed} from {settings_file}")
+                return
+
             if removed:
+                for sid in removed:
+                    del servers[sid]
                 write_json(settings_file, data)
                 success(f"Removed MCPs from {settings_file}: {', '.join(removed)}")
+            else:
+                print("No AIConfig MCPs found in settings.json")
+
     elif h_id == "codex":
-        if shutil.which("codex"):
-            env = dict(os.environ, CODEX_HOME=str(target_home))
-            for sid in aiconfig_mcps:
-                res = subprocess.run(["codex", "mcp", "remove", sid], env=env, capture_output=True, text=True)
-                if res.returncode == 0:
-                    success(f"Removed Codex MCP: {sid}")
-        else:
-            config_file = target_home / "config.toml"
-            if config_file.is_file():
-                _remove_toml_sections(config_file, [f"mcp_servers.{s}" for s in aiconfig_mcps])
-                success(f"Removed MCP sections from {config_file}")
+        config_file = target_home / "config.toml"
+        if config_file.is_file():
+            repo_mcp_dir = str((REPO_ROOT / "mcp").resolve()).replace("\\", "/")
+            lines = config_file.read_text(encoding="utf-8").splitlines(keepends=True)
+            # Parse TOML sections to find which mcp_servers.* sections contain AIConfig mcp paths
+            sections_to_remove: set[str] = set()
+            current_section = None
+            section_lines: dict[str, list[str]] = {}
 
+            for line in lines:
+                st = line.strip()
+                if st.startswith("[") and st.endswith("]"):
+                    current_section = st.strip("[]")
+                    section_lines[current_section] = [line]
+                elif current_section:
+                    section_lines[current_section].append(line)
 
-def _remove_toml_sections(path: Path, section_names: list[str]) -> None:
-    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
-    filtered = []
-    skip = False
-    for line in lines:
-        st = line.strip()
-        if st.startswith("[") and st.endswith("]"):
-            sec = st.strip("[]")
-            skip = any(sec == s or sec.startswith(f"{s}.") for s in section_names)
-        if not skip:
-            filtered.append(line)
-    path.write_text("".join(filtered), encoding="utf-8")
+            for sec, slines in section_lines.items():
+                if sec.startswith("mcp_servers."):
+                    block_text = "".join(slines).replace("\\", "/")
+                    if repo_mcp_dir in block_text or any(fname in block_text for fname in mcp_scripts):
+                        # extract top server name: mcp_servers.<name>
+                        parts = sec.split(".")
+                        server_name = parts[1]
+                        sections_to_remove.add(server_name)
 
+            if dry_run:
+                print(f"Dry run: would remove Codex MCPs {sorted(sections_to_remove)} from {config_file}")
+                return
+
+            if sections_to_remove:
+                if shutil.which("codex"):
+                    env = dict(os.environ, CODEX_HOME=str(target_home))
+                    for sname in sections_to_remove:
+                        subprocess.run(["codex", "mcp", "remove", sname], env=env, capture_output=True)
+                        success(f"Removed Codex MCP: {sname}")
+                else:
+                    prefixes = [f"mcp_servers.{s}" for s in sections_to_remove]
+                    _remove_toml_sections(config_file, prefixes)
+                    success(f"Removed Codex MCPs: {', '.join(sections_to_remove)}")
+            else:
+                print("No AIConfig MCPs found in Codex configuration")
 
 # ---------------------------------------------------------------------------
 # 2. Uninstall Prompt (@ references)
