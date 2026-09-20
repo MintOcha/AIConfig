@@ -2315,6 +2315,206 @@ async def pull_notebook(notebook: str, fetch_latest_output: bool = False) -> str
 # ---------------------------------------------------------------------------
 # Dataset Tools
 # ---------------------------------------------------------------------------
+SENSITIVE_OR_IGNORED_NAMES = {
+    ".git", ".gitignore", ".gitattributes", ".kaggle",
+    ".env", ".env.local", "kaggle.json", "kaggle.toml",
+    "__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache",
+    ".DS_Store", "Thumbs.db", "node_modules", ".venv", "venv",
+}
+SENSITIVE_EXTENSIONS = {".pyc", ".pyo", ".pyd", ".pem", ".key", ".pkcs12"}
+
+
+def _is_sensitive_or_ignored(path: Path) -> bool:
+    name = path.name
+    lower = name.lower()
+    if name in SENSITIVE_OR_IGNORED_NAMES or lower in SENSITIVE_OR_IGNORED_NAMES:
+        return True
+    if path.suffix.lower() in SENSITIVE_EXTENSIONS:
+        return True
+    for part in path.parts:
+        part_lower = part.lower()
+        if part in SENSITIVE_OR_IGNORED_NAMES or part_lower in SENSITIVE_OR_IGNORED_NAMES:
+            return True
+        if part.startswith(".git"):
+            return True
+        if part_lower.endswith(".egg-info"):
+            return True
+    if any(k in lower for k in ("id_rsa", "id_ed25519", "kaggle.json", "kaggle.toml")):
+        return True
+    if lower.startswith(".env"):
+        return True
+    return False
+
+
+def _collect_archive_files(sources: list[str]) -> dict[str, Path]:
+    archive_map: dict[str, Path] = {}
+    workspace = get_workspace_root().resolve()
+
+    for item in sources:
+        item = item.strip()
+        if not item:
+            continue
+        # Support source:target mapping if given
+        if ":" in item and not (len(item) > 1 and item[1] == ":" and item[0].isalpha()):
+            src_str, tgt_str = item.split(":", 1)
+        else:
+            src_str, tgt_str = item, None
+
+        raw = Path(src_str)
+        source_path = (raw if raw.is_absolute() else workspace / raw).resolve()
+
+        if not source_path.exists():
+            raise FileNotFoundError(f"Dataset source path not found: {src_str} ({source_path})")
+
+        if source_path.is_file():
+            if _is_sensitive_or_ignored(source_path):
+                continue
+            if tgt_str:
+                arc_name = tgt_str.strip().lstrip("/")
+            elif source_path.is_relative_to(workspace):
+                arc_name = source_path.relative_to(workspace).as_posix()
+            else:
+                arc_name = source_path.name
+
+            norm = os.path.normpath(arc_name).replace("\\", "/")
+            if norm.startswith("..") or norm.startswith("/") or os.path.isabs(norm):
+                raise ValueError(f"Unsafe archive path '{arc_name}' for source '{source_path}'")
+
+            if norm in archive_map and archive_map[norm] != source_path:
+                raise ValueError(
+                    f"Archive path collision: '{norm}' is mapped by both '{archive_map[norm]}' and '{source_path}'"
+                )
+            archive_map[norm] = source_path
+        elif source_path.is_dir():
+            target_prefix = tgt_str.strip().lstrip("/").rstrip("/") if tgt_str else None
+            for file_path in sorted(source_path.rglob("*")):
+                if not file_path.is_file():
+                    continue
+                if _is_sensitive_or_ignored(file_path):
+                    continue
+
+                if target_prefix is not None:
+                    rel_to_dir = file_path.relative_to(source_path).as_posix()
+                    arc_name = f"{target_prefix}/{rel_to_dir}" if target_prefix else rel_to_dir
+                elif source_path.is_relative_to(workspace):
+                    arc_name = file_path.relative_to(workspace).as_posix()
+                else:
+                    arc_name = file_path.relative_to(source_path.parent).as_posix()
+
+                norm = os.path.normpath(arc_name).replace("\\", "/")
+                if norm.startswith("..") or norm.startswith("/") or os.path.isabs(norm):
+                    raise ValueError(f"Unsafe archive path '{arc_name}' for source '{file_path}'")
+
+                if norm in archive_map and archive_map[norm] != file_path:
+                    raise ValueError(
+                        f"Archive path collision: '{norm}' is mapped by both '{archive_map[norm]}' and '{file_path}'"
+                    )
+                archive_map[norm] = file_path
+        else:
+            raise ValueError(f"Unsupported source path type: {source_path}")
+
+    if not archive_map:
+        raise ValueError("No valid files to package; all sources were empty or ignored.")
+
+    return archive_map
+
+
+def _create_deterministic_zip(archive_map: dict[str, Path], zip_path: Path) -> None:
+    import zipfile
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_zip = zip_path.with_suffix(".tmp.zip")
+    if temp_zip.exists():
+        temp_zip.unlink()
+
+    sorted_items = sorted(archive_map.items(), key=lambda pair: pair[0])
+
+    with zipfile.ZipFile(temp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for arc_name, file_path in sorted_items:
+            zinfo = zipfile.ZipInfo(filename=arc_name, date_time=(2026, 1, 1, 0, 0, 0))
+            zinfo.external_attr = 0o644 << 16
+            zinfo.compress_type = zipfile.ZIP_DEFLATED
+            with file_path.open("rb") as f:
+                zf.writestr(zinfo, f.read())
+
+    if zip_path.exists():
+        zip_path.unlink()
+    temp_zip.rename(zip_path)
+
+
+@app.tool(name="build_dataset")
+async def build_dataset(
+    sources: list[str],
+    dataset_slug: str,
+    title: str | None = None,
+    private: bool = True,
+    upload: bool = True,
+    zip_name: str | None = None,
+    version_notes: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    """Build a Kaggle dataset ZIP archive from multiple files and/or directories and optionally upload it.
+
+    Parameters:
+    - sources: list of file and/or directory paths to package into the ZIP archive.
+      Paths can be workspace-relative or absolute, and can use 'source:archive_dest' syntax.
+    - dataset_slug: slug for the Kaggle dataset.
+    - title: dataset title (defaults to slug titleized).
+    - private: whether the dataset is private (default True).
+    - upload: whether to upload to Kaggle immediately (default True).
+    - zip_name: filename of the generated ZIP inside the dataset (default: '{dataset_slug}.zip').
+    - version_notes: version notes when uploading a new version.
+    - metadata: optional presentation metadata for dataset-metadata.json.
+    """
+    slug = _slugify(dataset_slug)
+    if not slug:
+        raise ValueError("Invalid dataset_slug")
+
+    archive_map = _collect_archive_files(sources)
+
+    archive_filename = zip_name or f"{slug}.zip"
+    if not archive_filename.endswith(".zip"):
+        archive_filename += ".zip"
+
+    datasets_dir = get_kaggle_root() / "datasets" / slug
+    datasets_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = datasets_dir / archive_filename
+
+    _create_deterministic_zip(archive_map, zip_path)
+    total_bytes = zip_path.stat().st_size
+
+    manifest_lines = [f"- {arc} ({human_size(src.stat().st_size)})" for arc, src in sorted(archive_map.items())]
+    summary = (
+        f"Built dataset archive `{zip_path.name}` ({human_size(total_bytes)}, {len(archive_map)} files) "
+        f"under `{zip_path.relative_to(get_workspace_root())}`:\n"
+        + "\n".join(manifest_lines[:20])
+    )
+    if len(manifest_lines) > 20:
+        summary += f"\n... and {len(manifest_lines) - 20} more files."
+
+    if not upload:
+        owner = _default_owner() or "owner"
+        meta_path = datasets_dir / "dataset-metadata.json"
+        meta_content = {
+            "title": title or slug.replace("-", " ").title(),
+            "id": f"{owner}/{slug}",
+            "licenses": [{"name": "CC0-1.0"}],
+        }
+        if metadata:
+            meta_content.update(metadata)
+        meta_path.write_text(json.dumps(meta_content, indent=2))
+        return f"{summary}\n\nDataset packaged locally; upload skipped (--no-upload)."
+
+    upload_options = dict(
+        title=title,
+        dataset_slug=slug,
+        private=private,
+        version_notes=version_notes,
+        keep_tabular=True,
+        dir_mode="zip",
+        metadata=metadata,
+    )
+    upload_res = _upload_dataset(str(zip_path), **upload_options)
+    return f"{summary}\n\n{upload_res}"
 
 @app.tool(name="push_dataset")
 async def upload_dataset(
@@ -2429,7 +2629,7 @@ def _upload_dataset(path: str, title: str | None = None, dataset_slug: str | Non
             client.datasets.dataset_api_client.get_dataset(request)
         existed = True
     except HTTPError as error:
-        if error.response is None or error.response.status_code != 404:
+        if error.response is None or error.response.status_code not in (404, 403):
             raise
         existed = False
     if existed:
@@ -2616,6 +2816,16 @@ def parse_args() -> argparse.Namespace:
     download = subparsers.add_parser("download", help="Download dataset without the MCP call timeout")
     download.add_argument("dataset")
     download.add_argument("--options", default="{}", help="JSON download options")
+    # build-dataset
+    p_build = subparsers.add_parser("build-dataset", help="Package multiple files/directories into a ZIP and upload dataset")
+    p_build.add_argument("sources", nargs="+", help="Files and/or directories to include in dataset archive")
+    p_build.add_argument("--slug", required=True, help="Dataset slug")
+    p_build.add_argument("--title", help="Dataset title")
+    p_build.add_argument("--public", action="store_true", help="Make dataset public (default is private)")
+    p_build.add_argument("--no-upload", action="store_true", help="Build ZIP staging locally without uploading")
+    p_build.add_argument("--zip-name", help="Archive file name inside dataset (default: <slug>.zip)")
+    p_build.add_argument("--notes", help="Version notes")
+    p_build.add_argument("--metadata", help="JSON metadata string")
     for operation in ("push-model", "pull-model"):
         transfer = subparsers.add_parser(operation, help="Transfer model weights without MCP timeout")
         transfer.add_argument("source")
@@ -2678,6 +2888,18 @@ def main() -> None:
             _print_result(_upload_dataset(args.path, **json.loads(args.options)))
         elif cmd == "download":
             _print_result(_download_dataset(args.dataset, **json.loads(args.options)))
+        elif cmd == "build-dataset":
+            meta = json.loads(args.metadata) if args.metadata else None
+            _print_result(asyncio.run(build_dataset(
+                sources=args.sources,
+                dataset_slug=args.slug,
+                title=args.title,
+                private=not args.public,
+                upload=not args.no_upload,
+                zip_name=args.zip_name,
+                version_notes=args.notes,
+                metadata=meta,
+            )))
         elif cmd in ("push-model", "pull-model"):
             _print_result(_model_transfer(cmd, args.source, json.loads(args.options)))
         return
