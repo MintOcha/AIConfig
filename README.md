@@ -221,9 +221,11 @@ The legacy Menu key stays under `key(key="menu")`; modern apps may ignore it.
 
 Choose **Kaggle** under **Install MCPs** in `./scripts/install.sh`.
 
-The MCP command is `uv run --script /path/to/AIConfig/mcp/kaggle_mcp.py --config /path/to/agent-home/kaggle.toml`. It automatically creates and scopes all notebooks, datasets, and run outputs under `./kaggle/` in the active project directory:
-
-- `save_notebook_file`: pushes code to Kaggle and starts execution. Automatically wraps local `.py` scripts into `notebook.ipynb` (`%%writefile` + `!python`) for safe DDP/GPU multiprocessing. Resolves and locks accelerators (T4, P100, TPU, CPU) and attaches datasets, competitions, and model weights.
+- `pull_notebook`: pulls code and remote configuration from Kaggle into `./kaggle/<notebook>/notebook.ipynb` and `./kaggle/<notebook>/kernel-metadata.json`.
+- `init_notebook`: initializes a brand new notebook experiment under `./kaggle/<notebook>/` with starter code (`train.py` or `notebook.ipynb`) and fresh `kernel-metadata.json`.
+- `save_notebook`: saves code and updates `kernel-metadata.json` locally and syncs to Kaggle cloud WITHOUT starting execution. If a `.py` script is present, automatically wraps it into `notebook.ipynb` (%%writefile + !python) for safe DDP/GPU multiprocessing.
+- `push_notebook`: pushes code to Kaggle and QUEUES EXECUTION (starts a new version/run on Kaggle Cloud). Increments run tracking (`total_runs`, `last_version_number`) in `kernel-metadata.json`.
+- `wait_for_complete`: waits for long-running executions (which can take hours) to finish without polling in tight loops. Automatically downloads outputs and builds compressed summaries upon completion.
 - `view_status`: fast execution status check (`QUEUED`, `RUNNING`, `COMPLETE`, `CANCEL_ACKNOWLEDGED`) in ~1.5s. Set `fetch_logs=True` to download and tail execution logs.
 - `fetch_output`: downloads output artifacts into `./kaggle/<notebook>/runs/<version>/output/`, parses `metrics.json`, and generates compact summaries (`summary.txt`, `tree.txt`, `logs.compressed.txt`).
 - `upload_dataset`: creates or updates Kaggle datasets from local files or directories, preserving tabular data (`.parquet`, `.csv`).
@@ -232,6 +234,16 @@ The MCP command is `uv run --script /path/to/AIConfig/mcp/kaggle_mcp.py --config
 - `get_quota`: shows weekly GPU and TPU hours remaining, used, and refresh dates.
 - `cancel_run`: cancels active remote kernel sessions.
 
+CLI Usage:
+The script is also directly runnable from the command line:
+```bash
+uv run --script mcp/kaggle_mcp.py quota
+uv run --script mcp/kaggle_mcp.py status <notebook>
+uv run --script mcp/kaggle_mcp.py push <notebook> [--accelerator gpu]
+uv run --script mcp/kaggle_mcp.py save <notebook>
+uv run --script mcp/kaggle_mcp.py wait <notebook> [--timeout 3600]
+uv run --script mcp/kaggle_mcp.py output <notebook>
+```
 ## Use with other coding agents
 
 Point the agent's global instruction file at `prompts/coding-rules.md`, or copy its contents when the agent does not support imported instruction files. Skill support and installation locations vary by agent, so treat each directory under `skill/` as a self-contained package and follow that agent's skill-loading convention.

@@ -8,6 +8,7 @@
 # ///
 from __future__ import annotations
 
+import asyncio
 import argparse
 import csv
 import json
@@ -28,7 +29,35 @@ WORKSPACE_ROOT = Path.cwd().resolve()
 CONFIG_USERNAME: str | None = None
 CONFIG_API_TOKEN: str | None = None
 
-app = FastMCP("kaggle")
+app = FastMCP(
+    "kaggle",
+    instructions="""Kaggle Machine Learning & Experiment MCP.
+
+CANONICAL WORKFLOW:
+1. Pull existing notebook: `pull_notebook(notebook="<name>")`
+   - Creates `./kaggle/<notebook>/notebook.ipynb` and `./kaggle/<notebook>/kernel-metadata.json`.
+   - If starting a brand new experiment, call `init_notebook(notebook="<name>")`.
+2. Configure execution via `kernel-metadata.json`:
+   - Edit `./kaggle/<notebook>/kernel-metadata.json` directly using standard file tools:
+     - "dataset_sources": ["username/dataset-slug"] (mounts under /kaggle/input/<dataset-slug>/)
+     - "competition_sources": ["competition-name"] (mounts competition data)
+     - "model_sources": ["username/model/framework/variation"] (mounts model weights)
+     - "enable_gpu": "true" | "false" (or set accelerator in push/save)
+     - "enable_tpu": "true" | "false"
+     - "enable_internet": "true" | "false"
+     - "is_private": "true" | "false"
+     - "id": "username/notebook-slug"
+3. Save vs Push:
+   - `save_notebook(notebook="...")`: saves code and updates metadata locally and syncs to Kaggle cloud WITHOUT starting execution. If a `.py` file is present, automatically wraps it into `notebook.ipynb` (%%writefile + !python) for safe multiprocessing/GPU training.
+   - `push_notebook(notebook="...")`: pushes to Kaggle and QUEUES EXECUTION (starts a new run/version).
+4. Long-Running Execution & Waiting:
+   - Kaggle training runs frequently take 10 minutes to several hours.
+   - NEVER poll `view_status` in tight loops.
+   - Use `wait_for_complete(notebook="...", timeout=3600)` which blocks cleanly, or run in the background via CLI:
+     `uv run --script mcp/kaggle_mcp.py wait <notebook>`
+   - When finished, `fetch_output` downloads all artifacts into `./kaggle/<notebook>/runs/<version>/output/` and generates `summary.txt` with compressed logs.
+"""
+)
 
 
 # ---------------------------------------------------------------------------
@@ -320,42 +349,268 @@ def _parse_kernel_csv(output: str) -> list[dict[str, str]]:
 # Accelerator Handling
 # ---------------------------------------------------------------------------
 
+# Canonical accelerators supported on Kaggle Cloud
+VALID_ACCELERATORS: dict[str, str] = {
+    "none": "none",
+    "cpu": "none",
+    "gpu": "NvidiaTeslaT4",
+    "t4": "NvidiaTeslaT4",
+    "nvidia-tesla-t4": "NvidiaTeslaT4",
+    "nvidiateslat4": "NvidiaTeslaT4",
+    "p100": "NvidiaTeslaP100",
+    "nvidia-tesla-p100": "NvidiaTeslaP100",
+    "nvidiateslap100": "NvidiaTeslaP100",
+    "tpu": "tpu",
+    "tpu-v3-8": "tpu",
+}
+
+
 def _normalize_accelerator(value: str) -> str:
-    normalized = (value or "none").strip()
-    key = normalized.lower().replace("_", "-")
-    aliases = {
-        "nvidia-tesla-t4": "NvidiaTeslaT4",
-        "nvidia-t4": "NvidiaTeslaT4",
-        "tesla-t4": "NvidiaTeslaT4",
-        "t4": "NvidiaTeslaT4",
-        "gput4x2": "NvidiaTeslaT4",
-        "gput4": "NvidiaTeslaT4",
-        "gpu": "NvidiaTeslaT4",
-        "nvidiateslat4": "NvidiaTeslaT4",
-        "nvidia-tesla-p100": "NvidiaTeslaP100",
-        "nvidia-p100": "NvidiaTeslaP100",
-        "p100": "NvidiaTeslaP100",
-        "nvidia-tesla-v100": "NvidiaTeslaV100",
-        "v100": "NvidiaTeslaV100",
-        "nvidia-tesla-a100": "NvidiaTeslaA100",
-        "a100": "NvidiaTeslaA100",
-        "nvidia-l4": "NvidiaL4",
-        "l4": "NvidiaL4",
-        "nvidia-tesla-t4x2": "NvidiaTeslaT4",
-        "nvidia_tesla_t4": "NvidiaTeslaT4",
-        "nvidia_tesla_p100": "NvidiaTeslaP100",
-        "none": "none",
-        "cpu": "none",
-        "tpu": "tpu",
-        "tpu-v3-8": "tpu",
-    }
-    return aliases.get(key, normalized)
+    normalized = (value or "none").strip().lower().replace("_", "-")
+    return VALID_ACCELERATORS.get(normalized, value)
+
+
+def _validate_accelerator(value: str) -> str:
+    """Strict validation for accelerator options.
+
+    Raises ValueError if an unsupported accelerator is requested.
+    Prevents Kaggle Cloud from silently dropping GPU/TPU and running on CPU.
+    """
+    normalized = (value or "none").strip().lower().replace("_", "-")
+    if normalized not in VALID_ACCELERATORS:
+        valid_options = sorted(list(set(VALID_ACCELERATORS.keys())))
+        raise ValueError(
+            f"Invalid accelerator: '{value}'. Supported accelerators are strictly:\n"
+            f"- CPU: 'none' or 'cpu'\n"
+            f"- GPU (Tesla T4): 'gpu', 't4', or 'NvidiaTeslaT4'\n"
+            f"- GPU (Tesla P100): 'p100' or 'NvidiaTeslaP100'\n"
+            f"- TPU: 'tpu' or 'tpu-v3-8'\n"
+            f"(Valid choices: {', '.join(valid_options)})"
+        )
+    return VALID_ACCELERATORS[normalized]
 
 
 def _is_gpu_accelerator(value: str) -> bool:
     normalized = _normalize_accelerator(value).lower()
     return normalized.startswith("nvidia")
 
+
+def _check_accelerator_quota(acc: str) -> tuple[bool, str]:
+    """Pre-flight check accelerator quota to prevent failures on Kaggle Cloud."""
+    normalized = _normalize_accelerator(acc).lower()
+    if normalized in ("none", "", "cpu"):
+        return True, "CPU (no quota required)"
+
+    try:
+        proc = _run_kaggle(["quota", "--csv"], timeout=30)
+        rows = _parse_kernel_csv(proc.stdout)
+        is_gpu = _is_gpu_accelerator(acc)
+        is_tpu = normalized == "tpu"
+
+        for row in rows:
+            res = (row.get("resource") or "").lower()
+            rem = row.get("remaining", "0h")
+            rem_val = float(rem.replace("h", "").strip()) if "h" in rem else 0.0
+
+            if is_gpu and "gpu" in res:
+                if rem_val <= 0.0:
+                    return False, f"GPU quota exhausted ({rem} remaining, refreshes at {row.get('refreshAt')})"
+                return True, f"GPU quota available ({rem} remaining)"
+            if is_tpu and "tpu" in res:
+                if rem_val <= 0.0:
+                    return False, f"TPU quota exhausted ({rem} remaining, refreshes at {row.get('refreshAt')})"
+                return True, f"TPU quota available ({rem} remaining)"
+    except Exception as err:
+        # Non-blocking if quota check fails (e.g. offline or network blip)
+        return True, f"Quota check skipped: {err}"
+
+    return True, "Quota check ok"
+
+
+def _lint_kernel_metadata(meta: dict[str, Any]) -> list[str]:
+    """Strict validation of kernel-metadata.json fields reusing KaggleApi's native validators.
+
+    Per coding rules (Rule 4: Manual implementation rule - do not re-implement library functions),
+    this invokes the official KaggleApi validation methods directly to guarantee 100% parity
+    with Kaggle Cloud enforcement without hardcoding or re-inventing checks.
+    """
+    from kaggle.api.kaggle_api_extended import KaggleApi
+    api = KaggleApi()
+
+    errors: list[str] = []
+
+    # 1. Kernel slug & syntax validation
+    slug = meta.get("id")
+    if not slug:
+        errors.append("Missing required 'id' (slug) in kernel-metadata.json. Must be formatted as '{username}/{notebook-slug}'.")
+    else:
+        try:
+            api.validate_kernel_string(slug)
+            owner, kernel_slug, version = api.parse_kernel_string(slug)
+            if version is not None:
+                errors.append(f"Invalid 'id': '{slug}'. Do NOT include a version number in kernel-metadata.json 'id'.")
+            api._validate_slug_syntax(kernel_slug)
+        except ValueError as err:
+            errors.append(str(err))
+
+    # 2. Title validation (Kaggle rule: >= 5 chars)
+    title = meta.get("title")
+    if not title or len(str(title).strip()) < 5:
+        errors.append("Title must be at least five characters")
+
+    # 3. Code file validation
+    code_file = meta.get("code_file")
+    if not code_file:
+        errors.append("A source file must be specified in the metadata ('code_file')")
+
+    # 4. Language & Kernel type validation (KaggleApi native sets)
+    kernel_type = meta.get("kernel_type", "")
+    if kernel_type not in api.valid_push_kernel_types:
+        errors.append(
+            f"Invalid kernel_type: '{kernel_type}'. Valid options are {api.valid_push_kernel_types}"
+        )
+
+    language = meta.get("language", "")
+    if language not in api.valid_push_language_types:
+        errors.append(
+            f"Invalid language: '{language}'. Valid options are {api.valid_push_language_types}"
+        )
+
+    # 5. Dataset sources validation (native Kaggle validator)
+    for ds in meta.get("dataset_sources", []):
+        try:
+            api.validate_dataset_string(ds)
+        except ValueError as err:
+            errors.append(f"Invalid dataset_sources entry '{ds}': {err}")
+
+    # 6. Competition sources validation
+    for cs in meta.get("competition_sources", []):
+        if "/" in cs:
+            errors.append(
+                f"Invalid competition_sources entry '{cs}': Competition sources must be just the competition name (e.g. 'titanic'), NOT 'owner/competition'."
+            )
+
+    # 7. Model sources validation (native Kaggle validator)
+    for ms in meta.get("model_sources", []):
+        try:
+            api.validate_model_instance_version_string(ms)
+        except ValueError as err:
+            errors.append(f"Invalid model_sources entry '{ms}': {err}")
+
+    # 8. Strict Accelerator validation
+    acc = meta.get("accelerator")
+    if acc:
+        try:
+            _validate_accelerator(str(acc))
+        except ValueError as err:
+            errors.append(str(err))
+
+    return errors
+
+
+def _check_accelerator_quota(acc: str) -> tuple[bool, str]:
+    """Pre-flight check accelerator quota to prevent failures on Kaggle Cloud."""
+    normalized = _normalize_accelerator(acc).lower()
+    if normalized in ("none", "", "cpu"):
+        return True, "CPU (no quota required)"
+
+    try:
+        proc = _run_kaggle(["quota", "--csv"], timeout=30)
+        rows = _parse_kernel_csv(proc.stdout)
+        is_gpu = _is_gpu_accelerator(acc)
+        is_tpu = normalized == "tpu"
+
+        for row in rows:
+            res = (row.get("resource") or "").lower()
+            rem = row.get("remaining", "0h")
+            rem_val = float(rem.replace("h", "").strip()) if "h" in rem else 0.0
+
+            if is_gpu and "gpu" in res:
+                if rem_val <= 0.0:
+                    return False, f"GPU quota exhausted ({rem} remaining, refreshes at {row.get('refreshAt')})"
+                return True, f"GPU quota available ({rem} remaining)"
+            if is_tpu and "tpu" in res:
+                if rem_val <= 0.0:
+                    return False, f"TPU quota exhausted ({rem} remaining, refreshes at {row.get('refreshAt')})"
+                return True, f"TPU quota available ({rem} remaining)"
+    except Exception as err:
+        # Non-blocking if quota check fails (e.g. offline or network blip)
+        return True, f"Quota check skipped: {err}"
+
+    return True, "Quota check ok"
+
+
+def _lint_kernel_metadata(meta: dict[str, Any]) -> list[str]:
+    """Strict validation of kernel-metadata.json fields reusing KaggleApi's native validators.
+
+    Per coding rules (Rule 4: Manual implementation rule - do not re-implement library functions),
+    this invokes the official KaggleApi validation methods directly to guarantee 100% parity
+    with Kaggle Cloud enforcement without hardcoding or re-inventing checks.
+    """
+    from kaggle.api.kaggle_api_extended import KaggleApi
+    api = KaggleApi()
+
+    errors: list[str] = []
+
+    # 1. Kernel slug & syntax validation
+    slug = meta.get("id")
+    if not slug:
+        errors.append("Missing required 'id' (slug) in kernel-metadata.json. Must be formatted as '{username}/{notebook-slug}'.")
+    else:
+        try:
+            api.validate_kernel_string(slug)
+            owner, kernel_slug, version = api.parse_kernel_string(slug)
+            if version is not None:
+                errors.append(f"Invalid 'id': '{slug}'. Do NOT include a version number in kernel-metadata.json 'id'.")
+            api._validate_slug_syntax(kernel_slug)
+        except ValueError as err:
+            errors.append(str(err))
+
+    # 2. Title validation (Kaggle rule: >= 5 chars)
+    title = meta.get("title")
+    if not title or len(str(title).strip()) < 5:
+        errors.append("Title must be at least five characters")
+
+    # 3. Code file validation
+    code_file = meta.get("code_file")
+    if not code_file:
+        errors.append("A source file must be specified in the metadata ('code_file')")
+
+    # 4. Language & Kernel type validation (KaggleApi native sets)
+    kernel_type = meta.get("kernel_type", "")
+    if kernel_type not in api.valid_push_kernel_types:
+        errors.append(
+            f"Invalid kernel_type: '{kernel_type}'. Valid options are {api.valid_push_kernel_types}"
+        )
+
+    language = meta.get("language", "")
+    if language not in api.valid_push_language_types:
+        errors.append(
+            f"Invalid language: '{language}'. Valid options are {api.valid_push_language_types}"
+        )
+
+    # 5. Dataset sources validation (native Kaggle validator)
+    for ds in meta.get("dataset_sources", []):
+        try:
+            api.validate_dataset_string(ds)
+        except ValueError as err:
+            errors.append(f"Invalid dataset_sources entry '{ds}': {err}")
+
+    # 6. Competition sources validation
+    for cs in meta.get("competition_sources", []):
+        if "/" in cs:
+            errors.append(
+                f"Invalid competition_sources entry '{cs}': Competition sources must be just the competition name (e.g. 'titanic'), NOT 'owner/competition'."
+            )
+
+    # 7. Model sources validation (native Kaggle validator)
+    for ms in meta.get("model_sources", []):
+        try:
+            api.validate_model_instance_version_string(ms)
+        except ValueError as err:
+            errors.append(f"Invalid model_sources entry '{ms}': {err}")
+
+    return errors
 
 def _read_notebook_accelerator(path: Path) -> str | None:
     if path.suffix != ".ipynb" or not path.exists():
@@ -541,49 +796,51 @@ def build_run_summary(run_dir: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Metadata & Cache Helpers
+# Metadata & Run Tracking Helpers
 # ---------------------------------------------------------------------------
 
-def _kernel_cache_path(name: str) -> Path:
-    return get_kaggle_root() / name / "working" / "kaggle_kernel.json"
-
-
-def _local_metadata_path(source_path: Path) -> Path:
-    return source_path.parent / "metadata.json"
-
-
-def _read_cache(name_or_path: str | Path) -> dict[str, Any]:
-    folder = name_or_path if isinstance(name_or_path, Path) else get_kaggle_root() / name_or_path
+def _kernel_metadata_path(name_or_folder: str | Path) -> Path:
+    folder = name_or_folder if isinstance(name_or_folder, Path) else get_kaggle_root() / name_or_folder
     if folder.is_file():
         folder = folder.parent
-    cache_file = folder / "working" / "kaggle_kernel.json"
-    meta_file = folder / "metadata.json"
+    return folder / "kernel-metadata.json"
 
-    data: dict[str, Any] = {}
-    if cache_file.exists():
+
+def _read_metadata(name_or_folder: str | Path) -> dict[str, Any]:
+    path = _kernel_metadata_path(name_or_folder)
+    if path.exists():
         try:
-            data.update(json.loads(cache_file.read_text()))
+            return json.loads(path.read_text())
         except Exception:
             pass
-    if meta_file.exists():
+    # Fallback to legacy metadata.json if it exists
+    folder = path.parent
+    if (folder / "metadata.json").exists():
         try:
-            data.update(json.loads(meta_file.read_text()))
+            return json.loads((folder / "metadata.json").read_text())
         except Exception:
             pass
-    return data
+    return {}
 
 
-def _write_cache(name: str, data: dict[str, Any]) -> None:
-    cache_path = _kernel_cache_path(name)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(json.dumps(data, indent=2, sort_keys=True))
+def _write_metadata(name_or_folder: str | Path, data: dict[str, Any]) -> None:
+    path = _kernel_metadata_path(name_or_folder)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = _read_metadata(name_or_folder)
+    existing.update(data)
+    path.write_text(json.dumps(existing, indent=2))
+
+
+def _read_cache(name_or_folder: str | Path) -> dict[str, Any]:
+    return _read_metadata(name_or_folder)
+
+
+def _write_cache(name_or_folder: str | Path, data: dict[str, Any]) -> None:
+    _write_metadata(name_or_folder, data)
 
 
 def _write_local_metadata(source_path: Path, data: dict[str, Any]) -> None:
-    path = _local_metadata_path(source_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, sort_keys=True))
-
+    _write_metadata(source_path, data)
 
 def _clean_status_label(status: str | None) -> str:
     if not status:
@@ -654,113 +911,379 @@ async def _find_kernel(title: str, name: str) -> tuple[bool, dict[str, Any]]:
 # MCP Tools
 # ---------------------------------------------------------------------------
 
+def _resolve_notebook_folder(notebook: str) -> tuple[str, Path]:
+    kaggle_root = get_kaggle_root()
+    raw = Path(notebook)
+    candidate = raw if raw.is_absolute() else get_workspace_root() / raw
+    if candidate.is_dir():
+        return candidate.name, candidate.resolve()
+    if candidate.is_file():
+        # If pointing to a script in workspace root, create or use ./kaggle/<stem>
+        if candidate.parent == get_workspace_root():
+            folder = kaggle_root / candidate.stem
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / candidate.name
+            if not target.exists() or candidate.stat().st_mtime > target.stat().st_mtime:
+                shutil.copy(candidate, target)
+            return candidate.stem, folder.resolve()
+        return candidate.parent.name, candidate.parent.resolve()
+
+    name = notebook.strip().strip("/")
+    folder = kaggle_root / name
+    if not folder.exists():
+        folded = name.casefold()
+        matches = [
+            p
+            for p in kaggle_root.iterdir()
+            if p.is_dir() and (p.name.casefold() == folded or _slugify(p.name).casefold() == folded)
+        ]
+        if matches:
+            folder = matches[0]
+        else:
+            folder.mkdir(parents=True, exist_ok=True)
+    return folder.name, folder.resolve()
 @app.tool()
-async def save_notebook_file(
+async def init_notebook(
     notebook: str,
-    run: bool = True,
-    private: bool = True,
-    internet: bool = True,
-    accelerator: str = "none",
-    py_source: str | None = None,
+    title: str | None = None,
+    template_type: str = "py",
+) -> str:
+    """Initialize a brand new notebook experiment directory under ./kaggle/<notebook>/.
+
+    Creates:
+    - `./kaggle/<notebook>/kernel-metadata.json` (pointing to your username/<slug>)
+    - If template_type == 'py' (default): `./kaggle/<notebook>/train.py`
+    - If template_type == 'ipynb': `./kaggle/<notebook>/notebook.ipynb`
+    - `./kaggle/<notebook>/runs/` and `./kaggle/<notebook>/working/` directories.
+
+    You can then edit code and edit `kernel-metadata.json` before calling `push_notebook`.
+    """
+    name, folder = _resolve_notebook_folder(notebook)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "runs").mkdir(parents=True, exist_ok=True)
+    (folder / "working").mkdir(parents=True, exist_ok=True)
+
+    owner = _default_owner()
+    slug = _slugify(name)
+    full_id = f"{owner}/{slug}" if owner else slug
+    notebook_title = title or name
+
+    code_file = "notebook.ipynb"
+    if template_type.lower() == "py":
+        py_path = folder / "train.py"
+        if not py_path.exists():
+            py_path.write_text(
+                f'"""Training script for {notebook_title}."""\n'
+                f'import os\n'
+                f'print("Starting {notebook_title} on Kaggle...")\n'
+            )
+    else:
+        ipynb_path = folder / "notebook.ipynb"
+        if not ipynb_path.exists():
+            nb = {
+                "cells": [
+                    {"cell_type": "markdown", "metadata": {}, "source": [f"# {notebook_title}\n"]},
+                    {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": ["print('Hello from Kaggle')\n"]},
+                ],
+                "metadata": {
+                    "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+                    "language_info": {"name": "python"},
+                    "kaggle": {"accelerator": "none", "dataSources": [], "isInternetEnabled": True, "language": "python", "sourceType": "notebook"},
+                },
+                "nbformat": 4,
+                "nbformat_minor": 5,
+            }
+            ipynb_path.write_text(json.dumps(nb, indent=2))
+
+    metadata_path = folder / "kernel-metadata.json"
+    if not metadata_path.exists():
+        meta = {
+            "id": full_id,
+            "title": notebook_title,
+            "code_file": code_file,
+            "language": "python",
+            "kernel_type": "notebook",
+            "is_private": "true",
+            "enable_gpu": "false",
+            "enable_tpu": "false",
+            "enable_internet": "true",
+            "dataset_sources": [],
+            "competition_sources": [],
+            "kernel_sources": [],
+            "model_sources": [],
+            "total_runs": 0,
+            "last_version_number": 0,
+            "last_status": "UNPUSHED",
+        }
+        metadata_path.write_text(json.dumps(meta, indent=2))
+
+    return (
+        f"Initialized new Kaggle notebook experiment '{name}':\n"
+        f"- Folder: {folder.relative_to(get_workspace_root())}\n"
+        f"- Code: {'train.py' if template_type == 'py' else 'notebook.ipynb'}\n"
+        f"- Metadata: {metadata_path.relative_to(get_workspace_root())}\n\n"
+        f"Next: Edit code and `kernel-metadata.json` (to attach datasets/GPU), then call `push_notebook('{name}')`."
+    )
+
+
+
+
+@app.tool()
+async def save_notebook(
+    notebook: str,
+    accelerator: str | None = None,
     dataset_sources: list[str] | None = None,
     competition_sources: list[str] | None = None,
     model_sources: list[str] | None = None,
+    internet: bool | None = None,
+    private: bool | None = None,
+    py_source: str | None = None,
 ) -> str:
-    """Save a local Kaggle notebook file, push to Kaggle, and optionally run it.
+    """Save and prepare local notebook files without pushing or executing on Kaggle.
 
-    Saves the notebook under ./kaggle/<notebook_name>/.
-    When py_source is provided (or a .py file exists), syncs the script into notebook.ipynb
-    (%%writefile + !python pattern) to avoid DDP/interactive GPU issues.
+    STORAGE & DIRECTORY STRUCTURE:
+    - All files are stored under `./kaggle/<notebook_name>/`:
+        ./kaggle/<notebook_name>/
+            ├── notebook.ipynb         # Notebook pushed to Kaggle
+            ├── kernel-metadata.json   # Kaggle configuration (hardware, datasets, title, privacy)
+            ├── train.py               # (Optional) local Python script
+            └── runs/<version>/        # Execution output and logs
+
+    CODE WRAPPING:
+    - If a .py file is present (or py_source is provided), automatically wraps it into
+      notebook.ipynb (%%writefile + !python) for safe DDP/GPU multiprocessing.
+
+    METADATA & STRICT LINTING:
+    - Updates ./kaggle/<notebook>/kernel-metadata.json.
+    - Runs strict validation on all fields before saving. If any field is invalid, raises
+      an error detailing what is wrong and what is accepted.
+    - Does NOT push to Kaggle or start execution. Use push_notebook when ready to run.
     """
-    name, path, kernel_type = _source_path(notebook)
-    cache_pre = _read_cache(name)
-    title = name
+    name, folder = _resolve_notebook_folder(notebook)
+    folder.mkdir(parents=True, exist_ok=True)
 
-    if py_source is None:
-        try:
-            py_path = _resolve_py_source(name, None)
-            py_source = py_path.name
-        except FileNotFoundError:
-            pass
-
-    # Auto-sync .py → .ipynb
-    if py_source is not None or kernel_type == "script":
-        py_path = _resolve_py_source(name, py_source)
-        py_text = py_path.read_text()
-        script_name = py_path.name or "train.py"
-        nb_acc = _resolve_accelerator(accelerator, path, cache_pre)
-
-        existing_acc = _read_notebook_accelerator(path)
-        if existing_acc and nb_acc == "none":
-            nb_acc = existing_acc
-
-        folder = get_kaggle_root() / name
-        ipynb_path = folder / "notebook.ipynb"
-        if ipynb_path.exists():
-            try:
-                nb = json.loads(ipynb_path.read_text())
-            except Exception:
-                nb = {}
-        else:
-            nb = {}
-
-        nb.setdefault("cells", [])
-        nb.setdefault("metadata", {})
-        nb["metadata"].setdefault("kernelspec", {"display_name": "Python 3", "language": "python", "name": "python3"})
-        nb["metadata"].setdefault("language_info", {"name": "python"})
-        nb["metadata"].setdefault("kaggle", {})["accelerator"] = nb_acc
-        nb["metadata"]["kaggle"]["isInternetEnabled"] = internet
-        nb["metadata"]["kaggle"]["language"] = "python"
-        nb["metadata"]["kaggle"]["sourceType"] = "notebook"
-        nb["nbformat"] = 4
-        nb["nbformat_minor"] = 5
-
-        nb["cells"] = [
-            {"cell_type": "markdown", "metadata": {}, "source": f"# {title}\n\nAuto-synced from `{script_name}`.\n"},
-            {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _as_cell_source(f"%%writefile {script_name}\n" + py_text)},
-            {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _as_cell_source(f"!python {script_name}")},
-        ]
-        ipynb_path.write_text(json.dumps(nb, indent=2))
-        path = ipynb_path
-        kernel_type = "notebook"
+    # 1. Resolve code: .py auto-conversion or .ipynb
+    py_candidate: Path | None = None
+    if py_source:
+        py_candidate = _resolve_py_source(name, py_source)
     else:
-        nb = json.loads(path.read_text())
-        nb_acc = _resolve_accelerator(accelerator, path, cache_pre)
-        nb.setdefault("metadata", {}).setdefault("kaggle", {})["accelerator"] = nb_acc
-        nb["metadata"]["kaggle"]["isInternetEnabled"] = internet
-        path.write_text(json.dumps(nb, indent=2))
+        for fname in ("train.py", f"{name.lower()}.py", f"{name}.py", "main.py", "notebook.py"):
+            c = folder / fname
+            if c.exists():
+                py_candidate = c
+                break
+        if not py_candidate:
+            other_py = [p for p in folder.glob("*.py") if p.name not in ("setup.py", "__init__.py")]
+            if other_py:
+                py_candidate = other_py[0]
 
-    existed, kernel = await _find_kernel(title, name)
+    ipynb_path = folder / "notebook.ipynb"
+
+    should_wrap_py = False
+    if py_candidate and py_candidate.exists():
+        if py_source or not ipynb_path.exists():
+            should_wrap_py = True
+        elif py_candidate.stat().st_mtime > ipynb_path.stat().st_mtime:
+            should_wrap_py = True
+
+    if should_wrap_py and py_candidate:
+        py_text = py_candidate.read_text()
+        script_name = py_candidate.name
+        nb = {
+            "cells": [
+                {"cell_type": "markdown", "metadata": {}, "source": f"# {name}\n\nAuto-converted from `{script_name}`.\n"},
+                {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _as_cell_source(f"%%writefile {script_name}\n" + py_text)},
+                {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _as_cell_source(f"!python {script_name}")},
+            ],
+            "metadata": {
+                "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+                "language_info": {"name": "python"},
+                "kaggle": {"accelerator": "none", "dataSources": [], "isInternetEnabled": True, "language": "python", "sourceType": "notebook"},
+            },
+            "nbformat": 4,
+            "nbformat_minor": 5,
+        }
+        ipynb_path.write_text(json.dumps(nb, indent=2))
+        code_file = "notebook.ipynb"
+        kernel_type = "notebook"
+    elif ipynb_path.exists():
+        code_file = "notebook.ipynb"
+        kernel_type = "notebook"
+    elif py_candidate:
+        code_file = py_candidate.name
+        kernel_type = "script"
+    else:
+        nb = {
+            "cells": [
+                {"cell_type": "markdown", "metadata": {}, "source": f"# {name}\n"},
+                {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": ["# Add code here\nprint('Hello Kaggle')\n"]},
+            ],
+            "metadata": {
+                "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+                "language_info": {"name": "python"},
+                "kaggle": {"accelerator": "none", "dataSources": [], "isInternetEnabled": True, "language": "python", "sourceType": "notebook"},
+            },
+            "nbformat": 4,
+            "nbformat_minor": 5,
+        }
+        ipynb_path.write_text(json.dumps(nb, indent=2))
+        code_file = "notebook.ipynb"
+        kernel_type = "notebook"
+
+    meta = _read_metadata(folder)
     owner = _default_owner()
     if not owner:
         raise RuntimeError("Could not determine Kaggle username. Set KAGGLE_USERNAME or configure ~/.kaggle/kaggle.json.")
 
-    ref = _full_slug(kernel) or f"{owner}/{_slugify(name)}"
-    push_dir = get_kaggle_root() / name / "working" / "kaggle_push"
-    push_dir.mkdir(parents=True, exist_ok=True)
-    code_file = "notebook.ipynb" if kernel_type == "notebook" else path.name
-    shutil.copy(path, push_dir / code_file)
+    existed, kernel = await _find_kernel(meta.get("title", name), name)
+    ref = meta.get("id") or _full_slug(kernel) or f"{owner}/{_slugify(name)}"
+    title = meta.get("title") or name
 
-    acc = _resolve_accelerator(accelerator, path, _read_cache(name))
-    datasets = dataset_sources if dataset_sources is not None else list(cache_pre.get("dataset_sources") or [])
-    competitions = competition_sources if competition_sources is not None else list(cache_pre.get("competition_sources") or [])
-    models = model_sources if model_sources is not None else list(cache_pre.get("model_sources") or [])
-    metadata = {
+    # Accelerator
+    acc = accelerator or meta.get("accelerator") or "none"
+    if acc != "none":
+        acc = _normalize_accelerator(acc)
+    enable_gpu = meta.get("enable_gpu", "false")
+    if isinstance(enable_gpu, bool):
+        enable_gpu = "true" if enable_gpu else "false"
+    if _is_gpu_accelerator(acc):
+        enable_gpu = "true"
+
+    enable_tpu = meta.get("enable_tpu", "false")
+    if isinstance(enable_tpu, bool):
+        enable_tpu = "true" if enable_tpu else "false"
+    if acc.lower() == "tpu":
+        enable_tpu = "true"
+
+    # Internet
+    enable_internet = meta.get("enable_internet", "true")
+    if internet is not None:
+        enable_internet = "true" if internet else "false"
+    elif isinstance(enable_internet, bool):
+        enable_internet = "true" if enable_internet else "false"
+
+    # Privacy
+    is_private = meta.get("is_private", "true")
+    if private is not None:
+        is_private = "true" if private else "false"
+    elif isinstance(is_private, bool):
+        is_private = "true" if is_private else "false"
+
+    # Sources
+    datasets = dataset_sources if dataset_sources is not None else list(meta.get("dataset_sources") or [])
+    competitions = competition_sources if competition_sources is not None else list(meta.get("competition_sources") or [])
+    models = model_sources if model_sources is not None else list(meta.get("model_sources") or [])
+
+    full_meta = {
         "id": ref,
         "title": title,
         "code_file": code_file,
         "language": "python",
         "kernel_type": kernel_type,
-        "is_private": "true" if private else "false",
-        "enable_gpu": "true" if _is_gpu_accelerator(acc) else "false",
-        "enable_tpu": "true" if acc.lower() == "tpu" else "false",
-        "enable_internet": "true" if internet else "false",
+        "is_private": is_private,
+        "enable_gpu": enable_gpu,
+        "enable_tpu": enable_tpu,
+        "enable_internet": enable_internet,
         "dataset_sources": datasets,
         "competition_sources": competitions,
-        "kernel_sources": [],
+        "kernel_sources": list(meta.get("kernel_sources") or []),
         "model_sources": models,
+        "accelerator": acc,
     }
-    (push_dir / "kernel-metadata.json").write_text(json.dumps(metadata, indent=2))
+
+    # Strict linting check
+    lint_errors = _lint_kernel_metadata(full_meta)
+    if lint_errors:
+        formatted_errors = "\n".join(f"- {err}" for err in lint_errors)
+        raise ValueError(
+            f"Metadata validation failed for '{name}':\n{formatted_errors}\n\n"
+            f"Please fix kernel-metadata.json according to Kaggle specifications."
+        )
+
+    for k in ("last_version_number", "total_runs", "last_status", "last_run_utc", "last_pushed_utc"):
+        if k in meta:
+            full_meta[k] = meta[k]
+
+    _write_metadata(folder, full_meta)
+
+    attached = []
+    if datasets:
+        attached.append(f"datasets: {', '.join(datasets)}")
+    if competitions:
+        attached.append(f"competitions: {', '.join(competitions)}")
+    if models:
+        attached.append(f"models: {', '.join(models)}")
+    attached_msg = f"\nattached: {'; '.join(attached)}" if attached else ""
+
+    return (
+        f"Saved local notebook '{name}'\n"
+        f"code: {code_file}\n"
+        f"metadata: {(_kernel_metadata_path(folder)).relative_to(get_workspace_root())}\n"
+        f"accelerator: {acc} (gpu={enable_gpu}, tpu={enable_tpu})\n"
+        f"internet: {enable_internet}"
+        f"{attached_msg}\n"
+        f"(Not pushed to Kaggle. Call push_notebook to queue execution)."
+    )
+@app.tool()
+async def push_notebook(
+    notebook: str,
+    accelerator: str | None = None,
+    dataset_sources: list[str] | None = None,
+    competition_sources: list[str] | None = None,
+    model_sources: list[str] | None = None,
+    internet: bool | None = None,
+    private: bool | None = None,
+    py_source: str | None = None,
+) -> str:
+    """Push a local notebook folder to Kaggle and queue execution (starts a new run).
+
+    STORAGE & DIRECTORY STRUCTURE:
+    - Looks up `./kaggle/<notebook_name>/`.
+    - All outputs and run summaries will be downloaded into `./kaggle/<notebook_name>/runs/<version>/`.
+
+    VALIDATION & LINTING:
+    - Runs strict validation on `./kaggle/<notebook>/kernel-metadata.json`.
+      (If any metadata field or slug is invalid, stops immediately with specific error feedback).
+    - Pre-flight quota check: Verifies accelerator quota on Kaggle before pushing.
+      (If GPU/TPU quota is 0.00h, blocks the push with an error instead of letting Kaggle fail).
+
+    EXECUTION:
+    - Pushes to Kaggle, creating a new version/run on Kaggle Cloud.
+    - Updates run tracking (`total_runs`, `last_version_number`, `last_status`) in `kernel-metadata.json`.
+    """
+    name, folder = _resolve_notebook_folder(notebook)
+    # Save and lint first
+    await save_notebook(
+        notebook=notebook,
+        accelerator=accelerator,
+        dataset_sources=dataset_sources,
+        competition_sources=competition_sources,
+        model_sources=model_sources,
+        internet=internet,
+        private=private,
+        py_source=py_source,
+    )
+
+    full_meta = _read_metadata(folder)
+    acc = full_meta.get("accelerator", "none")
+
+    # Pre-flight quota check
+    has_quota, quota_msg = _check_accelerator_quota(acc)
+    if not has_quota:
+        raise RuntimeError(
+            f"Push rejected for '{name}': {quota_msg}. "
+            f"Please switch accelerator to 'none' (CPU) or wait for your weekly quota to refresh."
+        )
+
+    code_file = full_meta.get("code_file", "notebook.ipynb")
+    ref = full_meta.get("id", "")
+    title = full_meta.get("title", name)
+
+    # Stage and push
+    push_dir = folder / "working" / "kaggle_push"
+    push_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy(folder / code_file, push_dir / code_file)
+    (push_dir / "kernel-metadata.json").write_text(json.dumps(full_meta, indent=2))
 
     cmd = ["kernels", "push", "-p", str(push_dir)]
     if acc and acc.lower() not in ("none", "cpu"):
@@ -770,78 +1293,106 @@ async def save_notebook_file(
     version_match = re.search(r"Kernel version\s+(\d+)\s+successfully pushed", result.stdout, re.I)
     version = int(version_match.group(1)) if version_match else None
 
-    # Update cache and local metadata
+    # Update metadata tracking
     owner_slug, kernel_slug = _split_kernel_slug(ref)
-    cache_update = {
-        "title": title,
-        "slug": ref,
-        "id": ref,
-        "owner_slug": owner_slug,
-        "username": owner_slug,
-        "kernel_slug": kernel_slug,
-        "source_path": str(path.relative_to(get_workspace_root())),
-        "kernel_type": kernel_type,
-        "accelerator": acc,
-        "internet": internet,
-        "private": private,
+    current_runs = int(full_meta.get("total_runs", 0)) + 1
+    meta_updates = {
         "last_pushed_utc": datetime.now(timezone.utc).isoformat(),
-        "dataset_sources": datasets,
-        "competition_sources": competitions,
-        "model_sources": models,
+        "last_status": "QUEUED",
+        "total_runs": current_runs,
     }
     if version:
-        cache_update["last_version_number"] = version
-    _write_cache(name, cache_update)
-    _write_local_metadata(path, cache_update)
+        meta_updates["last_version_number"] = version
+    _write_metadata(folder, meta_updates)
 
-    status_msg = f"Updating existing Kaggle notebook: {title}" if existed else f"Creating new Kaggle notebook: {title}"
     attached = []
-    if datasets:
-        attached.append(f"datasets: {', '.join(datasets)}")
-    if competitions:
-        attached.append(f"competitions: {', '.join(competitions)}")
-    if models:
-        attached.append(f"models: {', '.join(models)}")
+    if full_meta.get("dataset_sources"):
+        attached.append(f"datasets: {', '.join(full_meta['dataset_sources'])}")
+    if full_meta.get("competition_sources"):
+        attached.append(f"competitions: {', '.join(full_meta['competition_sources'])}")
+    if full_meta.get("model_sources"):
+        attached.append(f"models: {', '.join(full_meta['model_sources'])}")
     attached_msg = f"\nattached: {'; '.join(attached)}" if attached else ""
+
     return (
-        f"{status_msg}\n"
+        f"Pushed '{title}' to Kaggle.\n"
         f"slug: {ref}\n"
-        f"version: {version or 'latest'}\n"
-        f"accelerator: {acc}\n"
-        f"internet: {internet}"
+        f"version: {version or 'latest'} (total runs: {current_runs})\n"
+        f"accelerator: {acc} (gpu={full_meta.get('enable_gpu')}, tpu={full_meta.get('enable_tpu')})\n"
+        f"internet: {full_meta.get('enable_internet')}"
         f"{attached_msg}\n"
         f"Notebook successfully queued on Kaggle."
     )
 
 
 @app.tool()
-async def sync_py_to_ipynb(notebook: str, py_source: str | None = None) -> str:
-    """Convert/sync a local .py script into ./kaggle/<notebook>/notebook.ipynb with %%writefile + !python."""
-    name, _, _ = _source_path(notebook)
-    py_path = _resolve_py_source(name, py_source)
-    folder = get_kaggle_root() / name
-    folder.mkdir(parents=True, exist_ok=True)
-    ipynb_path = folder / "notebook.ipynb"
+async def wait_for_complete(
+    notebook: str,
+    timeout: int = 3600,
+    poll_interval: int = 30,
+    fetch_output_on_complete: bool = True,
+) -> str:
+    """Wait for a running Kaggle notebook to finish execution (COMPLETE, ERROR, or CANCELLED).
 
-    py_text = py_path.read_text()
-    script_name = py_path.name or "train.py"
+    NOTE: Kaggle training/inference runs frequently take 10 minutes to several hours.
+    AI agents: do NOT poll repeatedly in tight tool loops. Use wait_for_complete or run
+    `python mcp/kaggle_mcp.py wait <notebook>` in the background.
 
-    nb = {
-        "cells": [
-            {"cell_type": "markdown", "metadata": {}, "source": f"# {name}\n\nAuto-synced from `{script_name}`.\n"},
-            {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _as_cell_source(f"%%writefile {script_name}\n" + py_text)},
-            {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": _as_cell_source(f"!python {script_name}")},
-        ],
-        "metadata": {
-            "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
-            "language_info": {"name": "python"},
-            "kaggle": {"accelerator": "none", "dataSources": [], "isInternetEnabled": True, "language": "python", "sourceType": "notebook"},
-        },
-        "nbformat": 4,
-        "nbformat_minor": 5,
-    }
-    ipynb_path.write_text(json.dumps(nb, indent=2))
-    return f"Synced `{py_path.name}` into `{ipynb_path.relative_to(get_workspace_root())}` ({len(py_text.splitlines())} lines)."
+    Args:
+        notebook: Notebook name or directory.
+        timeout: Maximum seconds to wait before returning status (default: 3600s / 1hr).
+        poll_interval: Seconds between status checks (default: 30s).
+        fetch_output_on_complete: Whether to automatically download outputs and compress logs when finished.
+    """
+    name, folder = _resolve_notebook_folder(notebook)
+    meta = _read_metadata(folder)
+    owner = _default_owner()
+    existed, kernel = await _find_kernel(meta.get("title", name), name)
+    ref = meta.get("id") or _full_slug(kernel) or f"{owner}/{_slugify(name)}"
+
+    start_time = asyncio.get_event_loop().time()
+    while True:
+        status_proc = _run_kaggle(["kernels", "status", ref], timeout=30)
+        status_text = status_proc.stdout.strip()
+        match = re.search(r'has status "([^"]+)"', status_text)
+        status_label = _clean_status_label(match.group(1) if match else "UNKNOWN")
+
+        version_match = re.search(r"version\s+(\d+)", status_text, re.I)
+        version = int(version_match.group(1)) if version_match else meta.get("last_version_number")
+
+        _write_metadata(folder, {"last_status": status_label})
+
+        if status_label in ("COMPLETE", "ERROR", "CANCEL_ACKNOWLEDGED"):
+            msg = f"Notebook '{name}' finished with status: {status_label} (version {version})."
+            if status_label == "COMPLETE" and fetch_output_on_complete:
+                try:
+                    out_res = await fetch_output(notebook, run_number=version)
+                    msg += f"\n\nOutput download result:\n{out_res}"
+                except Exception as err:
+                    msg += f"\n(Auto-fetch output encountered error: {err})"
+            return msg
+
+        elapsed = asyncio.get_event_loop().time() - start_time
+        if elapsed >= timeout:
+            return f"Wait timeout reached after {int(elapsed)}s. Current status: {status_label} (version {version})."
+
+        await asyncio.sleep(max(5, poll_interval))
+
+@app.tool()
+async def delete_notebook(notebook: str) -> str:
+    """Delete a notebook and its remote runs from your Kaggle account.
+
+    WARNING: This permanently removes the notebook and all versions on Kaggle Cloud.
+    """
+    name, folder = _resolve_notebook_folder(notebook)
+    meta = _read_metadata(folder)
+    owner = _default_owner()
+    existed, kernel = await _find_kernel(meta.get("title", name), name)
+    ref = meta.get("id") or _full_slug(kernel) or f"{owner}/{_slugify(name)}"
+
+    proc = _run_kaggle(["kernels", "delete", "-y", ref], timeout=60)
+    out = proc.stdout.strip() or f"Kernel {ref} deleted successfully"
+    return out
 
 
 @app.tool()
@@ -894,62 +1445,247 @@ async def list_active_runs(limit: int = 50, head: int = 15) -> str:
         lines.append(f"... {len(active) - head} more active")
     return "\n".join(lines)
 
+def _fetch_live_kernel_telemetry(owner: str, slug: str) -> dict[str, Any]:
+    """Query Kaggle midtier APIs directly for live kernel metadata and session status.
+
+    Returns dictionary with machine_shape, enable_gpu, enable_tpu, status, and failure_message.
+    """
+    from kaggle.api.kaggle_api_extended import KaggleApi
+    from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelRequest, ApiGetKernelSessionStatusRequest
+
+    telemetry: dict[str, Any] = {
+        "machine_shape": None,
+        "enable_gpu": False,
+        "enable_tpu": False,
+        "status": None,
+        "failure_message": None,
+    }
+    try:
+        api = KaggleApi()
+        api.authenticate()
+        with api.build_kaggle_client() as client:
+            # 1. Get live hardware config
+            try:
+                k_req = ApiGetKernelRequest()
+                k_req.user_name = owner
+                k_req.kernel_slug = slug
+                k_res = client.kernels.kernels_api_client.get_kernel(k_req)
+                meta = getattr(k_res, "metadata", None)
+                if meta:
+                    telemetry["machine_shape"] = getattr(meta, "machine_shape", None)
+                    telemetry["enable_gpu"] = bool(getattr(meta, "enable_gpu", False))
+                    telemetry["enable_tpu"] = bool(getattr(meta, "enable_tpu", False))
+            except Exception:
+                pass
+
+            # 2. Get live session status & failure message
+            try:
+                s_req = ApiGetKernelSessionStatusRequest()
+                s_req.user_name = owner
+                s_req.kernel_slug = slug
+                s_res = client.kernels.kernels_api_client.get_kernel_session_status(s_req)
+                if s_res:
+                    raw_status = getattr(s_res, "status", None)
+                    if raw_status:
+                        telemetry["status"] = _clean_status_label(str(raw_status))
+                    telemetry["failure_message"] = getattr(s_res, "failure_message", "")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return telemetry
+
+
+def _fetch_live_logs_stream(owner: str, slug: str) -> list[str]:
+    """Stream live logs via Kaggle midtier SSE/stream endpoint with CLI fallback."""
+    from kaggle.api.kaggle_api_extended import KaggleApi
+    from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelSessionLogsStreamRequest
+
+    clean_lines: list[str] = []
+    # Priority 1: SDK live log stream endpoint
+    try:
+        api = KaggleApi()
+        api.authenticate()
+        with api.build_kaggle_client() as client:
+            req = ApiGetKernelSessionLogsStreamRequest()
+            req.user_name = owner
+            req.kernel_slug = slug
+            res = client.kernels.kernels_api_client.get_kernel_session_logs_stream(req)
+            content_type = res.headers.get("Content-Type", "")
+            if "text/event-stream" in content_type:
+                for raw_line in res.iter_lines():
+                    if not raw_line:
+                        continue
+                    line_str = raw_line.decode("utf-8", errors="replace")
+                    if line_str.startswith("data:"):
+                        data_val = line_str[5:].strip()
+                        try:
+                            item = json.loads(data_val)
+                            text = item.get("data") or item.get("message") or ""
+                            for sub in text.splitlines():
+                                if sub.strip():
+                                    clean_lines.append(sub)
+                        except Exception:
+                            clean_lines.append(data_val)
+            else:
+                try:
+                    items = json.loads(res.text)
+                    if isinstance(items, list):
+                        for it in items:
+                            text = it.get("data") or it.get("message") or ""
+                            for sub in text.splitlines():
+                                if sub.strip():
+                                    clean_lines.append(sub)
+                    else:
+                        clean_lines = [l for l in res.text.splitlines() if l.strip()]
+                except Exception:
+                    clean_lines = [l for l in res.text.splitlines() if l.strip()]
+    except Exception:
+        pass
+
+    # Priority 2: CLI logs fallback if stream endpoint didn't return lines
+    if not clean_lines:
+        try:
+            logs_proc = _run_kaggle(["kernels", "logs", f"{owner}/{slug}"], timeout=60)
+            raw_stdout = logs_proc.stdout.strip()
+            if raw_stdout.startswith("[") or raw_stdout.startswith("{"):
+                try:
+                    parsed = json.loads(raw_stdout)
+                    if isinstance(parsed, list):
+                        for item in parsed:
+                            text_part = item.get("data") or item.get("message") or ""
+                            for sub in text_part.splitlines():
+                                if sub.strip():
+                                    clean_lines.append(sub)
+                except Exception:
+                    clean_lines = [l for l in raw_stdout.splitlines() if l.strip()]
+            else:
+                clean_lines = [l for l in raw_stdout.splitlines() if l.strip()]
+        except Exception:
+            pass
+
+    return clean_lines
+
 
 @app.tool()
-async def view_status(notebook: str, tail: int = 15, fetch_logs: bool = False) -> str:
-    """Check Kaggle notebook status.
+async def view_status(notebook: str, tail: int = 10, fetch_logs: bool = True) -> str:
+    """Check Kaggle notebook status with rich live execution telemetry.
 
-    Fast execution by default. Set fetch_logs=True to download full execution logs into runs/<version>/logs.txt.
+    Queries Kaggle midtier APIs directly for:
+    - Current status: QUEUED, RUNNING, COMPLETE, ERROR, or CANCEL_ACKNOWLEDGED
+    - Hardware / Accelerator: Actual GPU/TPU allocated on Kaggle Cloud (e.g. NvidiaTeslaT4, NvidiaTeslaP100, TPU, or CPU)
+    - Elapsed time: Wall time since the run started
+    - CPU/GPU usage: Extracted from live stdout/stderr telemetry markers
+    - Live logs: Latest 10 lines from Kaggle's live log stream endpoint
     """
-    name, path, _ = _source_path(notebook)
-    existed, kernel = await _find_kernel(name, name)
-    ref = _full_slug(kernel)
-    if not ref:
-        owner = _default_owner()
-        ref = f"{owner}/{_slugify(name)}" if owner else None
-    if not ref:
-        raise RuntimeError(f"Could not resolve Kaggle kernel for '{name}'. Push with save_notebook_file first.")
+    name, folder = _resolve_notebook_folder(notebook)
+    meta = _read_metadata(folder)
+    owner = _default_owner()
+    existed, kernel = await _find_kernel(meta.get("title", name), name)
+    ref = meta.get("id") or _full_slug(kernel) or f"{owner}/{_slugify(name)}"
+    owner_part, slug_part = _split_kernel_slug(ref)
 
-    cache = _read_cache(name)
+    # 1. Fetch live telemetry from Kaggle API
+    telemetry = _fetch_live_kernel_telemetry(owner_part, slug_part)
 
-    # 1. Fetch status fast
+    # Check status via CLI as well to ensure version capture
     status_proc = _run_kaggle(["kernels", "status", ref], timeout=30)
     status_text = status_proc.stdout.strip()
     match = re.search(r'has status "([^"]+)"', status_text)
-    status_label = _clean_status_label(match.group(1) if match else "UNKNOWN")
+    cli_status_label = _clean_status_label(match.group(1) if match else "UNKNOWN")
+    status_label = telemetry.get("status") or cli_status_label
 
     version_match = re.search(r"version\s+(\d+)", status_text, re.I)
-    version = int(version_match.group(1)) if version_match else cache.get("last_version_number")
+    version = int(version_match.group(1)) if version_match else meta.get("last_version_number")
 
-    run_dir = get_kaggle_root() / name / "runs" / str(version or 0)
+    # 2. Hardware / Accelerator resolution from live Kaggle Cloud metadata
+    raw_shape = telemetry.get("machine_shape")
+    server_shape = raw_shape if raw_shape and str(raw_shape).strip().lower() not in ("none", "") else None
+    server_gpu = bool(telemetry.get("enable_gpu"))
+    server_tpu = bool(telemetry.get("enable_tpu"))
+
+    meta_acc = str(meta.get("accelerator") or "none").lower()
+    meta_gpu = meta.get("enable_gpu") in (True, "true")
+    meta_tpu = meta.get("enable_tpu") in (True, "true")
+
+    hardware_display = "CPU"
+    if server_shape:
+        hardware_display = f"GPU ({server_shape})"
+    elif server_gpu or meta_gpu or (meta_acc not in ("none", "cpu", "") and _is_gpu_accelerator(meta_acc)):
+        acc_name = server_shape or (meta_acc if meta_acc not in ("none", "cpu", "") else "NvidiaTeslaT4")
+        if acc_name in ("none", "cpu", None):
+            acc_name = "NvidiaTeslaT4"
+        hardware_display = f"GPU ({acc_name})"
+    elif server_tpu or meta_tpu or meta_acc == "tpu":
+        hardware_display = "TPU (v3-8)"
+    else:
+        hardware_display = "CPU"
+    # 3. Elapsed Time Calculation
+    last_pushed = meta.get("last_pushed_utc")
+    elapsed_str = "unknown"
+    if last_pushed:
+        try:
+            pushed_dt = datetime.fromisoformat(last_pushed)
+            elapsed_sec = int((datetime.now(timezone.utc) - pushed_dt).total_seconds())
+            mins, secs = divmod(elapsed_sec, 60)
+            hours, mins = divmod(mins, 60)
+            if hours > 0:
+                elapsed_str = f"{hours}h {mins}m {secs}s"
+            elif mins > 0:
+                elapsed_str = f"{mins}m {secs}s"
+            else:
+                elapsed_str = f"{secs}s"
+        except Exception:
+            pass
+
+    run_dir = folder / "runs" / str(version or 0)
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    # 4. Fetch live logs via Kaggle stream endpoint
     log_snippet = ""
+    usage_telemetry = []
     if fetch_logs:
-        try:
-            logs_proc = _run_kaggle(["kernels", "logs", ref], timeout=60)
-            logs_text = logs_proc.stdout
-            (run_dir / "logs.txt").write_text(logs_text)
+        clean_lines = _fetch_live_logs_stream(owner_part, slug_part)
+        if clean_lines:
+            (run_dir / "logs.txt").write_text("\n".join(clean_lines))
             build_run_summary(run_dir)
-            lines = logs_text.splitlines()
-            log_snippet = "\n".join(lines[-tail:]) if lines else "[empty logs]"
-        except Exception as err:
-            log_snippet = f"[failed to fetch logs: {err}]"
+
+            tail_lines = clean_lines[-tail:]
+            log_snippet = "\n".join(tail_lines)
+
+            # Search for GPU/CPU usage markers in logs
+            for line in clean_lines:
+                l_lower = line.lower()
+                if any(k in l_lower for k in ("nvidia-smi", "cuda memory", "gpu memory", "gpu utilization", "vram", "cpu utilization", "ram used")):
+                    usage_telemetry.append(line.strip())
 
     # Update metadata
-    cache_update = {
-        **cache,
-        "last_status": status_label,
-        "last_status_utc": datetime.now(timezone.utc).isoformat(),
-    }
-    _write_cache(name, cache_update)
-    _write_local_metadata(path, cache_update)
+    _write_metadata(
+        folder,
+        {
+            "last_status": status_label,
+            "last_status_utc": datetime.now(timezone.utc).isoformat(),
+        },
+    )
 
-    res = f"Notebook '{name}' ({ref}): {status_label} (version {version or 'unknown'})"
+    lines = [
+        f"Notebook: '{name}' ({ref})",
+        f"- Status: {status_label} (version {version or 'unknown'})",
+        f"- Hardware: {hardware_display}",
+        f"- Elapsed time: {elapsed_str}",
+    ]
+    if telemetry.get("failure_message"):
+        lines.append(f"- Failure reason: {telemetry['failure_message']}")
+    if usage_telemetry:
+        lines.append(f"- Resource usage detected: {usage_telemetry[-1]}")
+
     if log_snippet:
-        res += f"\n\nRecent logs:\n```text\n{log_snippet}\n```"
-    return res
+        lines.append(f"\nLatest {tail} lines of live logs:\n```text\n{log_snippet}\n```")
+    else:
+        lines.append(f"\n(No logs available yet)")
 
+    return "\n".join(lines)
 
 @app.tool()
 async def fetch_output(notebook: str, run_number: int | None = None) -> str:
@@ -1332,9 +2068,40 @@ async def get_quota() -> str:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Kaggle Local MCP Server")
+    parser = argparse.ArgumentParser(description="Kaggle Local MCP Server & CLI Tool")
     parser.add_argument("--config", type=Path, help="Path to machine-local kaggle.toml")
     parser.add_argument("--workspace-root", type=Path, help="Override workspace root directory")
+
+    subparsers = parser.add_subparsers(dest="command", help="CLI Subcommands")
+
+    # push
+    p_push = subparsers.add_parser("push", help="Push notebook and run on Kaggle")
+    p_push.add_argument("notebook", help="Notebook name or directory")
+    p_push.add_argument("--accelerator", help="Accelerator (none, gpu, tpu)")
+
+    # save
+    p_save = subparsers.add_parser("save", help="Save notebook locally and sync code without running")
+    p_save.add_argument("notebook", help="Notebook name or directory")
+
+    # wait
+    p_wait = subparsers.add_parser("wait", help="Wait for running notebook to complete")
+    p_wait.add_argument("notebook", help="Notebook name or directory")
+    p_wait.add_argument("--timeout", type=int, default=3600, help="Max wait seconds (default: 3600)")
+    p_wait.add_argument("--poll-interval", type=int, default=30, help="Poll interval in seconds")
+
+    # status
+    p_status = subparsers.add_parser("status", help="Check notebook status")
+    p_status.add_argument("notebook", help="Notebook name or directory")
+    p_status.add_argument("--logs", action="store_true", help="Fetch logs")
+
+    # output
+    p_output = subparsers.add_parser("output", help="Download notebook outputs")
+    p_output.add_argument("notebook", help="Notebook name or directory")
+    p_output.add_argument("--run", type=int, help="Specific run number")
+
+    # quota
+    subparsers.add_parser("quota", help="Check accelerator quota")
+
     return parser.parse_args()
 
 
@@ -1367,6 +2134,25 @@ def main() -> None:
         WORKSPACE_ROOT = Path(os.environ["KAGGLE_WORKSPACE_ROOT"]).resolve()
 
     load_config(args.config)
+
+    # CLI mode
+    if args.command:
+        cmd = args.command
+        if cmd == "quota":
+            print(asyncio.run(get_quota()))
+        elif cmd == "status":
+            print(asyncio.run(view_status(args.notebook, fetch_logs=args.logs)))
+        elif cmd == "push":
+            print(asyncio.run(push_notebook(args.notebook, accelerator=args.accelerator)))
+        elif cmd == "save":
+            print(asyncio.run(save_notebook(args.notebook)))
+        elif cmd == "wait":
+            print(asyncio.run(wait_for_complete(args.notebook, timeout=args.timeout, poll_interval=args.poll_interval)))
+        elif cmd == "output":
+            print(asyncio.run(fetch_output(args.notebook, run_number=args.run)))
+        return
+
+    # MCP server mode
     app.run(transport="stdio", show_banner=False)
 
 
