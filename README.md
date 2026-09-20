@@ -36,13 +36,13 @@ codex plugin add ponytail@ponytail
 Launch the setup menu:
 
 ```bash
-./scripts/install.sh
+./scripts/install.py
 ```
 
-Use `./scripts/install.sh --dry-run` to exercise the menus without changing
+Use `./scripts/install.py --dry-run` to exercise the menus without changing
 agent configuration.
 
-Use `./scripts/install.sh --omp` to configure OMP. The menu can apply tracked
+Use `./scripts/install.py --omp` to configure OMP. The menu can apply tracked
 files from `config/omp/` to `~/.omp/agent`, copy existing `~/.omp/agent` configs
 back into `config/omp/`, or configure MCPs. You can also run
 `./scripts/sync-omp-config.py` directly to capture allowlisted OMP settings
@@ -51,7 +51,7 @@ model credentials, MCP configuration, databases, sessions, history, caches, and
 other transient state; it also refuses allowlisted files that contain
 secret-like keys.
 
-Use `./scripts/install.sh --freebuff` to install into Freebuff. MCPs are merged
+Use `./scripts/install.py --freebuff` to install into Freebuff. MCPs are merged
 into `~/.agents/mcp.json`, skills are linked under `~/.agents/skills`, and the
 selected prompt is inlined into `~/.AGENTS.md`. Freebuff reads user knowledge
 files directly and does not resolve `@path` imports, so prompt content is copied
@@ -107,8 +107,8 @@ retry across the configured API keys before returning an error.
 
 ### Android phone automation
 
-Choose **Android** under **Install MCPs** in `./scripts/install.sh` (or
-`./scripts/install.sh --omp`). The existing installer registers `android` and
+Choose **Android** under **Install MCPs** in `./scripts/install.py` (or
+`./scripts/install.py --omp`). The installer registers `android` and
 creates `android.toml` in the selected agent home. Install `uv` and Android
 [Platform Tools](https://developer.android.com/tools/releases/platform-tools),
 put both on PATH, enable USB debugging and authorize the computer on the phone.
@@ -219,7 +219,7 @@ The legacy Menu key stays under `key(key="menu")`; modern apps may ignore it.
 
 ### Kaggle workspace & experiments
 
-Choose **Kaggle** under **Install MCPs** in `./scripts/install.sh`.
+Choose **Kaggle** under **Install MCPs** in `./scripts/install.py`.
 
 - `pull_notebook`: pulls code and remote configuration from Kaggle into `./kaggle/<notebook>/notebook.ipynb` and `./kaggle/<notebook>/kernel-metadata.json`.
 - `init_notebook`: initializes a brand new notebook experiment under `./kaggle/<notebook>/` with starter code (`train.py` or `notebook.ipynb`) and fresh `kernel-metadata.json`.
