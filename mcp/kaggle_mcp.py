@@ -453,7 +453,7 @@ async def read_metadata(reference: str, kind: str = "datasets") -> str:
     if not re.fullmatch(r"[\w-]+/[\w.-]+", reference):
         raise ValueError("Expected owner/slug")
     code = '''
-import sys
+import sys, json
 from kaggle.api.kaggle_api_extended import KaggleApi
 from kagglesdk.datasets.types.dataset_api_service import ApiGetDatasetRequest
 from kagglesdk.models.types.model_api_service import ApiGetModelRequest
@@ -469,9 +469,107 @@ with api.build_kaggle_client() as client:
         request = ApiGetModelRequest()
         request.owner_slug, request.model_slug = owner, slug
         result = client.models.model_api_client.get_model(request)
-    print(result.to_json())
+    metadata = result.to_dict()
+    if kind == 'datasets':
+        metadata['isPrivate'] = result.is_private
+        metadata['visibility'] = 'private' if result.is_private else 'public'
+    print(json.dumps(metadata))
 '''
     return await _query_process([sys.executable, "-c", code, kind, reference])
+
+
+@app.tool()
+async def update_dataset_metadata(dataset: str, changes: dict[str, Any]) -> str:
+    """Edit dataset presentation without uploading files. Preserves unspecified metadata.
+
+    Fields: title, subtitle, description (Markdown), licenses, keywords,
+    expectedUpdateFrequency, userSpecifiedSources. Dates and author are managed by Kaggle.
+    Licenses use [{"name":"LICENSE-ID"}]. Does not change privacy or collaborators.
+    """
+    allowed = {"title", "subtitle", "description", "licenses", "keywords",
+               "expectedUpdateFrequency", "userSpecifiedSources"}
+    if not changes or changes.keys() - allowed:
+        raise ValueError(f"Supply presentation fields only: {sorted(allowed)}")
+    if not re.fullmatch(r"[\w-]+/[\w.-]+", dataset):
+        raise ValueError("Expected owner/slug")
+    code = '''
+import json, sys
+from kaggle.api.kaggle_api_extended import KaggleApi
+from kagglesdk.datasets.types.dataset_api_service import (
+    ApiGetDatasetMetadataRequest, ApiUpdateDatasetMetadataRequest, DatasetSettings)
+api = KaggleApi(); api.authenticate()
+dataset, changes = sys.argv[1], json.loads(sys.argv[2])
+with api.build_kaggle_client() as client:
+    request = ApiGetDatasetMetadataRequest()
+    request.owner_slug, request.dataset_slug = dataset.split('/')
+    response = client.datasets.dataset_api_client.get_dataset_metadata(request)
+    if response.error_message:
+        raise RuntimeError(response.error_message)
+    info = response.info
+    if info is None:
+        raise RuntimeError('Dataset metadata response omitted settings')
+    settings = DatasetSettings()
+    for name in ('title', 'subtitle', 'description', 'is_private', 'keywords',
+                 'licenses', 'collaborators', 'data', 'expected_update_frequency',
+                 'user_specified_sources'):
+        setattr(settings, name, getattr(info, name))
+    patch = DatasetSettings.from_dict(changes)
+    names = {'expectedUpdateFrequency': 'expected_update_frequency',
+             'userSpecifiedSources': 'user_specified_sources'}
+    for key in changes:
+        name = names.get(key, key)
+        setattr(settings, name, getattr(patch, name))
+    update = ApiUpdateDatasetMetadataRequest()
+    update.owner_slug, update.dataset_slug = request.owner_slug, request.dataset_slug
+    update.settings = settings
+    result = client.datasets.dataset_api_client.update_dataset_metadata(update)
+    if getattr(result, 'error_message', None):
+        raise RuntimeError(result.error_message)
+    print(json.dumps(dict(dataset=dataset, updated=list(changes))))
+'''
+    return await _query_process([sys.executable, "-c", code, dataset, json.dumps(changes)])
+
+
+@app.tool()
+async def delete_dataset(dataset: str) -> str:
+    """Permanently delete a Kaggle dataset and its versions. Use only when explicitly authorized."""
+    if not re.fullmatch(r"[\w-]+/[\w.-]+", dataset):
+        raise ValueError("Expected owner/slug")
+    return await _query_kaggle(["datasets", "delete", dataset, "--yes"])
+
+
+@app.tool()
+async def update_notebook_presentation(notebook: str, title: str | None = None,
+                                       markdown_path: str | None = None) -> str:
+    """Edit local notebook title and introductory Markdown without running it.
+
+    markdown_path is an agent-written description file. Preserves code and outputs.
+    Use push_notebook to publish and run. Kaggle manages author and dates; dataset
+    update-frequency and license fields are not notebook metadata fields.
+    """
+    _, folder = _resolve_notebook_folder(notebook)
+    metadata = _read_metadata(folder)
+    if markdown_path is not None:
+        source = Path(markdown_path)
+        if not source.is_absolute():
+            source = get_workspace_root() / source
+        code = folder / metadata.get("code_file", "notebook.ipynb")
+        if code.suffix != ".ipynb":
+            raise ValueError("Markdown presentation requires an ipynb notebook")
+        document = json.loads(code.read_text())
+        cell = dict(cell_type="markdown", metadata={"tags": ["kaggle-description"]},
+                    source=source.read_text().splitlines(keepends=True))
+        cells = document["cells"]
+        previous = next((i for i, item in enumerate(cells)
+                         if "kaggle-description" in item.get("metadata", {}).get("tags", [])), None)
+        if previous is None:
+            cells.insert(0, cell)
+        else:
+            cells[previous] = cell
+        code.write_text(json.dumps(document, indent=2))
+    if title is not None:
+        _write_metadata(folder, {"title": title})
+    return f"Updated local presentation for {notebook}; not published or executed."
 
 
 def _parse_kernel_csv(output: str) -> list[dict[str, str]]:
@@ -2041,6 +2139,7 @@ async def upload_dataset(
     version_notes: str | None = None,
     keep_tabular: bool = True,
     dir_mode: str = "zip",
+    metadata: dict[str, Any] | None = None,
 ) -> str:
     """Upload or update a dataset. Please run as CLI for long uploads:
 
@@ -2051,7 +2150,7 @@ async def upload_dataset(
     continues: monitor its log, do NOT restart it. Use CLI for future long uploads.
     """
     options = dict(title=title, dataset_slug=dataset_slug, private=private,
-                   version_notes=version_notes, keep_tabular=keep_tabular, dir_mode=dir_mode)
+                   version_notes=version_notes, keep_tabular=keep_tabular, dir_mode=dir_mode, metadata=metadata)
     return await _transfer("upload", path, options)
 
 
@@ -2077,7 +2176,8 @@ async def _transfer(operation: str, source: str, options: dict) -> str:
 
 def _upload_dataset(path: str, title: str | None = None, dataset_slug: str | None = None,
                     private: bool = True, version_notes: str | None = None,
-                    keep_tabular: bool = True, dir_mode: str = "zip") -> str:
+                    keep_tabular: bool = True, dir_mode: str = "zip",
+                    metadata: dict[str, Any] | None = None) -> str:
     raw_path = Path(path)
     source_path = raw_path if raw_path.is_absolute() else get_workspace_root() / raw_path
     if not source_path.exists():
@@ -2113,31 +2213,43 @@ def _upload_dataset(path: str, title: str | None = None, dataset_slug: str | Non
             "licenses": [{"name": "CC0-1.0"}],
         }
         meta_path.write_text(json.dumps(meta_content, indent=2))
+    document = json.loads(meta_path.read_text())
+    if document.get("id") != ref:
+        raise ValueError(f"Dataset metadata id must match requested target {ref}")
+    if metadata:
+        allowed = {"title", "subtitle", "description", "licenses", "keywords",
+                   "expectedUpdateFrequency", "userSpecifiedSources"}
+        if metadata.keys() - allowed:
+            raise ValueError(f"Unsupported presentation fields: {sorted(metadata.keys() - allowed)}")
+        document.update(metadata)
+    if title is not None:
+        document["title"] = title
+    meta_path.write_text(json.dumps(document, indent=2))
 
-    # Check if dataset exists on Kaggle
-    existed = False
+    from kaggle_transfer import DatasetApi
+    from kagglesdk.datasets.types.dataset_api_service import ApiGetDatasetRequest
+    from requests import HTTPError
+    api = DatasetApi()
+    api.authenticate()
+    request = ApiGetDatasetRequest()
+    request.owner_slug, request.dataset_slug = ref.split("/")
     try:
-        status_proc = _run_kaggle(["datasets", "status", ref], timeout=20)
-        if "ready" in status_proc.stdout.lower() or "pending" in status_proc.stdout.lower():
-            existed = True
-    except Exception:
+        with api.build_kaggle_client() as client:
+            client.datasets.dataset_api_client.get_dataset(request)
+        existed = True
+    except HTTPError as error:
+        if error.response is None or error.response.status_code != 404:
+            raise
         existed = False
-
     if existed:
-        notes = version_notes or f"Updated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
-        cmd = ["datasets", "version", "-p", str(upload_folder), "-m", notes, "-r", dir_mode]
-        if keep_tabular:
-            cmd.append("-t")
-        proc = _run_kaggle(cmd, timeout=600)
-        action_msg = f"Created new version of existing dataset '{ref}' ({notes})."
+        result = api.dataset_create_version(str(upload_folder), version_notes or "Updated dataset",
+                    convert_to_csv=not keep_tabular, dir_mode=dir_mode)
     else:
-        cmd = ["datasets", "create", "-p", str(upload_folder), "-r", dir_mode]
-        if not private:
-            cmd.append("-u")
-        if keep_tabular:
-            cmd.append("-t")
-        proc = _run_kaggle(cmd, timeout=600)
-        action_msg = f"Created new dataset '{ref}' (private={private})."
+        result = api.dataset_create_new(str(upload_folder), public=not private,
+                    convert_to_csv=not keep_tabular, dir_mode=dir_mode)
+    if result.error:
+        raise RuntimeError(result.error)
+    action_msg = f"Published {'new version of' if existed else 'new'} dataset '{ref}'."
 
     # Save local metadata.json
     local_meta = {
@@ -2148,7 +2260,7 @@ def _upload_dataset(path: str, title: str | None = None, dataset_slug: str | Non
         "owner": owner,
         "private": private,
         "last_updated_utc": datetime.now(timezone.utc).isoformat(),
-        "source_folder": str(upload_folder.relative_to(get_workspace_root())),
+        "source_folder": str(upload_folder),
     }
     (datasets_dir / "metadata.json").write_text(json.dumps(local_meta, indent=2))
 
