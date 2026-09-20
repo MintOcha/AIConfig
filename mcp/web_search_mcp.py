@@ -723,8 +723,11 @@ class SearchRouter:
                 detail = re.sub(r"(?i)((?:api[_-]?key|token|key)=)[^&\s\"']+", r"\1[REDACTED]", detail)
                 failures.append(f"[{provider}]\n{detail}")
         if failures:
-            raise ProviderRequestError("Search exhausted without results; provider errors (credentials redacted):\n" + "\n".join(failures)) from None
-        return []
+            raise ProviderRequestError(
+                "Search exhausted without results; provider errors (credentials redacted):\n" + "\n".join(failures) +
+                "\n\n[Next Step: Check network/API keys or query with duckduckgo / web_search tool directly]"
+            ) from None
+        return "No results found for query. Try broader keywords or removing specific operators."
 
     async def fetch_content(self, urls: list[str]) -> list[dict[str, str]]:
         """Fetch page content through Codex native open command, with DuckDuckGo failover."""
@@ -752,8 +755,10 @@ class SearchRouter:
                 pass
 
         if not fetched_all:
+            detail = f" (attempted {len(urls)} URLs)" if urls else ""
             raise ProviderRequestError(
-                "Could not fetch any requested URLs using available providers"
+                f"Could not fetch any requested URLs using available providers{detail}.\n"
+                f"[Next Step: Verify URL accessibility or retrieve page content using standard HTTP requests/tools]"
             )
 
         # Return in original requested order for successfully fetched URLs
@@ -768,7 +773,10 @@ class SearchRouter:
         self, command_name: str, command_payload: list[dict[str, Any]]
     ) -> dict[str, Any]:
         if not self._codex_standalone_keys.configured:
-            raise ConfigurationError("Codex standalone is not configured")
+            raise ConfigurationError(
+                "Codex standalone is not configured.\n"
+                "[Next Step: Configure codex_standalone_keys in config.toml or use standard web_search/fetch tools]"
+            )
         api_key = await self._codex_standalone_keys.next_key()
         endpoint = f"{self.config.codex_standalone_base_url.rstrip('/')}/alpha/search"
         async with self._codex_client_factory(
@@ -786,7 +794,11 @@ class SearchRouter:
                     "commands": {command_name: command_payload},
                 },
             )
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as err:
+                body = err.response.text[:500]
+                raise ProviderRequestError(f"Codex command '{command_name}' failed ({err.response.status_code}): {body}") from err
             return response.json()
 
 

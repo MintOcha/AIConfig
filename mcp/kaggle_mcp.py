@@ -1827,9 +1827,12 @@ async def push_notebook(
         f"accelerator: {acc} (gpu={full_meta.get('enable_gpu')}, tpu={full_meta.get('enable_tpu')})\n"
         f"internet: {full_meta.get('enable_internet')}"
         f"{attached_msg}\n"
-        f"Notebook successfully queued on Kaggle."
+        f"Notebook successfully queued on Kaggle.\n\n"
+        f"[Next Step: To monitor execution, use CLI in background without blocking:\n"
+        f"uv run --script /home/nas/Projects/AIConfig/mcp/kaggle_mcp.py wait {canonical_ref} --timeout 3600 --poll-interval 30\n"
+        f"Or view live logs:\n"
+        f"uv run --script /home/nas/Projects/AIConfig/mcp/kaggle_mcp.py status {canonical_ref} --logs --log-timeout 60]"
     )
-
 
 @app.tool(name="wait_for_notebook")
 async def wait(
@@ -2138,11 +2141,22 @@ async def _completed_run(ref: str, version: int | None = None) -> RunVersion:
     if ver is None or ver < 1:
         raise RuntimeError(f"Cannot determine remote version for '{ref}'.")
     if status in ACTIVE_RUN_STATUSES:
-        raise RuntimeError(f"Run {ver} is currently {status}; outputs cannot be downloaded while a run is active. No output directory created.")
+        raise RuntimeError(
+            f"Run {ver} is currently {status}; outputs cannot be downloaded while a run is active. No output directory created.\n"
+            f"[Next Step: Wait for the run to complete or cancel it first:\n"
+            f"- Wait: uv run --script /home/nas/Projects/AIConfig/mcp/kaggle_mcp.py wait {ref} --until complete --timeout 3600\n"
+            f"- Cancel: cancel_notebook(notebook='{ref}') or uv run --script /home/nas/Projects/AIConfig/mcp/kaggle_mcp.py cancel {ref}]"
+        )
     if status in {"UNKNOWN", "UNPUSHED"}:
-        raise RuntimeError(f"Run {ver} has status {status}; cannot safely verify whether run is stopped. No output directory created.")
+        raise RuntimeError(
+            f"Run {ver} has status {status}; cannot safely verify whether run is stopped. No output directory created.\n"
+            f"[Next Step: Check notebook status via CLI: uv run --script /home/nas/Projects/AIConfig/mcp/kaggle_mcp.py status {ref}]"
+        )
     if status not in TERMINAL_RUN_STATUSES:
-        raise RuntimeError(f"Run {ver} has unrecognized status '{status}'; outputs require a stopped terminal run. No output directory created.")
+        raise RuntimeError(
+            f"Run {ver} has unrecognized status '{status}'; outputs require a stopped terminal run. No output directory created.\n"
+            f"[Next Step: Check status via CLI: uv run --script /home/nas/Projects/AIConfig/mcp/kaggle_mcp.py status {ref}]"
+        )
     return RunVersion(ver, status)
 
 
