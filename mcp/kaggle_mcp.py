@@ -711,17 +711,24 @@ def _model_transfer(operation: str, source: str, options: dict) -> str:
                 valid_types = {
                     "unspecified": "Unspecified",
                     "basemodel": "BaseModel",
+                    "base_model": "BaseModel",
                     "kagglevariant": "KaggleVariant",
+                    "kaggle_variant": "KaggleVariant",
                     "externalvariant": "ExternalVariant",
+                    "external_variant": "ExternalVariant",
                 }
                 curr_type = meta.get("modelInstanceType")
+                has_external = bool(meta.get("externalBaseModelUrl"))
                 if curr_type and isinstance(curr_type, str):
                     key = curr_type.lower().replace("-", "").replace("_", "")
-                    normalized = valid_types.get(key, "Unspecified")
+                    default_type = "ExternalVariant" if has_external else "Unspecified"
+                    normalized = valid_types.get(key, default_type)
                     if normalized != curr_type:
                         meta["modelInstanceType"] = normalized
                         changed = True
-
+                elif has_external and curr_type == "Unspecified":
+                    meta["modelInstanceType"] = "ExternalVariant"
+                    changed = True
                 if changed:
                     meta_file.write_text(json.dumps(meta, indent=2))
             except Exception:
