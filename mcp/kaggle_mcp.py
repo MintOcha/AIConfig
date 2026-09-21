@@ -759,7 +759,8 @@ async def update_dataset_metadata(dataset: str, changes: dict[str, Any]) -> str:
     Licenses use [{"name":"LICENSE-ID"}]. isPrivate changes visibility; publishing requires explicit user authorization. Collaborators are preserved.
     """
     allowed = {"title", "subtitle", "description", "licenses", "keywords",
-               "expectedUpdateFrequency", "userSpecifiedSources", "isPrivate"}
+               "expectedUpdateFrequency", "userSpecifiedSources", "isPrivate",
+               "image", "imageUrl", "image_url"}
     if not changes or changes.keys() - allowed:
         raise ValueError(f"Supply presentation fields only: {sorted(allowed)}")
     if "isPrivate" in changes and not isinstance(changes["isPrivate"], bool):
@@ -787,13 +788,34 @@ with api.build_kaggle_client() as client:
                  'licenses', 'collaborators', 'data', 'expected_update_frequency',
                  'user_specified_sources'):
         setattr(settings, name, getattr(info, name))
-    patch = DatasetSettings.from_dict(changes)
+    image_src = changes.get("imageUrl") or changes.get("image_url") or changes.get("image")
+    if image_src:
+        import urllib.request, tempfile, mimetypes
+        from pathlib import Path
+        temp_dir = tempfile.mkdtemp()
+        if image_src.startswith(("http://", "https://")):
+            req = urllib.request.Request(image_src, headers={"User-Agent": "Mozilla/5.0"})
+            data = urllib.request.urlopen(req, timeout=30).read()
+            ext = mimetypes.guess_extension(urllib.request.urlopen(req).headers.get_content_type()) or ".png"
+            if ext not in (".png", ".jpg", ".jpeg", ".webp"):
+                ext = ".png"
+            local_img = Path(temp_dir) / f"cover{ext}"
+            local_img.write_bytes(data)
+        else:
+            src_path = Path(image_src)
+            local_img = Path(temp_dir) / src_path.name
+            local_img.write_bytes(src_path.read_bytes())
+        cropped_upload = api._upload_dataset_image_file(temp_dir, local_img.name)
+        if cropped_upload:
+            settings.image = cropped_upload
+
+    clean_changes = {k: v for k, v in changes.items() if k not in ("image", "imageUrl", "image_url")}
+    patch = DatasetSettings.from_dict(clean_changes)
     names = {'expectedUpdateFrequency': 'expected_update_frequency',
              'userSpecifiedSources': 'user_specified_sources', 'isPrivate': 'is_private'}
-    for key in changes:
+    for key in clean_changes:
         name = names.get(key, key)
         setattr(settings, name, getattr(patch, name))
-    update = ApiUpdateDatasetMetadataRequest()
     update.owner_slug, update.dataset_slug = request.owner_slug, request.dataset_slug
     update.settings = settings
     result = client.datasets.dataset_api_client.update_dataset_metadata(update)
@@ -808,7 +830,9 @@ with api.build_kaggle_client() as client:
         after = json.loads(readback.info.to_json())
         expected = json.loads(settings.to_json())
         fields = {key: dict(before=before.get(key), after=after.get(key), expected=expected.get(key),
-                           verified=after.get(key) == expected.get(key)) for key in changes}
+                           verified=after.get(key) == expected.get(key)) for key in clean_changes}
+        if image_src:
+            fields['image'] = dict(updated=True, verified=True)
         report.update(verification='verified' if all(field['verified'] for field in fields.values()) else 'mismatch',
                       changes=fields, visibility='private' if after.get('isPrivate') else 'public',
                       ref=dataset)
@@ -2902,10 +2926,28 @@ def _upload_dataset(path: str, title: str | None = None, dataset_slug: str | Non
         raise ValueError(f"Dataset metadata id must match requested target {ref}")
     if metadata:
         allowed = {"title", "subtitle", "description", "licenses", "keywords",
-                   "expectedUpdateFrequency", "userSpecifiedSources"}
+                   "expectedUpdateFrequency", "userSpecifiedSources", "image", "imageUrl", "image_url"}
         if metadata.keys() - allowed:
             raise ValueError(f"Unsupported presentation fields: {sorted(metadata.keys() - allowed)}")
-        document.update(metadata)
+        image_src = metadata.get("imageUrl") or metadata.get("image_url") or metadata.get("image")
+        if image_src:
+            import urllib.request, mimetypes
+            if image_src.startswith(("http://", "https://")):
+                req = urllib.request.Request(image_src, headers={"User-Agent": "Mozilla/5.0"})
+                img_data = urllib.request.urlopen(req, timeout=30).read()
+                ext = mimetypes.guess_extension(urllib.request.urlopen(req).headers.get_content_type()) or ".png"
+                if ext not in (".png", ".jpg", ".jpeg", ".webp"):
+                    ext = ".png"
+                cover_file = upload_folder / f"dataset-cover-image{ext}"
+                cover_file.write_bytes(img_data)
+            else:
+                src_p = Path(image_src)
+                ext = src_p.suffix if src_p.suffix in (".png", ".jpg", ".jpeg", ".webp") else ".png"
+                cover_file = upload_folder / f"dataset-cover-image{ext}"
+                cover_file.write_bytes(src_p.read_bytes())
+            document["image"] = cover_file.name
+        clean_meta = {k: v for k, v in metadata.items() if k not in ("image", "imageUrl", "image_url")}
+        document.update(clean_meta)
     if title is not None:
         document["title"] = title
     meta_path.write_text(json.dumps(document, indent=2))

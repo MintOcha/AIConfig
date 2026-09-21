@@ -136,6 +136,48 @@ class RunSafetyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(saved_meta["trainingData"], ["owner/slug", "owner/slug2"])
                 self.assertEqual(saved_meta["modelInstanceType"], "Unspecified")
 
+    def test_update_dataset_metadata_allowed_fields(self):
+        # Verify image and imageUrl are accepted
+        with patch.object(module, "_query_process") as mock_qp:
+            mock_qp.return_value = json.dumps({"dataset": "owner/slug", "update_accepted": True})
+            res = asyncio.run(module.update_dataset_metadata("owner/slug", {"imageUrl": "https://example.com/art.jpg"}))
+            self.assertIn("update_accepted", res)
+            mock_qp.assert_called_once()
+
+    def test_upload_dataset_metadata_allows_image_url(self):
+        import tempfile
+        from unittest.mock import MagicMock
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_file = Path(tmpdir) / "data.csv"
+            data_file.write_text("a,b\n1,2\n")
+            mock_api = MagicMock()
+            mock_result = MagicMock()
+            mock_result.error = None
+            mock_api.dataset_create_new.return_value = mock_result
+            mock_api.dataset_create_version.return_value = mock_result
+            mock_api_cls = MagicMock(return_value=mock_api)
+            with patch("urllib.request.urlopen") as mock_url, \
+                 patch.object(module, "_default_owner", return_value="owner"), \
+                 patch.dict("sys.modules", {"kaggle_transfer": SimpleNamespace(DatasetApi=mock_api_cls)}), \
+                 patch("kagglesdk.datasets.types.dataset_api_service.ApiGetDatasetRequest"):
+                mock_resp = MagicMock()
+                mock_resp.read.return_value = b"fake-image-bytes"
+                mock_resp.headers.get_content_type.return_value = "image/png"
+                mock_url.return_value = mock_resp
+                res = module._upload_dataset(
+                    str(data_file),
+                    dataset_slug="test-slug",
+                    metadata={"imageUrl": "https://example.com/cover.png"}
+                )
+                self.assertIn("https://www.kaggle.com/datasets/owner/test-slug", res)
+                meta_path = Path(module.get_kaggle_root()) / "datasets/test-slug/dataset-metadata.json"
+                self.assertTrue(meta_path.exists())
+                content = json.loads(meta_path.read_text())
+                self.assertEqual(content["image"], "dataset-cover-image.png")
+                cover_file = Path(module.get_kaggle_root()) / "datasets/test-slug/dataset-cover-image.png"
+                self.assertTrue(cover_file.exists())
+                self.assertEqual(cover_file.read_bytes(), b"fake-image-bytes")
+
 
 if __name__ == "__main__":
     unittest.main()
