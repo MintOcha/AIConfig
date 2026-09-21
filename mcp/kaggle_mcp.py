@@ -361,15 +361,21 @@ def _strip_cli_warnings(text: str) -> str:
 
 def _run_kaggle(args: list[str], timeout: int = 300) -> subprocess.CompletedProcess[str]:
     cmd = [*_resolve_kaggle_cmd(), *args]
-    proc = subprocess.run(
-        cmd,
-        cwd=get_workspace_root(),
-        env=_cli_env(),
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-        check=True,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=get_workspace_root(),
+            env=_cli_env(),
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr = _strip_cli_warnings(exc.stderr or "")
+        stdout = _strip_cli_warnings(exc.stdout or "")
+        err_msg = stderr.strip() or stdout.strip() or f"Process exited with code {exc.returncode}"
+        raise RuntimeError(f"Kaggle command failed ({exc.returncode}): {' '.join(cmd)}\n{err_msg}") from None
     # Strip annoying version warning banners
     proc.stdout = _strip_cli_warnings(proc.stdout)
     proc.stderr = _strip_cli_warnings(proc.stderr)
@@ -685,6 +691,42 @@ def _model_transfer(operation: str, source: str, options: dict) -> str:
         folder = Path(source)
         if not folder.is_absolute():
             folder = get_workspace_root() / folder
+
+        meta_file = folder / "model-instance-metadata.json"
+        if meta_file.exists():
+            try:
+                meta = json.loads(meta_file.read_text())
+                changed = False
+                if "trainingData" in meta and isinstance(meta["trainingData"], list):
+                    cleaned_td = []
+                    for item in meta["trainingData"]:
+                        if isinstance(item, dict):
+                            slug = item.get("datasetSlug") or item.get("slug") or str(item)
+                            cleaned_td.append(str(slug))
+                            changed = True
+                        else:
+                            cleaned_td.append(str(item))
+                    meta["trainingData"] = cleaned_td
+
+                valid_types = {
+                    "unspecified": "Unspecified",
+                    "basemodel": "BaseModel",
+                    "kagglevariant": "KaggleVariant",
+                    "externalvariant": "ExternalVariant",
+                }
+                curr_type = meta.get("modelInstanceType")
+                if curr_type and isinstance(curr_type, str):
+                    key = curr_type.lower().replace("-", "").replace("_", "")
+                    normalized = valid_types.get(key, "Unspecified")
+                    if normalized != curr_type:
+                        meta["modelInstanceType"] = normalized
+                        changed = True
+
+                if changed:
+                    meta_file.write_text(json.dumps(meta, indent=2))
+            except Exception:
+                pass
+
         variation = options.get("variation")
         command = ["models", "instances"]
         if variation:
@@ -698,7 +740,7 @@ def _model_transfer(operation: str, source: str, options: dict) -> str:
             target = get_workspace_root() / target
         command = ["models", "instances", "versions", "download", source, "-p", str(target)]
     result = _run_kaggle(command, timeout=3600)
-    return result.stdout
+    return result.stdout or result.stderr or "Success"
 
 
 @app.tool(name="edit_dataset")

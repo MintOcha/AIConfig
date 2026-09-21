@@ -110,6 +110,32 @@ class RunSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("· timeout", report)
         self.assertIn("requested condition was not observed", report)
 
+    def test_run_kaggle_formats_cli_stderr_on_error(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = module.subprocess.CalledProcessError(
+                1, ["kaggle", "cmd"], output="", stderr="Kaggle API Error: forbidden\n"
+            )
+            with self.assertRaisesRegex(RuntimeError, "Kaggle API Error: forbidden"):
+                module._run_kaggle(["cmd"])
+
+    def test_model_transfer_sanitizes_metadata(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            meta_file = tmp_path / "model-instance-metadata.json"
+            meta_file.write_text(json.dumps({
+                "trainingData": [{"datasetSlug": "owner/slug"}, "owner/slug2"],
+                "modelInstanceType": "FineTuned"
+            }))
+            with patch.object(module, "_run_kaggle") as mock_run:
+                mock_proc = SimpleNamespace(stdout="uploaded", stderr="")
+                mock_run.return_value = mock_proc
+                res = module._model_transfer("push-model", str(tmp_path), {})
+                self.assertEqual(res, "uploaded")
+                saved_meta = json.loads(meta_file.read_text())
+                self.assertEqual(saved_meta["trainingData"], ["owner/slug", "owner/slug2"])
+                self.assertEqual(saved_meta["modelInstanceType"], "Unspecified")
+
 
 if __name__ == "__main__":
     unittest.main()
