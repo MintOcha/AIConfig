@@ -26,9 +26,18 @@ class RunSafetyTests(unittest.IsolatedAsyncioTestCase):
     async def test_ambiguous_cancel_sends_nothing(self):
         runs = [dict(version=v, status="RUNNING") for v in (2, 4)]
         with patch.object(module, "_discover_runs", return_value=runs), patch.object(module, "_query_process") as query:
-            with self.assertRaisesRegex(ValueError, "Multiple active"):
-                await module.cancel_run("owner/notebook")
+            report = await module.cancel_run("owner/notebook")
+            self.assertIn("Multiple active versions", report)
+            self.assertIn("Version 2", report)
+            self.assertIn("Version 4", report)
+            self.assertIn("specify", report.lower())
             query.assert_not_called()
+
+    async def test_ambiguous_cancel_with_version_targets_run(self):
+        with patch.object(module, "_discover_runs", return_value=[dict(version=4, status="RUNNING")]), \
+             patch.object(module, "_query_process", return_value='{"cancellation_sent": true}') as query:
+            result = await module.cancel_run("owner/notebook", version=4)
+            query.assert_called_once()
 
     async def exercise_cancel(self, *, location="https://api.kaggle.com/v1/kernels/output/download_zip/987654", status="RUNNING", dry_run=False, backend_error=""):
         sent = []

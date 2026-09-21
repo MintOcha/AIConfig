@@ -2517,16 +2517,31 @@ async def fetch_output(
 async def cancel_run(notebook: str, version: int | None = None, dry_run: bool = False) -> str:
     """Cancel a verified active notebook version, never an inferred numeric session ID.
 
-    Omit version to select the sole active run. Multiple active runs require an
-    explicit version. dry_run resolves and verifies the target without cancelling.
+    Omit version to select the sole active run. If multiple active runs are detected,
+    the tool reports all active versions and prompts to specify which version to cancel.
+    dry_run resolves and verifies the target without cancelling.
     """
     ref = _notebook_ref(notebook)
     runs = await _discover_runs(ref, version)
     active = [run for run in runs if run["status"] in ACTIVE_RUN_STATUSES]
     if not active:
-        return f"{ref}: no active run to cancel."
-    if len(active) != 1:
-        raise ValueError(f"Multiple active runs for {ref}: {[r['version'] for r in active]}; specify version")
+        if version is not None:
+            curr_status = runs[0].get("status") if runs else "unknown"
+            return f"Version {version} of '{ref}' is not active (status: {curr_status}); no active run to cancel."
+        latest_info = f" (latest version {runs[0].get('version')} is {runs[0].get('status')})" if runs and runs[0].get("version") else ""
+        return f"{ref}: no active run to cancel{latest_info}."
+    if len(active) > 1:
+        run_lines = "\n".join(
+            f"  - Version {r.get('version', 'unknown')} (status: {r.get('status', 'ACTIVE')})"
+            for r in sorted(active, key=lambda x: x.get("version") or 0, reverse=True)
+        )
+        return (
+            f"Multiple active versions are currently running for '{ref}':\n"
+            f"{run_lines}\n\n"
+            f"Please specify which version/run to cancel:\n"
+            f"- Via MCP tool: cancel_notebook(notebook='{ref}', version=<version>)\n"
+            f"- Via CLI:      uv run --script /home/nas/Projects/AIConfig/mcp/kaggle_mcp.py cancel {ref} --version <version>"
+        )
     target = active[0]["version"]
     code = '''
 import sys, json, re
