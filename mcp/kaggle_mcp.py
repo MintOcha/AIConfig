@@ -816,6 +816,7 @@ with api.build_kaggle_client() as client:
     for key in clean_changes:
         name = names.get(key, key)
         setattr(settings, name, getattr(patch, name))
+    update = ApiUpdateDatasetMetadataRequest()
     update.owner_slug, update.dataset_slug = request.owner_slug, request.dataset_slug
     update.settings = settings
     result = client.datasets.dataset_api_client.update_dataset_metadata(update)
