@@ -582,8 +582,9 @@ async def create_model(path: str) -> str:
 
 
 @app.tool()
-async def edit_model(path: str, variation: bool = False) -> str:
-    """Publish a complete local model-metadata.json or model-instance-metadata.json.
+async def edit_model(path: str, variation: bool = False, changes: dict[str, Any] | None = None) -> str:
+    """Publish a complete local model-metadata.json or model-instance-metadata.json,
+    or apply in-place changes (title, subtitle, description, isPrivate) to a model directly.
     Pull existing metadata with Kaggle models get before editing to preserve settings.
     Model cards describe research; variation metadata supplies usage and licensing.
     Does not upload weights or run notebooks.
@@ -591,9 +592,16 @@ async def edit_model(path: str, variation: bool = False) -> str:
     folder = Path(path)
     if not folder.is_absolute():
         folder = get_workspace_root() / folder
+    if changes:
+        meta_file = folder / ("model-instance-metadata.json" if variation else "model-metadata.json")
+        if meta_file.exists():
+            data = json.loads(meta_file.read_text())
+        else:
+            data = {}
+        data.update(changes)
+        meta_file.write_text(json.dumps(data, indent=2))
     return await _query_kaggle(["models", *(["instances"] if variation else []),
                                 "update", "-p", str(folder)])
-
 
 @app.tool()
 async def push_model(path: str, variation: str | None = None, version_notes: str = "",
@@ -3169,11 +3177,13 @@ def parse_args() -> argparse.Namespace:
     download.add_argument("dataset")
     download.add_argument("--options", default="{}", help="JSON download options")
     # build-dataset
-    p_build = subparsers.add_parser("build-dataset", help="Package multiple files/directories into a ZIP and upload dataset")
-    p_build.add_argument("sources", nargs="+", help="Files and/or directories to include in dataset archive")
-    p_build.add_argument("--slug", required=True, help="Dataset slug")
-    p_build.add_argument("--title", help="Dataset title")
-    p_build.add_argument("--public", action="store_true", help="Make dataset public (default is private)")
+    p_edit_model = subparsers.add_parser("edit-model", help="Edit model metadata and publish model card updates")
+    p_edit_model.add_argument("path", help="Folder containing model-metadata.json or model directory")
+    p_edit_model.add_argument("--variation", action="store_true", help="Update variation instance metadata instead of parent model")
+    p_edit_model.add_argument("--changes", help="JSON string of updates (title, subtitle, description, isPrivate)")
+    edit_dataset = subparsers.add_parser("edit-dataset", help="Edit dataset metadata and visibility without uploading files")
+    edit_dataset.add_argument("dataset")
+    edit_dataset.add_argument("--changes", required=True, help='JSON fields, including isPrivate true or false')
     p_build.add_argument("--no-upload", action="store_true", help="Build ZIP staging locally without uploading")
     p_build.add_argument("--zip-name", help="Archive file name inside dataset (default: <slug>.zip)")
     p_build.add_argument("--notes", help="Version notes")
@@ -3221,9 +3231,11 @@ def main() -> None:
         cmd = args.command
         if cmd == "quota":
             _print_result(asyncio.run(get_quota()))
+        elif cmd == "edit-model":
+            changes = json.loads(args.changes) if args.changes else None
+            _print_result(asyncio.run(edit_model(args.path, variation=args.variation, changes=changes)))
         elif cmd == "edit-dataset":
             _print_result(asyncio.run(update_dataset_metadata(args.dataset, json.loads(args.changes))))
-        elif cmd == "view-dataset":
             _print_result(asyncio.run(read_metadata(args.dataset, "datasets")))
         elif cmd == "status":
             fetch_logs = args.logs or bool(args.grep)
