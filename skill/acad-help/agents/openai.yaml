@@ -1,0 +1,4 @@
+interface:
+  display_name: "Acad Help"
+  short_description: "Research-grounded syllabus-aligned academic advice"
+  default_prompt: "Use $acad-help to review my work against the relevant syllabus and recommend concrete improvements."

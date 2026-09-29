@@ -1,0 +1,66 @@
+modelRoles:
+  smol: v-rail/gpt-6-luna:auto
+  slow: v-rail/gpt-5.6-sol
+  designer: v-rail/claude-opus-5
+  web: openai-codex/gpt-5.6-luna
+  tiny: v-rail/gpt-6-luna
+  task: v-rail/gemini-3.8-flash-high:auto
+  default: v-rail/gemini-3.8-flash-high
+disabledProviders:
+  - claude
+symbolPreset: unicode
+composer:
+  shape: claude
+theme:
+  dark: titanium
+  light: light
+setupVersion: 2
+steeringMode: all
+followUpMode: all
+statusLine:
+  preset: nerd
+  compactThinkingLevel: false
+interruptMode: wait
+tools:
+  approvalMode: yolo
+display:
+  showTokenUsage: true
+extendedContext: false
+compaction:
+  thresholdPercent: -1
+  thresholdTokens: 200000
+  idleEnabled: true
+dev:
+  autoqaConsent: granted
+defaultThinkingLevel: auto
+hideThinkingBlock: true
+retry:
+  fallbackChains:
+    web:
+      - web/parallel
+      - web/perplexity
+      - google/gemini-2.5-flash
+      - google-antigravity/gemini-2.5-flash
+      - anthropic/claude-haiku-4-5
+      - openai-codex/gpt-5.6
+      - openai-codex/gpt-5.5
+      - xai/grok-4.5
+      - xai-oauth/grok-4.5
+      - web/zai
+      - web/exa
+      - web/tinyfish
+      - web/jina
+      - web/kagi
+      - web/tavily
+      - web/firecrawl
+      - web/brave
+      - web/kimi
+      - web/synthetic
+      - web/ollama
+      - web/searxng
+      - web/startpage
+      - web/duckduckgo
+      - web/ecosia
+      - web/google
+      - web/mojeek
+      - web/public

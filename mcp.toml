@@ -1,0 +1,59 @@
+# Portable MCP catalog for the setup menu.
+#
+# The web entry is a single local FastMCP server. Its editable runtime
+# configuration is created in CODEX_HOME when the server is installed; no API
+# keys are stored in this repository or in the Codex MCP command.
+
+[mcp.web]
+label = "general web search tool. use for up-to-date information"
+category = "search"
+description = "general web search tool. use for up-to-date information"
+transport = "stdio"
+command = "uv"
+args = ["run", "--script", "{REPO_ROOT}/mcp/web_search_mcp.py", "--config", "{CODEX_HOME}/web.toml"]
+config_template = "mcp/web-search-mcp.toml"
+config_path = "{CODEX_HOME}/web.toml"
+
+[[mcp.web.providers]]
+label = "Brave"
+kind = "api_key"
+config_table = "providers.brave"
+config_key = "api_keys"
+
+[[mcp.web.providers]]
+label = "DuckDuckGo"
+kind = "toggle"
+config_table = "providers.duckduckgo"
+config_key = "enabled"
+
+[[mcp.web.providers]]
+label = "Codex standalone"
+kind = "api_key"
+config_table = "providers.codex_standalone"
+config_key = "api_keys"
+
+[[mcp.web.providers]]
+label = "Tavily"
+kind = "api_key"
+config_table = "providers.tavily"
+config_key = "api_keys"
+
+[mcp.android]
+label = "Android"
+category = "automation"
+description = "Compact phone screens, Unicode input and batched actions over ADB / UiAutomator"
+transport = "stdio"
+command = "uv"
+args = ["run", "--script", "{REPO_ROOT}/mcp/android_mcp.py", "--config", "{CODEX_HOME}/android.toml"]
+config_template = "mcp/android-mcp.toml"
+config_path = "{CODEX_HOME}/android.toml"
+
+[mcp.kaggle]
+label = "Kaggle"
+category = "machine-learning"
+description = "Manage Kaggle notebooks, push/run code, upload/download datasets, and fetch compressed run outputs"
+transport = "stdio"
+command = "uv"
+args = ["run", "--script", "{REPO_ROOT}/mcp/kaggle_mcp.py", "--config", "{CODEX_HOME}/kaggle.toml"]
+config_template = "mcp/kaggle-mcp.toml"
+config_path = "{CODEX_HOME}/kaggle.toml"

@@ -1,0 +1,8 @@
+app.message.followUp:
+- Tab
+- Ctrl+Enter
+- Ctrl+Q
+app.model.select: Ctrl+Alt+M
+app.model.selectTemporary:
+- Alt+M
+- Alt+P

@@ -1,0 +1,29 @@
+# API keys are deliberately kept in this machine-local file, not in mcp.toml
+# or the agent command. Add multiple keys to rotate through them in order.
+
+[search]
+brave_cooldown_seconds = 1.0
+# Avoid repeatedly hitting DuckDuckGo after bot detection, a 429, or an empty
+# result response. Requests skip DuckDuckGo during this cooldown.
+duckduckgo_cooldown_seconds = 60.0
+request_timeout_seconds = 30
+
+[providers.brave]
+command = "npx"
+args = ["-y", "@brave/brave-search-mcp-server@2.1.0"]
+api_keys = []
+
+[providers.duckduckgo]
+enabled = true
+command = "uvx"
+args = ["duckduckgo-mcp-server==0.6.1"]
+
+[providers.codex_standalone]
+api_keys = []
+base_url = "https://litellm.v-rail.org/v1"
+# Leave empty so the backend picks its own default model (future-proofing).
+model = ""
+
+[providers.tavily]
+api_keys = []
+endpoint = "https://mcp.tavily.com/mcp/"

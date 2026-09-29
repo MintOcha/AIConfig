@@ -1,0 +1,14 @@
+# Skill groups for the setup menu.
+#
+# Skill directories are discovered automatically from skill/*/SKILL.md.
+# Use "*" to include every discovered skill in a group.
+
+[groups.essential]
+label = "Install essential"
+description = "The small default set"
+skills = ["design"]
+
+[groups.all]
+label = "Install all"
+description = "Every discovered skill"
+skills = ["*"]

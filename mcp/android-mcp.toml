@@ -1,0 +1,7 @@
+# Empty selects the sole authorized device; otherwise use a full serial or unique prefix.
+# ANDROID_SERIAL is used when this value is empty.
+serial = ""
+# Maximum screen text per observation; screenshots are opt-in.
+output_chars = 12000
+# Implicit element wait; explicit wait actions can use a different deadline.
+wait_timeout = 3.0
