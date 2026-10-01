@@ -4,7 +4,7 @@ modelRoles:
   designer: v-rail/claude-opus-5
   web: openai-codex/gpt-5.6-luna
   tiny: v-rail/gpt-6-luna
-  task: v-rail/gemini-3.8-flash-high:auto
+  task: v-rail/gpt-6.1-sol
   default: v-rail/gemini-3.8-flash-high
 disabledProviders:
   - claude
