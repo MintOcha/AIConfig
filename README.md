@@ -43,8 +43,9 @@ Use `./scripts/install.py --dry-run` to exercise the menus without changing
 agent configuration.
 
 Use `./scripts/install.py --omp` to configure OMP. The menu can apply tracked
-files from `config/omp/` to `~/.omp/agent`, copy existing `~/.omp/agent` configs
-back into `config/omp/`, or configure MCPs. You can also run
+files from `config/omp/` to `~/.omp/agent`, or copy existing `~/.omp/agent`
+configs back into `config/omp/`. The sync action always reads OMP settings,
+regardless of the currently selected install target. You can also run
 `./scripts/sync-omp-config.py` directly to capture allowlisted OMP settings
 (`config.yml` and keybinding files) into `config/omp/`. The sync tool excludes
 model credentials, MCP configuration, databases, sessions, history, caches, and

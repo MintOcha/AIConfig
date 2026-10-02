@@ -599,7 +599,7 @@ OMP_VRAIL_COMPAT = {
 }
 
 
-def manage_omp_configs(target_home: Path, dry_run: bool) -> None:
+def manage_omp_configs(h_id: str, target_home: Path, dry_run: bool) -> None:
     omp_dir = REPO_ROOT / "config" / "omp"
     print(f"\n{BOLD}{BLUE}OMP Tracked Settings (config/omp):{RESET}")
     print(" 1) Apply tracked OMP settings (all model roles, preferences, keybindings)")
@@ -614,7 +614,8 @@ def manage_omp_configs(target_home: Path, dry_run: bool) -> None:
     if opt == "1":
         _apply_omp_settings(omp_dir, target_home, dry_run)
     elif opt == "2":
-        _sync_omp_settings(target_home, omp_dir, dry_run)
+        source = target_home if h_id == "omp" else HOME / ".omp" / "agent"
+        _sync_omp_settings(source, omp_dir, dry_run)
 
 
 def _apply_omp_provider_settings(target_home: Path, dry_run: bool) -> None:
@@ -1012,7 +1013,7 @@ def main() -> None:
         elif choice == "3":
             install_skills(h_id, target_home, args.dry_run)
         elif choice == "4":
-            manage_omp_configs(target_home, args.dry_run)
+            manage_omp_configs(h_id, target_home, args.dry_run)
         elif choice == "5":
             setup_models_and_provider(h_id, target_home, args.dry_run)
         elif choice == "6":
