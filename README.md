@@ -53,8 +53,11 @@ secret-like keys.
 
 The installer's **Configure Models & Auth** action generates OMP's credential-bearing
 `models.yml` locally, including provider-wide `v-rail` reasoning-effort forwarding.
-No per-model overrides are needed. Configure models first, then apply tracked OMP
-settings to restore your saved preferences and keybindings.
+**OMP / Tracked Configs → Apply tracked settings** also merges those compatibility
+flags into an existing `v-rail` provider, preserving credentials, other providers,
+and unrelated model settings. This merge requires PyYAML; no per-model list is needed.
+On a fresh machine, configure models first, then apply tracked OMP settings to
+restore your saved preferences and keybindings. Restart existing OMP sessions afterward.
 
 Use `./scripts/install.py --freebuff` to install into Freebuff. MCPs are merged
 into `~/.agents/mcp.json`, skills are linked under `~/.agents/skills`, and the

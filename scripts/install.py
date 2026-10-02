@@ -593,6 +593,10 @@ SENSITIVE_KEY_RE = re.compile(
     r"client[_-]?secret|password|credential|secret)(?:[^a-z0-9]|$)"
 )
 SETTINGS_FILES = ("config.yml", "keybindings.yml", "keybindings.json")
+OMP_VRAIL_COMPAT = {
+    "supportsReasoningEffort": True,
+    "omitReasoningEffort": False,
+}
 
 
 def manage_omp_configs(target_home: Path, dry_run: bool) -> None:
@@ -613,10 +617,38 @@ def manage_omp_configs(target_home: Path, dry_run: bool) -> None:
         _sync_omp_settings(target_home, omp_dir, dry_run)
 
 
+def _apply_omp_provider_settings(target_home: Path, dry_run: bool) -> None:
+    path = target_home / "models.yml"
+    if not path.is_file():
+        warning("No models.yml found; use Configure Models & Auth to set up v-rail.")
+        return
+    if yaml is None:
+        raise RuntimeError("PyYAML is required to safely update existing models.yml")
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("providers"), dict):
+        raise ValueError(f"Invalid provider configuration in {path}; file left unchanged")
+    provider = data["providers"].get("v-rail")
+    if provider is None:
+        warning("No v-rail provider found; use Configure Models & Auth to set it up.")
+        return
+    if not isinstance(provider, dict) or not isinstance(provider.get("compat", {}), dict):
+        raise ValueError(f"Invalid v-rail configuration in {path}; file left unchanged")
+    compat = provider.setdefault("compat", {})
+    if all(compat.get(key) == value for key, value in OMP_VRAIL_COMPAT.items()):
+        return
+    if dry_run:
+        print(f"Dry run: would apply v-rail reasoning compatibility to {path}")
+        return
+    compat.update(OMP_VRAIL_COMPAT)
+    write_yaml(path, data)
+
+
 def _apply_omp_settings(src_dir: Path, dst_dir: Path, dry_run: bool) -> None:
     if not src_dir.is_dir():
         failure(f"Tracked settings directory not found: {src_dir}")
         return
+
+    _apply_omp_provider_settings(dst_dir, dry_run)
 
     for fname in SETTINGS_FILES:
         src = src_dir / fname
@@ -808,10 +840,7 @@ def _setup_omp_provider(target_home: Path, api_key: str, models: list[str]) -> N
                 "apiKey": api_key,
                 "authHeader": True,
                 "discovery": {"type": "openai-models-list"},
-                "compat": {
-                    "supportsReasoningEffort": True,
-                    "omitReasoningEffort": False,
-                },
+                "compat": dict(OMP_VRAIL_COMPAT),
             },
             "openai-codex": {
                 "baseUrl": f"{BASE_URL}/v1",
