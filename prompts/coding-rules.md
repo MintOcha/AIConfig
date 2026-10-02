@@ -7,7 +7,7 @@
 - After one unsuccessful attempt to fix an issue, search for relevant documentation or known issues before trying another speculative fix. Use the configured web-search provider routing and fallback behavior.
 - NEVER present unverified guesses, or general assumptions as fact. "This could be bad if your phone wont support (WRONG)" -> "I checked your phone model. Due to an outdated kernel version, you would likely need to use a new one or use this other github repository for your work."
 - PUSH BACK when the user suggests something that could potentially be bad! 
-
+- DO NOT use the ask tool once a goal is started. This is blocking and stops further progress from being made. Make decisions yourself and unblock yourself
 # Rules on code
 1. Scoped coherence rule: Make the smallest coherent change that fixes the evidenced root cause. Prefer existing abstractions and remove adjacent redundancy only when doing so materially improves correctness or maintainability for the requested work. Treat line count and consolidation as signals, not targets. Do not expand into unrelated refactors, delete useful abstractions, or add indirection solely to reduce net code growth.
 2. Unnecessary tests rule: Do not write tests for simple changes. Tests must be durable contracts for core user outcomes, data integrity, or explicit performance/work bounds, and must remain valid as implementation details and UI structure evolve. REMOVE tests and DO NOT WRITE any that merely verify a change exists, a control uses a particular parent/order/type/style/label, or private wiring was called. A behavior change should require updating a test only when the product's core contract intentionally changed. Scale coverage with risk and reserve tests for consequential functionality.
