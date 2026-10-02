@@ -602,7 +602,7 @@ OMP_VRAIL_COMPAT = {
 def manage_omp_configs(target_home: Path, dry_run: bool) -> None:
     omp_dir = REPO_ROOT / "config" / "omp"
     print(f"\n{BOLD}{BLUE}OMP Tracked Settings (config/omp):{RESET}")
-    print(" 1) Apply tracked settings to ~/.omp/agent/ (Restore config.yml, keybindings)")
+    print(" 1) Apply tracked OMP settings (all model roles, preferences, keybindings)")
     print(" 2) Copy existing ~/.omp/agent/ settings into config/omp/ (Sync repository)")
     print(" b) Back")
 
@@ -854,11 +854,9 @@ def _setup_omp_provider(target_home: Path, api_key: str, models: list[str]) -> N
     config_path = target_home / "config.yml"
     config_data = read_yaml(config_path) if config_path.is_file() else {}
     roles = config_data.setdefault("modelRoles", {})
-    preferred = "v-rail/gemini-3.7-flash-high:medium" if any("gemini-3.7-flash-high" in m for m in models) else f"v-rail/{models[0]}"
-    roles["default"] = preferred
-    roles["advisor"] = "v-rail/gemini-3.7-flash-high"
-    roles["smol"] = "v-rail/gemini-3.7-flash-high"
-    roles["task"] = "v-rail/gpt-5.6-sol"
+    tracked_config = read_yaml(REPO_ROOT / "config" / "omp" / "config.yml")
+    for role, model in tracked_config.get("modelRoles", {}).items():
+        roles.setdefault(role, model)
 
     config_data["steeringMode"] = "all"
     config_data["followUpMode"] = "all"

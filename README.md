@@ -51,6 +51,11 @@ model credentials, MCP configuration, databases, sessions, history, caches, and
 other transient state; it also refuses allowlisted files that contain
 secret-like keys.
 
+Option **4 → 1** applies the complete tracked `config.yml`, including default,
+task, smol, slow, designer, web, and tiny model roles, plus preferences and
+keybindings. **Configure Models & Auth** uses these tracked roles as defaults
+without replacing existing role selections; there is no separate hardcoded role list.
+
 The installer's **Configure Models & Auth** action generates OMP's credential-bearing
 `models.yml` locally, including provider-wide `v-rail` reasoning-effort forwarding.
 **OMP / Tracked Configs → Apply tracked settings** also merges those compatibility
