@@ -18,7 +18,8 @@ OPENCODE_BASE_URL = "https://opencode.ai/zen/go/v1"
 CLI_PROXY_CONTAINER = "cli-proxy-api"
 POSTGRES_CONTAINER = "cliproxyapi-postgres"
 DASHBOARD_CONTAINER = "cliproxyapi-dashboard"
-
+USAGE_COLLECTOR_CONTAINER = "cliproxyapi-usage-collector"
+DASHBOARD_LOCAL_URL = "http://127.0.0.1:6868"
 
 def fetch_models() -> list[str]:
     request = Request(
@@ -89,6 +90,38 @@ def update_config(config_path: Path, model_ids: list[str]) -> int:
     temp_path.chmod(config_path.stat().st_mode)
     temp_path.replace(config_path)
     return updates
+
+def trigger_usage_collection(dashboard_dir: Path | None) -> bool:
+    if not dashboard_dir:
+        return False
+    collector_key = None
+    for env_name in (".env.production", ".env"):
+        env_file = dashboard_dir / env_name
+        if env_file.is_file():
+            for line in env_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = line.strip()
+                if line.startswith("COLLECTOR_API_KEY="):
+                    collector_key = line.split("=", 1)[1].strip().strip("'\"")
+                    break
+        if collector_key:
+            break
+    if not collector_key:
+        return False
+
+    request = Request(
+        f"{DASHBOARD_LOCAL_URL}/api/usage/collect",
+        data=b"",
+        headers={
+            "Authorization": f"Bearer {collector_key}",
+            "User-Agent": "CLIProxyAPI-update-server/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=10) as response:
+            return response.status == 200
+    except Exception:
+        return False
 
 
 def run_recent_errors(project_dir: Path) -> None:
@@ -220,8 +253,7 @@ def update_dashboard(dashboard_dir: Path) -> tuple[str, str]:
     before_version = deployed_version(dashboard_dir, compose_file, "dashboard")
     print("=== Updating Dashboard ===", flush=True)
     compose_command(dashboard_dir, compose_file, "pull", "dashboard")
-    compose_command(dashboard_dir, compose_file, "up", "-d", "dashboard")
-    after_version = deployed_version(dashboard_dir, compose_file, "dashboard")
+    compose_command(dashboard_dir, compose_file, "up", "-d")
     return before_version, after_version
 
 
@@ -230,11 +262,15 @@ def restart_stacks(project_dir: Path) -> None:
     compose_command(project_dir, None, "up", "-d")
 
 
-def verify_containers_running(include_dashboard: bool = True) -> None:
+def verify_containers_running(include_dashboard: bool = True, dashboard_dir: Path | None = None) -> None:
     running = running_container_names()
     required = [CLI_PROXY_CONTAINER, POSTGRES_CONTAINER]
     if include_dashboard:
         required.append(DASHBOARD_CONTAINER)
+        compose_file = resolve_compose_file(dashboard_dir) if dashboard_dir else None
+        if compose_file and compose_file.is_file():
+            if "usage-collector" in compose_file.read_text(encoding="utf-8", errors="ignore"):
+                required.append(USAGE_COLLECTOR_CONTAINER)
     missing = [name for name in required if name not in running]
     if missing:
         raise RuntimeError(f"container(s) not running after update: {', '.join(missing)}")
@@ -285,6 +321,8 @@ def main() -> int:
     dashboard_after = "unknown"
 
     try:
+        if dashboard_dir:
+            trigger_usage_collection(dashboard_dir)
         run_recent_errors(project_dir)
         model_ids = fetch_models()
         updated_providers = update_config(config_path, model_ids)
@@ -305,7 +343,10 @@ def main() -> int:
             else:
                 print("Dashboard directory not found; skipping Dashboard update.", flush=True)
 
-        verify_containers_running(include_dashboard=dashboard_dir is not None and not args.no_restart)
+        verify_containers_running(
+            include_dashboard=dashboard_dir is not None and not args.no_restart,
+            dashboard_dir=dashboard_dir,
+        )
     except (OSError, subprocess.CalledProcessError, ValueError, RuntimeError) as error:
         print(f"Update failed: {error}", file=sys.stderr)
         return 1
