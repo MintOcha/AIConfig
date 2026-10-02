@@ -808,6 +808,10 @@ def _setup_omp_provider(target_home: Path, api_key: str, models: list[str]) -> N
                 "apiKey": api_key,
                 "authHeader": True,
                 "discovery": {"type": "openai-models-list"},
+                "compat": {
+                    "supportsReasoningEffort": True,
+                    "omitReasoningEffort": False,
+                },
             },
             "openai-codex": {
                 "baseUrl": f"{BASE_URL}/v1",

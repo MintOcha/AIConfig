@@ -51,6 +51,11 @@ model credentials, MCP configuration, databases, sessions, history, caches, and
 other transient state; it also refuses allowlisted files that contain
 secret-like keys.
 
+The installer's **Configure Models & Auth** action generates OMP's credential-bearing
+`models.yml` locally, including provider-wide `v-rail` reasoning-effort forwarding.
+No per-model overrides are needed. Configure models first, then apply tracked OMP
+settings to restore your saved preferences and keybindings.
+
 Use `./scripts/install.py --freebuff` to install into Freebuff. MCPs are merged
 into `~/.agents/mcp.json`, skills are linked under `~/.agents/skills`, and the
 selected prompt is inlined into `~/.AGENTS.md`. Freebuff reads user knowledge

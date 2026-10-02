@@ -64,3 +64,5 @@ retry:
       - web/google
       - web/mojeek
       - web/public
+find:
+  enabled: "off"
