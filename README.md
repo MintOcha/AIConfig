@@ -99,10 +99,11 @@ preview every operation without changing the target.
 
 The search entry installs one local FastMCP server, `web`, run by `uv`
 from this repository. Its machine-local configuration is created under the
-selected agent home. Setup opens a provider menu for Brave, DuckDuckGo, Codex
-standalone search, and Tavily. Selecting a keyed provider requests its key
-through hidden input; configured providers receive a green checkmark.
-DuckDuckGo is disabled by default and its menu item toggles it directly. The
+Setup opens a provider menu for Brave, DuckDuckGo, Codex
+standalone search, and Tavily. Codex standalone setup offers to reuse an existing
+v-rail API key detected from installed agent configs (OMP, Claude Code, or Codex)
+or accept a manual key. Selecting other keyed providers requests their key
+through input; configured providers receive a green checkmark.
 menu also offers to edit the complete configuration in Vim before installing.
 No keys are placed in `mcp.toml` or in an agent command.
 OMP exposes the explicit `web.web-search`, `web.fetch`, and `web.research`

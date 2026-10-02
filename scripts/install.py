@@ -154,6 +154,28 @@ def read_toml(path: Path | str) -> dict:
     return tomllib.loads(p.read_text(encoding="utf-8"))
 
 
+def find_existing_api_key() -> tuple[str | None, str | None]:
+    candidates = [
+        (HOME / ".claude" / "settings.json", lambda d: d.get("env", {}).get("ANTHROPIC_AUTH_TOKEN") if d.get("env", {}).get("ANTHROPIC_BASE_URL") == BASE_URL else None),
+        (HOME / ".omp" / "agent" / "models.yml", lambda d: next((p.get("apiKey") for p in d.get("providers", {}).values() if str(p.get("baseUrl", "")).startswith(BASE_URL) and p.get("apiKey")), None) if yaml else None),
+        (HOME / ".config" / "opencode" / "opencode.json", lambda d: next((p.get("options", {}).get("apiKey") for p in d.get("provider", {}).values() if str(p.get("options", {}).get("baseURL", "")).startswith(BASE_URL) and p.get("options", {}).get("apiKey")), None)),
+        (HOME / ".local" / "share" / "kilo" / "auth.json", lambda d: d.get("cliproxyapi", {}).get("key")),
+        (HOME / ".codex" / "auth.json", lambda d: d.get("OPENAI_API_KEY")),
+    ]
+    for path, extractor in candidates:
+        if path.is_file():
+            try:
+                if path.suffix in (".yaml", ".yml"):
+                    data = read_yaml(path)
+                else:
+                    data = read_json(path)
+                key = extractor(data)
+                if key:
+                    return key, str(path)
+            except Exception:
+                pass
+    return None, None
+
 # ---------------------------------------------------------------------------
 # Header and Interactive Selection
 # ---------------------------------------------------------------------------
@@ -288,6 +310,8 @@ def configure_mcp_providers(server_id: str, server: dict, config_path: Path | No
 
             if kind == "toggle":
                 _toggle_toml_bool(config_path, table, key)
+            elif table == "providers.codex_standalone":
+                _configure_codex_standalone_provider(config_path)
             else:
                 try:
                     secret = input(f"Enter {label} (API key): ").strip()
@@ -344,6 +368,59 @@ def _set_toml_list_key(path: Path, table: str, key: str, value: str) -> None:
             lines.insert(start + 1, rep)
 
     path.write_text("".join(lines), encoding="utf-8")
+
+def _set_toml_str_key(path: Path, table: str, key: str, value: str) -> None:
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    header = f"[{table}]"
+    rep = f"{key} = {json.dumps(value)}\n"
+    try:
+        start = next(i for i, l in enumerate(lines) if l.strip() == header)
+    except StopIteration:
+        lines.append(f"\n{header}\n{rep}")
+    else:
+        end = next((i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("[")), len(lines))
+        pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+        for i in range(start + 1, end):
+            if pattern.match(lines[i]):
+                lines[i] = rep
+                break
+        else:
+            lines.insert(start + 1, rep)
+
+    path.write_text("".join(lines), encoding="utf-8")
+
+
+def _configure_codex_standalone_provider(config_path: Path) -> None:
+    print(f"\n{BOLD}Configure Codex standalone search provider:{RESET}")
+    print(" 1) v-rail (reuse existing API key from Claude, Codex, or OMP)")
+    print(" 2) Codex (enter API key manually)")
+    try:
+        opt = input("Select an option [1-2, default: 1]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+
+    if opt in ("", "1", "v-rail", "vrail"):
+        key, src = find_existing_api_key()
+        if key:
+            print(f"Reusing v-rail API key from {src}")
+            secret = key
+        else:
+            try:
+                secret = input("Enter v-rail API key: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return
+        if secret:
+            _set_toml_list_key(config_path, "providers.codex_standalone", "api_keys", secret)
+            _set_toml_str_key(config_path, "providers.codex_standalone", "base_url", f"{BASE_URL}/v1")
+            success("Configured Codex standalone search using v-rail")
+    elif opt in ("2", "codex"):
+        try:
+            secret = input("Enter Codex API key: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if secret:
+            _set_toml_list_key(config_path, "providers.codex_standalone", "api_keys", secret)
+            success("Updated Codex standalone API key")
 
 
 def install_mcps(h_id: str, target_home: Path, dry_run: bool) -> None:
@@ -758,28 +835,6 @@ def detect_standalone_web_search(api_key: str, models: list[str]) -> bool:
     except Exception:
         return False
 
-
-def find_existing_api_key() -> tuple[str | None, str | None]:
-    candidates = [
-        (HOME / ".claude" / "settings.json", lambda d: d.get("env", {}).get("ANTHROPIC_AUTH_TOKEN") if d.get("env", {}).get("ANTHROPIC_BASE_URL") == BASE_URL else None),
-        (HOME / ".omp" / "agent" / "models.yml", lambda d: next((p.get("apiKey") for p in d.get("providers", {}).values() if str(p.get("baseUrl", "")).startswith(BASE_URL) and p.get("apiKey")), None) if yaml else None),
-        (HOME / ".config" / "opencode" / "opencode.json", lambda d: next((p.get("options", {}).get("apiKey") for p in d.get("provider", {}).values() if str(p.get("options", {}).get("baseURL", "")).startswith(BASE_URL) and p.get("options", {}).get("apiKey")), None)),
-        (HOME / ".local" / "share" / "kilo" / "auth.json", lambda d: d.get("cliproxyapi", {}).get("key")),
-        (HOME / ".codex" / "auth.json", lambda d: d.get("OPENAI_API_KEY")),
-    ]
-    for path, extractor in candidates:
-        if path.is_file():
-            try:
-                if path.suffix in (".yaml", ".yml"):
-                    data = read_yaml(path)
-                else:
-                    data = read_json(path)
-                key = extractor(data)
-                if key:
-                    return key, str(path)
-            except Exception:
-                pass
-    return None, None
 
 
 def setup_models_and_provider(h_id: str, target_home: Path, dry_run: bool) -> None:
