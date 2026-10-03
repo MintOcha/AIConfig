@@ -28,7 +28,7 @@ display:
 extendedContext: false
 compaction:
   thresholdPercent: -1
-  thresholdTokens: 200000
+  thresholdTokens: 270000
   idleEnabled: true
 dev:
   autoqaConsent: granted
