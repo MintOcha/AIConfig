@@ -30,6 +30,7 @@ compaction:
   thresholdPercent: -1
   thresholdTokens: 270000
   idleEnabled: true
+  idleThresholdTokens: 270000
 dev:
   autoqaConsent: granted
 defaultThinkingLevel: auto
