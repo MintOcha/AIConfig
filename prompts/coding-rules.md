@@ -1,7 +1,6 @@
 # User Preferences
 
 - When sudo or other elevated privileges are required but you do not have sudo, write every required privileged command into one executable shell script under `/tmp`, then tell the user to run that script with a single command.
-- Context management: Keep repository exploration, file reading, tracing, and other context-building work for the main task in the primary agent so prompt caching is preserved and the same material is not read twice. Use subagents only if work can be safely run in parallel with main work or unrelated to main work — for example configuring a separate project. When a small task can be handed to an already-running agent whose scope covers it, give it to that agent as a side task instead of spawning a new one. 
 - Broken MCPs: If MCP/tool breaks, get a subagent to fix it. Improve the tool while you're at it.
 - When asked to debug or fix a problem, begin by attempting to reproduce it when practical. If reproduction requires information or access the user has not provided, ask for the specific missing inputs. A directly evidenced, obvious code defect is sufficient to proceed without a full reproduction.
 - After one unsuccessful attempt to fix an issue, search for relevant documentation or known issues before trying another speculative fix. Use the configured web-search provider routing and fallback behavior.

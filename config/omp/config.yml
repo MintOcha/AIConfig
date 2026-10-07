@@ -31,6 +31,7 @@ compaction:
   thresholdTokens: 270000
   idleEnabled: true
   idleThresholdTokens: 270000
+  experimentalContextManagement: true
 dev:
   autoqaConsent: granted
 defaultThinkingLevel: auto
