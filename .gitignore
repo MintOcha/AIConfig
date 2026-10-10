@@ -3,7 +3,6 @@ kaggle/
 .pytest_cache/
 .ruff_cache/
 *.pyc
-# ez-host secrets
-skill/ez-host/config.toml
-*.sxcu
+# skill secrets
+skill/*/config.toml
 config.toml

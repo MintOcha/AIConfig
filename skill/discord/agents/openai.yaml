@@ -1,0 +1,4 @@
+interface:
+  display_name: "Discord"
+  short_description: "Send messages and file attachments to a Discord webhook"
+  default_prompt: "Use $discord to send this message or file to my Discord webhook."

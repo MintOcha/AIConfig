@@ -65,7 +65,7 @@ def upload_file(file_path):
         headers={
             "key": api_key,
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "ShareX/17.0.0"
+            "User-Agent": "ezhost-cli/1.0"
         },
         method="POST"
     )
