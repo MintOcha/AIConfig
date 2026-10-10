@@ -1,18 +1,20 @@
 ---
 name: research-cleanup
-description: Use when archiving completed research phases, purging stale model checkpoints, temporary web data, logs, and intermediary artifacts, while preserving executable scripts and active checkpoints in RESEARCH_ARCHIVE.md.
+description: Destructive & lossy research workspace purifier. Use ONLY when the user explicitly requests cleanup/clean-up or this skill. Summarizes findings to RESEARCH_ARCHIVE.md, then permanently deletes obsolete checkpoints, web data, logs, and intermediary artifacts while preserving runnable scripts and active production checkpoints.
 ---
+# Research Workspace Cleanup & Archiving (Destructive & Lossy Purifier)
 
-# Research Workspace Cleanup & Archiving
+## Critical Operational Invariants
 
-## Purpose
+1. **Explicit Invocation Trigger**:
+   - **Trigger ONLY** when the user explicitly asks for "cleanup", "clean up", or specifically invokes this cleanup skill.
+   - **DO NOT TRIGGER** if the user merely says "archive", "summarize", or "save" without requesting workspace cleanup.
 
-Research projects accumulate dozens of gigabytes of intermediate model checkpoints, temporary web scrapes, raw cache dumps, and exploratory branch files. Without systematic consolidation, repositories become unmaintainable, slow to sync, and full of dead code.
-
-This skill defines the canonical protocol for distilling completed research initiatives into a permanent, structured `RESEARCH_ARCHIVE.md` while purging dead weight and retaining only what is strictly required for the current project to run as-is.
-
----
-
+2. **Destructive & Lossy by Design**:
+   - This skill is intentionally destructive and lossy.
+   - Files designated for removal **MUST be actually permanently deleted (`rm -rf`)**.
+   - **NEVER** move deleted files to a trash folder, backup directory, temporary staging cache, or another local path.
+   - **DO NOT HESITATE** to delete gigabytes of stale files once their findings/metrics are distilled into `RESEARCH_ARCHIVE.md`. The user has already authorized permanent removal by invoking this workflow.
 ## The Archival Contract
 
 ### 1. What to Archive & Purge
