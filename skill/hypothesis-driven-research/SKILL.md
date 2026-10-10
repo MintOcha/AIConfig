@@ -59,6 +59,12 @@ In the second case, report the identification boundary precisely: which explanat
 
 Finite empirical evidence does not provide absolute certainty. Never satisfy a demand for certainty by inventing a causal story. State the scope and assumptions of the explanation.
 
+## Reuse remote notebooks
+
+Before creating a Kaggle or Colab notebook, list the existing ones and adapt the closest match in place. A new diagnostic or inspection workflow starts from an existing notebook's data attachments, runtime, and verification gates, not from a new notebook.
+
+Alternative versions of the same test (different arm, depth, seed set, hyperparameter, or code revision) run as new versions of one notebook, parameterized in its inputs. Create a separate notebook only when the test is a different experiment, not a different setting of the same one. Keep per-version parameters recorded so results stay attributable to the version that produced them.
+
 ## Preserve evidence status
 
 Diagnostic reuse of inspected data may improve understanding, but it does not make those data untouched validation again. Keep discovery, diagnosis, confirmation, and prospective evidence distinct. A historically convincing explanation and a deployment-ready result are separate achievements.

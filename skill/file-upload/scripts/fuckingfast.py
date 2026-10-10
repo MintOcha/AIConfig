@@ -10,6 +10,10 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
+import secrets
+import shutil
+import subprocess
+import tempfile
 
 API = "https://fuckingfast.net/api"
 UPLOAD = "https://w.fuckingfast.net"
@@ -23,7 +27,10 @@ def credential(args: argparse.Namespace, required: bool = True) -> str | None:
 
 
 def request(method: str, url: str, account_id: str | None = None, data=None, content_type=None):
-    headers = {"Accept": "application/json, text/plain, */*"}
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    }
     if account_id:
         headers["Authorization"] = f"Bearer {account_id}"
     if content_type:
@@ -51,21 +58,53 @@ def upload(args: argparse.Namespace):
     path = Path(args.path).expanduser().resolve()
     if not path.is_file():
         raise SystemExit(f"File not found: {path}")
-    name = args.name or path.name
-    if len(name) > 500:
-        raise SystemExit("Remote file name exceeds 500 characters.")
-    account_id = credential(args, required=bool(args.parent_id))
-    prefix = f"/{quote(args.parent_id, safe='')}" if args.parent_id else ""
-    query = {}
-    if args.location_id:
-        query["locationId"] = args.location_id
-    if args.note is not None:
-        query["note"] = base64.b64encode(args.note.encode()).decode()
-    url = f"{UPLOAD}{prefix}/{quote(name, safe='')}"
-    if query:
-        url += "?" + urlencode(query)
-    content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
-    return request("PUT", url, account_id, path.read_bytes(), content_type)
+
+    encryption_password = None
+    temp_archive = None
+    upload_path = path
+
+    if getattr(args, "encrypt", False):
+        tool = shutil.which("7zz") or shutil.which("7z")
+        if not tool:
+            raise SystemExit("7-Zip (7zz or 7z) binary required for --encrypt.")
+        encryption_password = args.password or secrets.token_urlsafe(12)
+        temp_fd, temp_zip_str = tempfile.mkstemp(suffix=".zip")
+        os.close(temp_fd)
+        temp_archive = Path(temp_zip_str)
+        # remove empty temp file so 7zz can create the archive
+        temp_archive.unlink(missing_ok=True)
+        cmd = [tool, "a", f"-p{encryption_password}", str(temp_archive), str(path)]
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if res.returncode != 0:
+            temp_archive.unlink(missing_ok=True)
+            raise SystemExit(f"Archive encryption failed: {res.stderr.strip()}")
+        upload_path = temp_archive
+
+    try:
+        name = args.name or (f"{path.name}.zip" if getattr(args, "encrypt", False) else path.name)
+        if len(name) > 500:
+            raise SystemExit("Remote file name exceeds 500 characters.")
+        account_id = credential(args, required=bool(args.parent_id))
+        prefix = f"/{quote(args.parent_id, safe='')}" if args.parent_id else ""
+        query = {}
+        if args.location_id:
+            query["locationId"] = args.location_id
+        if args.note is not None:
+            query["note"] = base64.b64encode(args.note.encode()).decode()
+        url = f"{UPLOAD}{prefix}/{quote(name, safe='')}"
+        if query:
+            url += "?" + urlencode(query)
+        content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        resp = request("PUT", url, account_id, upload_path.read_bytes(), content_type)
+        if encryption_password:
+            if isinstance(resp, dict):
+                resp["encryptionPassword"] = encryption_password
+            else:
+                resp = f"{resp}\nEncryption Password: {encryption_password}"
+        return resp
+    finally:
+        if temp_archive and temp_archive.exists():
+            temp_archive.unlink(missing_ok=True)
 
 
 def main() -> None:
@@ -79,6 +118,8 @@ def main() -> None:
     p.add_argument("--parent-id")
     p.add_argument("--location-id")
     p.add_argument("--note")
+    p.add_argument("--encrypt", action="store_true", help="Encrypt file into password-protected zip using 7-Zip before uploading")
+    p.add_argument("--password", help="Password for encryption (auto-generated if omitted)")
 
     subs.add_parser("locations")
     subs.add_parser("account")

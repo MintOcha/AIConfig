@@ -1,0 +1,3 @@
+[ezhost]
+api_url = "https://api.e-z.host/files"
+key = "YOUR_API_KEY_HERE"

@@ -1,0 +1,4 @@
+interface:
+  display_name: "File Upload"
+  short_description: "Upload images, SVGs, documents, and archives via E-Z.Host or FuckingFast"
+  default_prompt: "Use $file-upload to upload this file and return its hosted link."

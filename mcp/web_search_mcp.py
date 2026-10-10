@@ -4,12 +4,14 @@
 # dependencies = [
 #   "fastmcp==3.4.5",
 #   "httpx==0.28.1",
+#   "yfinance==1.2.0",
 # ]
 # ///
 
 import argparse
 import asyncio
 import json
+import math
 import re
 import time
 import uuid
@@ -21,6 +23,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+import yfinance as yf
 import tomllib
 from fastmcp import Client, FastMCP
 from fastmcp.client.transports import StdioTransport
@@ -815,6 +818,189 @@ mcp = FastMCP(
     ),
 )
 router: SearchRouter | None = None
+
+
+# Market code -> Yahoo Finance suffix. An empty suffix means no suffix (US listings).
+_MARKET_SUFFIXES: dict[str, str] = {
+    "US": "", "NYSE": "", "NASDAQ": "", "NYQ": "", "NMS": "",
+    "TW": ".TW", "TPE": ".TW", "TWSE": ".TW", "TAIWAN": ".TW",
+    "TWO": ".TWO", "TPEX": ".TWO",
+    "HK": ".HK", "HKEX": ".HK",
+    "JP": ".T", "TSE": ".T", "TYO": ".T",
+    "UK": ".L", "GB": ".L", "LSE": ".L",
+    "KR": ".KS", "KRX": ".KS", "KOSPI": ".KS", "KOSDAQ": ".KQ",
+    "CN": ".SS", "SSE": ".SS", "SZSE": ".SZ",
+    "SG": ".SI", "SGX": ".SI",
+    "DE": ".DE", "XETRA": ".DE",
+    "FR": ".PA", "EPA": ".PA",
+    "CA": ".TO", "TSX": ".TO",
+    "AU": ".AX", "ASX": ".AX",
+    "IN": ".NS", "NSE": ".NS", "BSE": ".BO",
+}
+_NO_BACKEND_RESPONSE = "Found no tool response"
+
+
+def normalize_yahoo_symbol(ticker: str, asset_type: str, market: str | None) -> str:
+    """Map a user ticker plus optional market code to a Yahoo Finance symbol."""
+    symbol = ticker.strip().upper()
+    if not symbol:
+        raise ValueError("ticker must not be empty")
+    if market:
+        code = market.strip().upper()
+        if code not in _MARKET_SUFFIXES:
+            raise ValueError(
+                f"unsupported market '{market}'; supported codes: {', '.join(sorted(_MARKET_SUFFIXES))}"
+            )
+        suffix = _MARKET_SUFFIXES[code]
+        if suffix:
+            if symbol.endswith(suffix):
+                return symbol
+            if "." in symbol:
+                raise ValueError(f"ticker '{ticker}' conflicts with market '{market}'")
+            return symbol + suffix
+    if asset_type.strip().lower() == "crypto" and "-" not in symbol:
+        return f"{symbol}-USD"
+    return symbol
+
+
+def _non_nan(value: Any) -> Any:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    return value
+
+
+def _latest_statement_value(frame: Any, *rows: str) -> tuple[str, float] | None:
+    if frame is None or frame.empty:
+        return None
+    for row in rows:
+        if row not in frame.index:
+            continue
+        series = frame.loc[row].dropna()
+        if not series.empty:
+            return str(series.index[0])[:10], float(series.iloc[0])
+    return None
+
+
+def _fetch_yahoo_snapshot(symbol: str) -> dict[str, Any]:
+    """Blocking yfinance lookup; callers run it through asyncio.to_thread."""
+    ticker = yf.Ticker(symbol)
+    info = ticker.info or {}
+    price = _non_nan(info.get("regularMarketPrice") or info.get("currentPrice"))
+    if price is None:
+        try:
+            price = _non_nan(ticker.fast_info.last_price)
+        except Exception:  # noqa: BLE001 - fast_info is only a secondary price source
+            price = None
+    if price is None and not (info.get("longName") or info.get("shortName")):
+        raise ProviderRequestError(f"Yahoo Finance has no quote for '{symbol}'")
+    try:
+        income, balance = ticker.income_stmt, ticker.balance_sheet
+    except Exception:  # noqa: BLE001 - statements are optional enrichment
+        income, balance = None, None
+    return {
+        "symbol": symbol,
+        "name": info.get("longName") or info.get("shortName") or symbol,
+        "exchange": info.get("exchange"),
+        "currency": info.get("currency"),
+        "price": price,
+        "previous_close": _non_nan(info.get("previousClose")),
+        "market_cap": _non_nan(info.get("marketCap")),
+        "trailing_pe": _non_nan(info.get("trailingPE")),
+        "trailing_eps": _non_nan(info.get("trailingEps")),
+        "forward_pe": _non_nan(info.get("forwardPE")),
+        "price_to_book": _non_nan(info.get("priceToBook")),
+        "dividend_yield_pct": _non_nan(info.get("dividendYield")),
+        "beta": _non_nan(info.get("beta")),
+        "revenue": _non_nan(info.get("totalRevenue")),
+        "operating_income": _latest_statement_value(income, "Operating Income"),
+        "net_income": _non_nan(info.get("netIncomeToCommon")),
+        "book_equity": _latest_statement_value(balance, "Stockholders Equity", "Common Stock Equity"),
+        "total_debt": _non_nan(info.get("totalDebt")),
+        "cash": _non_nan(info.get("totalCash")),
+        "free_cash_flow": _non_nan(info.get("freeCashflow")),
+    }
+
+
+def _fmt_amount(value: float | None, currency: str | None) -> str:
+    if value is None:
+        return "n/a"
+    for scale, unit in ((1e12, "T"), (1e9, "B"), (1e6, "M")):
+        if abs(value) >= scale:
+            return f"{value / scale:,.2f}{unit} {currency or ''}".rstrip()
+    return f"{value:,.2f} {currency or ''}".rstrip()
+
+
+def _fmt_number(value: float | None, suffix: str = "") -> str:
+    return "n/a" if value is None else f"{value:,.2f}{suffix}"
+
+
+def _fmt_statement(pair: tuple[str, float] | None, currency: str | None) -> str:
+    if pair is None:
+        return "n/a"
+    return f"{_fmt_amount(pair[1], currency)} (FY ending {pair[0]})"
+
+
+def _render_snapshot(snapshot: dict[str, Any], heading: str) -> str:
+    cur = snapshot["currency"]
+    rows = [
+        ("Price", _fmt_amount(snapshot["price"], cur)),
+        ("Previous close", _fmt_amount(snapshot["previous_close"], cur)),
+        ("Market cap", _fmt_amount(snapshot["market_cap"], cur)),
+        ("Trailing P/E", _fmt_number(snapshot["trailing_pe"])),
+        ("Trailing EPS", _fmt_number(snapshot["trailing_eps"])),
+        ("Forward P/E", _fmt_number(snapshot["forward_pe"])),
+        ("P/B", _fmt_number(snapshot["price_to_book"])),
+        ("Dividend yield", _fmt_number(snapshot["dividend_yield_pct"], "%")),
+        ("Beta", _fmt_number(snapshot["beta"])),
+        ("Revenue (TTM)", _fmt_amount(snapshot["revenue"], cur)),
+        ("Operating income (latest FY)", _fmt_statement(snapshot["operating_income"], cur)),
+        ("Net income (TTM)", _fmt_amount(snapshot["net_income"], cur)),
+        ("Book equity (latest FY)", _fmt_statement(snapshot["book_equity"], cur)),
+        ("Total debt", _fmt_amount(snapshot["total_debt"], cur)),
+        ("Cash", _fmt_amount(snapshot["cash"], cur)),
+        ("Free cash flow (TTM)", _fmt_amount(snapshot["free_cash_flow"], cur)),
+    ]
+    header = (
+        f"{heading}\n"
+        f"{snapshot['name']} ({snapshot['symbol']}, exchange {snapshot['exchange'] or 'n/a'}, currency {cur or 'n/a'})"
+    )
+    return header + "\n" + "\n".join(f"- {label}: {value}" for label, value in rows)
+
+
+async def lookup_finance(router: SearchRouter, ticker: str, asset_type: str, market: str | None) -> str:
+    """Primary backend first, then Yahoo Finance; backend answers are enriched with fundamentals."""
+    symbol = normalize_yahoo_symbol(ticker, asset_type, market)
+    payload: dict[str, Any] = {"ticker": ticker, "type": asset_type}
+    if market:
+        payload["market"] = market
+    backend_text = ""
+    backend_failure = ""
+    try:
+        res = await router.execute_codex_command("finance", [payload])
+        backend_text = str(res.get("output") or "").strip()
+    except (ConfigurationError, ProviderRequestError, httpx.HTTPError) as error:
+        backend_failure = str(error) or type(error).__name__
+    if backend_text and _NO_BACKEND_RESPONSE not in backend_text:
+        try:
+            snapshot = await asyncio.to_thread(_fetch_yahoo_snapshot, symbol)
+        except Exception as error:  # noqa: BLE001 - enrichment is best-effort
+            return f"{backend_text}\n\nFundamentals unavailable for {symbol}: {error}"
+        return f"{backend_text}\n\n{_render_snapshot(snapshot, 'Fundamentals (Yahoo Finance)')}"
+    reason = backend_failure or "backend returned no tool response"
+    try:
+        snapshot = await asyncio.to_thread(_fetch_yahoo_snapshot, symbol)
+    except Exception as error:  # noqa: BLE001 - reported to the caller below
+        raise ProviderRequestError(
+            f"finance lookup failed for '{ticker}' (Yahoo symbol '{symbol}'). "
+            f"Primary backend: {reason}. Yahoo Finance fallback: {error}"
+        ) from error
+    return (
+        f"Primary backend unavailable ({reason}); data from Yahoo Finance for {symbol}.\n\n"
+        + _render_snapshot(snapshot, "Quote and fundamentals (Yahoo Finance)")
+    )
+
+
+
 def register_tools(app: FastMCP, cfg: RouterConfig) -> None:
     @app.tool(name="web-search")
     async def web_search(
@@ -936,14 +1122,10 @@ def register_tools(app: FastMCP, cfg: RouterConfig) -> None:
 
         @app.tool(name="finance")
         async def finance(ticker: str, asset_type: str = "equity", market: str | None = None) -> str:
-            """Look up financial quotes for a given ticker (type: equity, fund, crypto, index)."""
+            """Look up financial quotes and fundamentals (type: equity, fund, crypto, index). Accepts market codes such as TW, TPE, HK, JP, UK; normalizes Yahoo suffixes; falls back to Yahoo Finance when the primary backend has no data."""
             if router is None:
                 raise RuntimeError("Web search router has not been configured")
-            payload: dict[str, Any] = {"ticker": ticker, "type": asset_type}
-            if market:
-                payload["market"] = market
-            res = await router.execute_codex_command("finance", [payload])
-            return res.get("output", "")
+            return await lookup_finance(router, ticker, asset_type, market)
 
         @app.tool(name="weather")
         async def weather(location: str, start_date: str | None = None, duration_days: int | None = None) -> str:

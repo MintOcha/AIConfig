@@ -52,12 +52,13 @@ CANONICAL WORKFLOW:
      - "id": "username/notebook-slug"
 3. Save vs Push:
    - `save_notebook(notebook="...")`: saves code and updates metadata locally and syncs to Kaggle cloud WITHOUT starting execution. If a `.py` file is present, automatically wraps it into `notebook.ipynb` (%%writefile + !python) for safe multiprocessing/GPU training.
-   - `push_notebook(notebook="...")`: pushes to Kaggle and QUEUES EXECUTION (starts a new run/version).
+   - `push_notebook(notebook="...")`: pushes to Kaggle and QUEUES EXECUTION (starts a new run/version). Optional `parameters` (name -> string/number/bool) are injected into the staged copy only (`NB_PARAM_<NAME>` env vars and `/kaggle/working/params.json`); optional `label` names the version. Several versions of one notebook may run concurrently.
 4. Long-Running Execution & Waiting:
    - Kaggle training runs frequently take 10 minutes to several hours.
    - NEVER poll `view_notebook` in tight loops.
    - Use `wait_for_notebook(notebook="owner/slug", until="complete", timeout=20)` or `until="log", text="epoch 1"`.
    - Longer waits require a matching client timeout; output download is explicit via pull_outputs.
+   - Select a version with `version=<n>` or `label=<label>` on view_notebook, wait_for_notebook, pull_outputs, pull_notebook, and cancel_notebook. Omitting both uses the latest version, except cancel_notebook, which requires one of them.
    - When finished, `pull_outputs` retrieves artifacts and compressed summaries.
 """
 )
@@ -1481,18 +1482,33 @@ def _kernel_metadata_path(name_or_folder: str | Path) -> Path:
     return folder / "kernel-metadata.json"
 
 
+KERNEL_METADATA_FIELDS = frozenset({
+    "id", "title", "code_file", "language", "kernel_type", "is_private",
+    "enable_gpu", "enable_tpu", "enable_internet", "dataset_sources",
+    "competition_sources", "kernel_sources", "model_sources", "accelerator",
+    "machine_shape", "versions",
+})
+
+
+def _known_metadata(data: Any) -> dict[str, Any]:
+    """Keep current kernel-metadata fields only; legacy single-slot run fields are dropped."""
+    if not isinstance(data, dict):
+        return {}
+    return {key: value for key, value in data.items() if key in KERNEL_METADATA_FIELDS}
+
+
 def _read_metadata(name_or_folder: str | Path) -> dict[str, Any]:
     path = _kernel_metadata_path(name_or_folder)
     if path.exists():
         try:
-            return json.loads(path.read_text())
+            return _known_metadata(json.loads(path.read_text()))
         except Exception:
             pass
     # Fallback to legacy metadata.json if it exists
     folder = path.parent
     if (folder / "metadata.json").exists():
         try:
-            return json.loads((folder / "metadata.json").read_text())
+            return _known_metadata(json.loads((folder / "metadata.json").read_text()))
         except Exception:
             pass
     return {}
@@ -1502,20 +1518,50 @@ def _write_metadata(name_or_folder: str | Path, data: dict[str, Any]) -> None:
     path = _kernel_metadata_path(name_or_folder)
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = _read_metadata(name_or_folder)
-    existing.update(data)
+    existing.update(_known_metadata(data))
     path.write_text(json.dumps(existing, indent=2))
 
 
-def _read_cache(name_or_folder: str | Path) -> dict[str, Any]:
-    return _read_metadata(name_or_folder)
+def _load_version_records(name_or_folder: str | Path) -> list[dict[str, Any]]:
+    """Per-version records: version, label, parameters, status, pushed_utc."""
+    return [dict(record) for record in (_read_metadata(name_or_folder).get("versions") or [])]
 
 
-def _write_cache(name_or_folder: str | Path, data: dict[str, Any]) -> None:
-    _write_metadata(name_or_folder, data)
+def _find_notebook_folder_by_ref(ref: str) -> Path | None:
+    for folder in sorted(get_kaggle_root().iterdir()):
+        if folder.is_dir() and _read_metadata(folder).get("id") == ref:
+            return folder
+    return None
 
 
-def _write_local_metadata(source_path: Path, data: dict[str, Any]) -> None:
-    _write_metadata(source_path, data)
+def _resolve_version(ref: str, version: int | None, label: str | None) -> int | None:
+    """Resolve a version/label selector to one remote version; None means use the default."""
+    if version is not None and version < 1:
+        raise ValueError("version must be a positive Kaggle version")
+    if label is None:
+        return version
+    folder = _find_notebook_folder_by_ref(ref)
+    matches = [record for record in (_load_version_records(folder) if folder else [])
+               if record.get("label") == label]
+    if not matches:
+        raise ValueError(f"No pushed version of '{ref}' has label {label!r}; use push_notebook(label=...) or pass version.")
+    resolved = int(matches[0]["version"])
+    if version is not None and version != resolved:
+        raise ValueError(f"version {version} and label {label!r} select different versions ({resolved}); pass only one")
+    return resolved
+
+
+def _update_version_status(ref: str, version: int | None, status: str | None) -> None:
+    folder = _find_notebook_folder_by_ref(ref)
+    if folder is None or version is None or not status:
+        return
+    records = _load_version_records(folder)
+    for record in records:
+        if record.get("version") == version and record.get("status") != status:
+            record["status"] = status
+            _write_metadata(folder, {"versions": records})
+            return
+
 
 def _clean_status_label(status: str | None) -> str:
     if not status:
@@ -1554,7 +1600,7 @@ def _cli_find_kernel(title: str, owner: str) -> tuple[bool, dict[str, Any]]:
 
 
 async def _find_kernel(title: str, name: str, owner: str) -> tuple[bool, dict[str, Any]]:
-    cached = _read_cache(name)
+    cached = _read_metadata(name)
     slug = cached.get('slug') or cached.get('id')
     if slug and _split_kernel_slug(slug)[0] == owner:
         return True, cached
@@ -1667,9 +1713,6 @@ async def init_notebook(
             "competition_sources": [],
             "kernel_sources": [],
             "model_sources": [],
-            "total_runs": 0,
-            "last_version_number": 0,
-            "last_status": "UNPUSHED",
         }
         metadata_path.write_text(json.dumps(meta, indent=2))
 
@@ -1898,10 +1941,6 @@ async def save_notebook(
             f"Please fix kernel-metadata.json according to Kaggle specifications."
         )
 
-    for k in ("last_version_number", "total_runs", "last_status", "last_run_utc", "last_pushed_utc"):
-        if k in meta:
-            full_meta[k] = meta[k]
-
     _write_metadata(folder, full_meta)
 
     attached = []
@@ -1922,6 +1961,56 @@ async def save_notebook(
         f"{attached_msg}\n"
         f"(Not pushed to Kaggle. Call push_notebook to queue execution)."
     )
+PARAMETER_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+PARAMETER_CELL_MARKER = "# --- kaggle_mcp run parameters: injected into the staged copy only ---"
+
+
+def _validate_run_parameters(parameters: dict[str, Any] | None, label: str | None,
+                             ref: str, folder: Path) -> tuple[dict[str, Any], str | None]:
+    params = dict(parameters or {})
+    for key, value in params.items():
+        if not PARAMETER_NAME_PATTERN.fullmatch(key):
+            raise ValueError(f"Parameter name {key!r} must match [A-Za-z_][A-Za-z0-9_]*")
+        if not isinstance(value, (str, int, float, bool)):
+            raise ValueError(f"Parameter {key!r} must be a string, number, or boolean")
+    label = label.strip() if label is not None else None
+    if label is not None:
+        if not label:
+            raise ValueError("label must not be empty")
+        if any(record.get("label") == label for record in _load_version_records(folder)):
+            raise ValueError(f"Label {label!r} is already used by a pushed version of '{ref}'; choose a unique label")
+    return params, label or None
+
+
+def _parameter_cell_source(params: dict[str, Any]) -> str:
+    payload = json.dumps(json.dumps(params, sort_keys=True))
+    return (
+        f"{PARAMETER_CELL_MARKER}\n"
+        "import json as _kmcp_json, os as _kmcp_os\n"
+        f"_KMCP_PARAMS = _kmcp_json.loads({payload})\n"
+        "for _kmcp_k, _kmcp_v in _KMCP_PARAMS.items():\n"
+        "    _kmcp_os.environ['NB_PARAM_' + _kmcp_k.upper()] = str(_kmcp_v).lower() if isinstance(_kmcp_v, bool) else str(_kmcp_v)\n"
+        "_kmcp_os.makedirs('/kaggle/working', exist_ok=True)\n"
+        "with open('/kaggle/working/params.json', 'w') as _kmcp_f:\n"
+        "    _kmcp_json.dump(_KMCP_PARAMS, _kmcp_f, indent=2)\n"
+    )
+
+
+def _stage_source_with_parameters(source: Path, dest: Path, params: dict[str, Any]) -> None:
+    """Copy the source to the push staging area, prepending the parameter cell when params are given."""
+    if not params:
+        shutil.copy(source, dest)
+        return
+    cell = _parameter_cell_source(params)
+    if source.suffix == ".ipynb":
+        nb = json.loads(source.read_text())
+        nb["cells"].insert(0, {"cell_type": "code", "execution_count": None, "metadata": {},
+                               "outputs": [], "source": _as_cell_source(cell)})
+        dest.write_text(json.dumps(nb, indent=2))
+    else:
+        dest.write_text(cell + "\n" + source.read_text())
+
+
 @app.tool()
 async def push_notebook(
     notebook: str,
@@ -1932,12 +2021,26 @@ async def push_notebook(
     internet: bool | None = None,
     private: bool | None = None,
     py_source: str | None = None,
+    parameters: dict[str, str | int | float | bool] | None = None,
+    label: str | None = None,
 ) -> str:
     """Push a local notebook folder to Kaggle and queue execution (starts a new run).
 
     STORAGE & DIRECTORY STRUCTURE:
     - Looks up `./kaggle/<notebook_name>/`.
     - All outputs and run summaries will be downloaded into `./kaggle/<notebook_name>/runs/<version>/`.
+
+    PARAMETERS & LABEL:
+    - parameters: optional object of name -> string/number/boolean. Names must match [A-Za-z_][A-Za-z0-9_]*.
+      The staged copy gets a first cell that sets os.environ['NB_PARAM_<NAME>'] (strings; booleans as
+      'true'/'false') and writes /kaggle/working/params.json. Your local source file is not modified.
+      Python scripts (.py) get the same block prepended to the staged copy.
+    - label: optional unique name for this version within the notebook; select it later with `label=`.
+    - Each push is recorded in kernel-metadata.json `versions` with version, label, parameters, status, pushed_utc.
+
+    CONCURRENCY:
+    - A push is not blocked by earlier versions of the same notebook that are still running.
+      If Kaggle enforces a concurrent-session cap, the Kaggle error is returned with that hint.
 
     VALIDATION & LINTING:
     - Runs strict validation on `./kaggle/<notebook>/kernel-metadata.json`.
@@ -1947,7 +2050,6 @@ async def push_notebook(
 
     EXECUTION:
     - Pushes to Kaggle, creating a new version/run on Kaggle Cloud.
-    - Updates run tracking (`total_runs`, `last_version_number`, `last_status`) in `kernel-metadata.json`.
     Dataset archives may mount as extracted directories/files, not as the uploaded ZIP.
     Inspect the mounted input tree before loading; only unzip when the archive exists.
     """
@@ -1966,6 +2068,7 @@ async def push_notebook(
 
     full_meta = _read_metadata(folder)
     acc = full_meta.get("accelerator", "none")
+    run_parameters, run_label = _validate_run_parameters(parameters, label, full_meta.get("id", name), folder)
 
     # Pre-flight quota check
     has_quota, quota_msg = _check_accelerator_quota(acc, _account_owner(full_meta['id']))
@@ -1982,16 +2085,31 @@ async def push_notebook(
     # Stage and push
     push_dir = folder / "working" / "kaggle_push"
     push_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy(folder / code_file, push_dir / code_file)
-    (push_dir / "kernel-metadata.json").write_text(json.dumps(full_meta, indent=2))
+    _stage_source_with_parameters(folder / code_file, push_dir / code_file, run_parameters)
+    staged_meta = {key: value for key, value in full_meta.items() if key != "versions"}
+    (push_dir / "kernel-metadata.json").write_text(json.dumps(staged_meta, indent=2))
 
     cmd = ["kernels", "push", "-p", str(push_dir)]
     if acc and acc.lower() not in ("none", "cpu"):
         cmd.extend(["--accelerator", acc])
 
-    result = _run_kaggle(cmd, timeout=600, owner=_account_owner(ref))
+    try:
+        result = _run_kaggle(cmd, timeout=600, owner=_account_owner(ref))
+    except RuntimeError as error:
+        if re.search(r"concurrent|concurrency|maximum|too many|session.*(cap|limit)|(cap|limit).*session", str(error), re.I):
+            raise RuntimeError(
+                f"{error}\n"
+                f"Kaggle appears to have rejected this push because of a concurrent-session cap on the account. "
+                f"Stop or wait for an active version of '{ref}' or another notebook, then retry."
+            ) from error
+        raise
     version_match = re.search(r"Kernel version\s+(\d+)\s+successfully pushed", result.stdout, re.I)
-    version = int(version_match.group(1)) if version_match else None
+    if not version_match:
+        raise RuntimeError(
+            f"Kaggle reported no version number for '{ref}'; the push may have been accepted. "
+            f"Check with view_notebook before retrying. CLI output: {result.stdout.strip()[:300]}"
+        )
+    version = int(version_match.group(1))
 
     # Extract canonical ref and URL from CLI output if available
     url_match = re.search(r"https?://(?:www\.)?kaggle\.com/(?:code/)?([^/\s]+/[^/\s]+)", result.stdout)
@@ -2000,18 +2118,16 @@ async def push_notebook(
     else:
         canonical_ref = ref
 
-    # Update metadata tracking
-    owner_slug, kernel_slug = _split_kernel_slug(canonical_ref)
-    current_runs = int(full_meta.get("total_runs", 0)) + 1
-    meta_updates = {
-        "id": canonical_ref,
-        "last_pushed_utc": datetime.now(timezone.utc).isoformat(),
-        "last_status": "QUEUED",
-        "total_runs": current_runs,
-    }
-    if version:
-        meta_updates["last_version_number"] = version
-    _write_metadata(folder, meta_updates)
+    # Per-version tracking; concurrent versions never overwrite each other
+    records = _load_version_records(folder)
+    records.append({
+        "version": version,
+        "label": run_label,
+        "parameters": run_parameters,
+        "status": "QUEUED",
+        "pushed_utc": datetime.now(timezone.utc).isoformat(),
+    })
+    _write_metadata(folder, {"id": canonical_ref, "versions": records})
     attached = []
     if full_meta.get("dataset_sources"):
         attached.append(f"datasets: {', '.join(full_meta['dataset_sources'])}")
@@ -2020,19 +2136,23 @@ async def push_notebook(
     if full_meta.get("model_sources"):
         attached.append(f"models: {', '.join(full_meta['model_sources'])}")
     attached_msg = f"\nattached: {'; '.join(attached)}" if attached else ""
+    label_msg = f"label: {run_label}\n" if run_label else ""
+    params_msg = f"parameters: {json.dumps(run_parameters, sort_keys=True)}\n" if run_parameters else ""
 
     return (
         f"Pushed '{title}' to Kaggle.\n"
         f"slug: {canonical_ref}\n"
-        f"version: {version or 'latest'} (total runs: {current_runs})\n"
+        f"version: {version}\n"
+        f"{label_msg}"
+        f"{params_msg}"
         f"accelerator: {acc} (gpu={full_meta.get('enable_gpu')}, tpu={full_meta.get('enable_tpu')})\n"
         f"internet: {full_meta.get('enable_internet')}"
         f"{attached_msg}\n"
         f"Notebook successfully queued on Kaggle.\n\n"
         f"[Next Step: To monitor execution, use CLI in background without blocking:\n"
-        f"uv run --script {Path(__file__).resolve()} wait {canonical_ref} --timeout 3600 --poll-interval 30\n"
+        f"uv run --script {Path(__file__).resolve()} wait {canonical_ref} --version {version} --timeout 3600 --poll-interval 30\n"
         f"Or view live logs:\n"
-        f"uv run --script {Path(__file__).resolve()} status {canonical_ref} --logs --log-timeout 300]"
+        f"uv run --script {Path(__file__).resolve()} status {canonical_ref} --version {version} --logs --log-timeout 300]"
     )
 
 ACTIVE_RUN_STATUSES = {"RUNNING", "QUEUED", "PREPARING", "PENDING", "STARTING", "CANCEL_REQUESTED"}
@@ -2112,12 +2232,14 @@ async def wait(
     versions: list[int | str] | None = None,
     timeout: int = 600,
     poll_interval: int = 5,
+    label: str | None = None,
 ) -> str:
     """Wait until notebook terminates or a literal string appears in available logs.
 
     until: complete or log. log requires text (case-sensitive literal substring).
     version: specific version to wait for (int or 'v3').
     versions: list of versions (e.g. ['v3', 'v4'] or [3, 4]); returns when the FIRST one settles.
+    label: label recorded at push time; selects that version (alternative to version).
     Existing log text also matches; this is not restricted to new log lines.
     Returns concise text with reason matched, terminal, or timeout. Terminal errors stop
     either wait mode. No output download. Default timeout is 600s (10 minutes).
@@ -2138,6 +2260,10 @@ async def wait(
         if v_int < 1:
             raise ValueError("version must be a positive integer")
         target_versions.append(v_int)
+    if label is not None:
+        resolved = _resolve_version(ref, None, label)
+        if resolved not in target_versions:
+            target_versions.append(resolved)
     if versions is not None:
         for v in versions:
             v_int = int(str(v).lstrip("vV"))
@@ -2184,6 +2310,7 @@ async def wait(
                     try:
                         log_poll_timeout = min(DEFAULT_LOG_TIMEOUT, rem_time) if until == "log" else min(30, rem_time)
                         snapshot = await _run_snapshot(ref, target_v, logs=until == "log", log_timeout=log_poll_timeout)
+                        _update_version_status(ref, snapshot.get("version"), snapshot.get("status"))
                     except (TimeoutError, RuntimeError) as error:
                         message = str(error)
                         is_timeout = isinstance(error, TimeoutError) or isinstance(error.__cause__, TimeoutError)
@@ -2309,6 +2436,13 @@ async def list_active_runs(limit: int = 50, head: int = 15) -> str:
 
 def _format_run(ref: str, snapshot: dict, logs: list[str], reason: str | None = None) -> str:
     header = f"{ref} · version {snapshot.get('version') or 'unknown'} · {snapshot['status']}"
+    folder = _find_notebook_folder_by_ref(ref)
+    record = next((r for r in (_load_version_records(folder) if folder else [])
+                   if r.get("version") == snapshot.get("version")), {})
+    if record.get("label"):
+        header += f" · label {record['label']}"
+    if record.get("parameters"):
+        header += f" · params {json.dumps(record['parameters'], sort_keys=True)}"
     if reason:
         header += f" · {reason}"
     lines = [header, f"Hardware: {snapshot.get('hardware', 'unknown')} | Training outcome: unknown"]
@@ -2347,10 +2481,12 @@ async def view_status(
     context: int = 3,
     log_timeout: int = DEFAULT_LOG_TIMEOUT,
     version: int | None = None,
+    label: str | None = None,
 ) -> str:
     """Inspect actual remote version/status with bounded log collection. COMPLETE is notebook status, not training success.
 
-    Omit version to report every active saved version, or latest if none is active.
+    Omit version and label to report every active saved version, or latest if none is active.
+    label selects the version recorded under that label at push time (alternative to version).
     grep: Python re.search regex matching raw or formatted logs; alternation such as
     healthcheck|event=|error works directly. tail limits matching lines; context adds
     this many surrounding lines on each side (default 3), merging overlapping ranges.
@@ -2369,6 +2505,7 @@ async def view_status(
             raise ValueError(f"Invalid regex pattern for grep: {err}") from err
 
     ref = _notebook_ref(notebook)
+    version = _resolve_version(ref, version, label)
     if version is None:
         runs = await _discover_runs(ref)
         heading = (
@@ -2380,6 +2517,8 @@ async def view_status(
             for run in runs:
                 if run['version'] is not None and run['status'] in ACTIVE_RUN_STATUSES:
                     await kaggle_logs.logs(ref, run['version'], _cli_env(_account_owner(ref)), wait=1)
+            for run in runs:
+                _update_version_status(ref, run.get("version"), run.get("status"))
             return heading + "\n\n".join(_format_run(ref, run, []) for run in runs)
         reports = await asyncio.gather(*(
             view_status(ref, tail, fetch_logs, grep, context, log_timeout, run["version"])
@@ -2388,6 +2527,7 @@ async def view_status(
         ))
         return heading + "\n\n".join(reports)
     snapshot = await _run_snapshot(ref, version, logs=fetch_logs or bool(grep), log_timeout=log_timeout)
+    _update_version_status(ref, snapshot.get("version"), snapshot.get("status"))
     raw_logs = snapshot.get("logs", [])
     if pattern is not None:
         matches = [index for index, line in enumerate(raw_logs) if _matches_log_line(pattern, line)][-tail:]
@@ -2640,13 +2780,15 @@ with api.build_kaggle_client() as client:
 @app.tool(name="pull_outputs")
 async def fetch_output(
     notebook: str,
-    run_number: int | None = None,
+    version: int | None = None,
+    label: str | None = None,
     pattern: str | None = None,
     timeout: int = 1800,
 ) -> str:
     """Retrieve outputs from a stopped Kaggle version (COMPLETE, CANCEL_ACKNOWLEDGED, ERROR).
-    
-    run_number is the remote version, never a local counter.
+
+    version is the remote Kaggle version, never a local counter. label selects the version recorded at push time
+    (alternative to version). Output is saved under runs/<version>/output.
     pattern is an optional fnmatch glob to download selectively (e.g. 'terminal-credit-output/*' or '*.pt').
     timeout is download deadline in seconds (default 1800 / 30 mins).
     """
@@ -2664,7 +2806,11 @@ async def fetch_output(
         if not ref:
             raise RuntimeError(f"Could not resolve Kaggle kernel for '{name}'.")
 
-    version, status = await _completed_run(ref, run_number)
+    version, status = await _completed_run(ref, _resolve_version(ref, version, label))
+    record = next((r for r in _load_version_records(_find_notebook_folder_by_ref(ref) or name)
+                   if r.get("version") == version), {})
+    record_label = record.get("label")
+    record_params = record.get("parameters", {})
     target_dir = get_kaggle_root() / name / "runs" / str(version)
     output_dir = target_dir / "output"
 
@@ -2688,6 +2834,8 @@ async def fetch_output(
 
     return (
         f"Fetched run outputs for '{name}' into `{target_dir.relative_to(get_workspace_root())}`:\n"
+        f"- Version: {version}{f' (label {record_label})' if record_label else ''}\n"
+        f"- Parameters: {json.dumps(record_params, sort_keys=True)}\n"
         f"- Status: {status}\n"
         f"- Files downloaded: {file_count} ({human_size(total_size)})\n\n"
         f"{summary_text[:1000]}"
@@ -2695,35 +2843,22 @@ async def fetch_output(
 
 
 @app.tool(name="cancel_notebook")
-async def cancel_run(notebook: str, version: int | None = None, dry_run: bool = False) -> str:
-    """Cancel a verified active notebook version, never an inferred numeric session ID.
+async def cancel_run(notebook: str, version: int | None = None, label: str | None = None,
+                     dry_run: bool = False) -> str:
+    """Cancel one verified active notebook version, selected by version or label.
 
-    Omit version to select the sole active run. If multiple active runs are detected,
-    the tool reports all active versions and prompts to specify which version to cancel.
-    dry_run resolves and verifies the target without cancelling.
+    version or label is REQUIRED; nothing is inferred. Only the selected version's session is cancelled.
+    Use view_notebook to list active versions and their labels. dry_run verifies the target without cancelling.
     """
+    if version is None and label is None:
+        raise ValueError("cancel_notebook requires version or label; it never infers a version to cancel")
     ref = _notebook_ref(notebook)
-    runs = await _discover_runs(ref, version)
-    active = [run for run in runs if run["status"] in ACTIVE_RUN_STATUSES]
-    if not active:
-        if version is not None:
-            curr_status = runs[0].get("status") if runs else "unknown"
-            return f"Version {version} of '{ref}' is not active (status: {curr_status}); no active run to cancel."
-        latest_info = f" (latest version {runs[0].get('version')} is {runs[0].get('status')})" if runs and runs[0].get("version") else ""
-        return f"{ref}: no active run to cancel{latest_info}."
-    if len(active) > 1:
-        run_lines = "\n".join(
-            f"  - Version {r.get('version', 'unknown')} (status: {r.get('status', 'ACTIVE')})"
-            for r in sorted(active, key=lambda x: x.get("version") or 0, reverse=True)
-        )
-        return (
-            f"Multiple active versions are currently running for '{ref}':\n"
-            f"{run_lines}\n\n"
-            f"Please specify which version/run to cancel:\n"
-            f"- Via MCP tool: cancel_notebook(notebook='{ref}', version=<version>)\n"
-            f"- Via CLI:      uv run --script {Path(__file__).resolve()} cancel {ref} --version <version>"
-        )
-    target = active[0]["version"]
+    target = _resolve_version(ref, version, label)
+    runs = await _discover_runs(ref, target)
+    run = runs[0] if runs else {}
+    if run.get("status") not in ACTIVE_RUN_STATUSES:
+        return f"Version {target} of '{ref}' is not active (status: {run.get('status', 'unknown')}); no active run to cancel."
+    _update_version_status(ref, target, run.get("status"))
     code = '''
 import sys, json, re
 from urllib.parse import urlparse
@@ -2766,11 +2901,16 @@ with api.build_kaggle_client() as client:
 
 
 @app.tool()
-async def pull_notebook(notebook: str, fetch_latest_output: bool = False, version: int | None = None) -> str:
-    """Pull notebook source and optional stopped-run outputs from the same verified version."""
+async def pull_notebook(notebook: str, fetch_latest_output: bool = False, version: int | None = None,
+                        label: str | None = None) -> str:
+    """Pull notebook source and optional stopped-run outputs from the same verified version.
+
+    version or label selects a specific pushed version (label is the push-time name). Omit both for the
+    latest version. A selected version is written under runs/<version>/source and does not overwrite the
+    notebook folder's current source.
+    """
     if version is not None and version < 1:
         raise ValueError("version must be positive")
-    historical = version is not None
     owners = [_account_owner(notebook)] if '/' in notebook else list(_accounts())
     rows = []
     for owner in owners:
@@ -2790,6 +2930,11 @@ async def pull_notebook(notebook: str, fetch_latest_output: bool = False, versio
         raise RuntimeError(f"Notebook '{notebook}' not found in your Kaggle account list.")
 
     ref = match.get("ref", "")
+    if label is not None:
+        if version is not None:
+            raise ValueError("pass version or label, not both")
+        version = _resolve_version(ref, None, label)
+    historical = version is not None
     title = (match.get("title") or ref.split("/")[-1]).strip()
     local_name = _sanitize_local_name(title)
     folder = get_kaggle_root() / local_name
@@ -2846,18 +2991,10 @@ with api.build_kaggle_client() as client:
         except Exception as error:
             raise RuntimeError(f"Output download failed for version {version}: {error}") from error
 
-    cache_update = {
-        "title": title,
-        "slug": ref,
-        "id": ref,
-        "source_path": str(target_path.relative_to(get_workspace_root())),
-        "last_status": status_label,
-        "last_version_number": version,
-        "pulled_utc": datetime.now(timezone.utc).isoformat(),
-    }
+    identity = {"title": title, "id": ref}
     if not historical:
-        _write_cache(local_name, cache_update)
-    _write_local_metadata(target_path, cache_update)
+        _write_metadata(local_name, identity)
+    _write_metadata(target_path, identity)
 
     return f"Pulled '{ref}' into `{folder.relative_to(get_workspace_root())}` (version {version}, status {status_label}).{output_msg}"
 
@@ -3380,6 +3517,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_push = subparsers.add_parser("push", help="Push notebook and run on Kaggle")
     p_push.add_argument("notebook", help="Notebook name or directory")
     p_push.add_argument("--accelerator", help="Accelerator (none, gpu, tpu)")
+    p_push.add_argument("--parameters", help='JSON object of run parameters, e.g. \'{"depth": 3}\'')
+    p_push.add_argument("--label", help="Unique name for this version within the notebook")
 
     # save
     p_save = subparsers.add_parser("save", help="Save notebook locally and sync code without running")
@@ -3395,6 +3534,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_wait.add_argument("--text")
     p_wait.add_argument("--version", type=int)
     p_wait.add_argument("--versions", nargs="+", type=int)
+    p_wait.add_argument("--label", help="Select the version recorded under this label at push time")
 
     # status
     p_status = subparsers.add_parser("status", help="Check notebook status")
@@ -3405,10 +3545,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_status.add_argument("--context", type=int, default=3, help="Lines before and after each grep match")
     p_status.add_argument("--log-timeout", type=int, default=DEFAULT_LOG_TIMEOUT, help=f"Log streaming wait timeout in seconds for CLI mode (default {DEFAULT_LOG_TIMEOUT})")
     p_status.add_argument("--version", type=int)
+    p_status.add_argument("--label", help="Select the version recorded under this label at push time")
 
     p_cancel = subparsers.add_parser("cancel", help="Cancel a verified active notebook run")
     p_cancel.add_argument("notebook")
     p_cancel.add_argument("--version", type=int)
+    p_cancel.add_argument("--label", help="Select the version recorded under this label at push time")
     p_cancel.add_argument("--dry-run", action="store_true")
 
     p_edit = subparsers.add_parser("edit-notebook", help="Publish title or Markdown without execution")
@@ -3419,7 +3561,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # output
     p_output = subparsers.add_parser("output", help="Download notebook outputs")
     p_output.add_argument("notebook", help="Notebook name or directory")
-    p_output.add_argument("--run", type=int, help="Specific run number")
+    p_output.add_argument("--version", type=int, help="Remote Kaggle version to download")
+    p_output.add_argument("--label", help="Select the version recorded under this label at push time")
     p_output.add_argument("--pattern", help="Selective glob pattern to filter output files (e.g. 'terminal-credit-output/*')")
     p_output.add_argument("--timeout", type=int, default=1800, help="Download timeout in seconds (default 1800)")
 
@@ -3511,19 +3654,19 @@ def main() -> None:
             _print_result(asyncio.run(read_dataset(args.dataset)))
         elif cmd == "status":
             fetch_logs = args.logs or bool(args.grep)
-            _print_result(asyncio.run(view_status(args.notebook, tail=args.tail, fetch_logs=fetch_logs, grep=args.grep, context=args.context, log_timeout=args.log_timeout, version=args.version)))
+            _print_result(asyncio.run(view_status(args.notebook, tail=args.tail, fetch_logs=fetch_logs, grep=args.grep, context=args.context, log_timeout=args.log_timeout, version=args.version, label=args.label)))
         elif cmd == "cancel":
-            _print_result(asyncio.run(cancel_run(args.notebook, version=args.version, dry_run=args.dry_run)))
+            _print_result(asyncio.run(cancel_run(args.notebook, version=args.version, label=args.label, dry_run=args.dry_run)))
         elif cmd == "edit-notebook":
             _print_result(asyncio.run(update_notebook_presentation(args.notebook, title=args.title, markdown_path=args.markdown_path)))
         elif cmd == "push":
-            _print_result(asyncio.run(push_notebook(args.notebook, accelerator=args.accelerator)))
+            _print_result(asyncio.run(push_notebook(args.notebook, accelerator=args.accelerator, parameters=json.loads(args.parameters) if args.parameters else None, label=args.label)))
         elif cmd == "save":
             _print_result(asyncio.run(save_notebook(args.notebook, accelerator=getattr(args, "accelerator", None))))
         elif cmd == "wait":
-            _print_result(asyncio.run(wait(args.notebook, until=args.until, text=args.text, timeout=args.timeout, poll_interval=args.poll_interval, version=args.version, versions=args.versions)))
+            _print_result(asyncio.run(wait(args.notebook, until=args.until, text=args.text, timeout=args.timeout, poll_interval=args.poll_interval, version=args.version, versions=args.versions, label=args.label)))
         elif cmd == "output":
-            _print_result(asyncio.run(fetch_output(args.notebook, run_number=args.run, pattern=args.pattern, timeout=args.timeout)))
+            _print_result(asyncio.run(fetch_output(args.notebook, version=args.version, label=args.label, pattern=args.pattern, timeout=args.timeout)))
         elif cmd == "upload":
             options = json.loads(args.options)
             owner = _dataset_owner(args.path, options.get("dataset_slug"))
