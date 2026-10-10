@@ -10,8 +10,9 @@ Inspect before changing the system. Confirm Debian 12, capture the complete `apt
 Use `scripts/repair_debian_opencl.sh USER` when the evidence matches this workflow. The script:
 
 - Disables the exact known-invalid Ubuntu Docker/bookworm source and exact duplicate Palantir backports entry through recoverable `.disabled` renames.
+- Repairs packages missing dpkg control entries (e.g. missing list or md5sums files from foreign or broken packages) by restoring their canonical Debian repository versions.
+- Completes interrupted dpkg configuration and resolves broken dependency state allowing version realignment.
 - Finds installed packages with missing payloads under `/usr/share/perl5` and reinstalls the affected set with `needrestart` in one transaction.
-- Completes interrupted dpkg configuration and fixes dependency state.
 - Installs `intel-opencl-icd`, the OpenCL loader, and `clinfo`.
 - Adds the target user to `render` and `video`, verifies repaired package payloads, and runs `clinfo -l` as that user.
 

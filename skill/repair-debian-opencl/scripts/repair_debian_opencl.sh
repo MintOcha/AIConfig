@@ -48,8 +48,8 @@ disable_source() {
   local disabled_path="${source_path}.disabled"
 
   if [[ -e "$disabled_path" ]]; then
-    echo "Refusing to overwrite existing backup $disabled_path." >&2
-    exit 1
+    local backup_path="${disabled_path}.$(date +%s)"
+    mv "$disabled_path" "$backup_path"
   fi
 
   mv "$source_path" "$disabled_path"
@@ -73,9 +73,31 @@ fi
 
 echo "Refreshing Debian package metadata..."
 apt-get update
+echo "Checking for packages missing control database files..."
+mapfile -t audit_reinstall_packages < <(
+  dpkg --audit 2>/dev/null | awk '
+    /they need to be reinstalled:/ { flag=1; next }
+    flag && /^[[:space:]]+[a-zA-Z0-9]/ { print $1; next }
+    flag && /^[^[:space:]]/ { flag=0 }
+  ' | sort -u
+) || true
+
+if [[ ${#audit_reinstall_packages[@]} -gt 0 ]]; then
+  echo "Restoring packages with missing dpkg control entries: ${audit_reinstall_packages[*]}"
+  for pkg in "${audit_reinstall_packages[@]}"; do
+    pkg_name="${pkg%%:*}"
+    repo_version=$(apt-cache madison "$pkg_name" 2>/dev/null | awk -F'|' 'NR==1 {gsub(/ /, "", $2); print $2}')
+    if [[ -n "$repo_version" ]]; then
+      apt-get install --allow-downgrades -y "${pkg_name}=${repo_version}" || true
+    else
+      apt-get install --reinstall --allow-downgrades -y "$pkg" || true
+    fi
+  done
+fi
+
 echo "Finishing interrupted package configuration and resolving broken dependencies..."
 dpkg --configure -a
-apt-get --fix-broken install -y
+apt-get --fix-broken install --allow-downgrades -y
 
 declare -A repair_packages=([needrestart]=1)
 for package_list in /var/lib/dpkg/info/*.list; do
@@ -96,7 +118,7 @@ done
 
 mapfile -t packages < <(printf '%s\n' "${!repair_packages[@]}" | LC_ALL=C sort)
 echo "Restoring packages with missing Perl payloads: ${packages[*]}"
-apt-get install --reinstall -y "${packages[@]}"
+apt-get install --reinstall --allow-downgrades -y "${packages[@]}"
 
 test -s /usr/share/perl5/NeedRestart.pm
 perl -MNeedRestart -e 'print "needrestart Perl module restored\n"'
