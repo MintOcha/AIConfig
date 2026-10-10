@@ -1,0 +1,4 @@
+interface:
+  display_name: "Research Cleanup"
+  short_description: "Archive research experiments to RESEARCH_ARCHIVE.md and purge obsolete checkpoints, caches, and datasets"
+  default_prompt: "Use $research-cleanup to audit, archive completed research to RESEARCH_ARCHIVE.md, remove stale heavy files, and ensure current scripts run."
