@@ -73,6 +73,9 @@ fi
 
 echo "Refreshing Debian package metadata..."
 apt-get update
+echo "Finishing interrupted package configuration and resolving broken dependencies..."
+dpkg --configure -a
+apt-get --fix-broken install -y
 
 declare -A repair_packages=([needrestart]=1)
 for package_list in /var/lib/dpkg/info/*.list; do
@@ -97,11 +100,6 @@ apt-get install --reinstall -y "${packages[@]}"
 
 test -s /usr/share/perl5/NeedRestart.pm
 perl -MNeedRestart -e 'print "needrestart Perl module restored\n"'
-
-echo "Finishing interrupted package configuration..."
-dpkg --configure -a
-apt-get --fix-broken install -y
-
 echo "Installing Intel OpenCL runtime and diagnostics..."
 apt-get install -y intel-opencl-icd ocl-icd-libopencl1 clinfo
 
