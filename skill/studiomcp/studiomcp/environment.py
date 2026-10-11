@@ -308,7 +308,7 @@ class Environment:
         from .gallery import gallery
         description = self.request(studio, 'ls', root='game', path=path, limit=1)
         if description['root']['className'] == 'KeyframeSequence':
-            raise ValueError('Viewing KeyframeSequence is supported headlessly via RbxMCP2')
+            raise ValueError('Viewing KeyframeSequence is supported headlessly via bloxsmith')
         # Inspection camera/state ownership is separate from the isolated capture worker.
         images = []
         try:

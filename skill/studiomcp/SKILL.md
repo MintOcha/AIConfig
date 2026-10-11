@@ -5,7 +5,7 @@ description: Interact directly with live Roblox Studio sessions: execute Luau, c
 
 # StudioMCP
 
-Direct live bridge to Roblox Studio and Open Cloud assets. File-directory authoring and build compilation belong in RbxMCP2.
+Direct live bridge to Roblox Studio and Open Cloud assets. File-directory authoring and build compilation belong in bloxsmith.
 
 ## Commands
 

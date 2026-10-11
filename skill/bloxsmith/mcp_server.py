@@ -1,4 +1,4 @@
-"""FastMCP server implementation for Bloxsmith (formerly RbxMCP2).
+"""FastMCP server implementation for Bloxsmith.
 
 Wraps build, test, view, cloud asset fetch, toolbox search, catalog search, avatar, and upload.
 Supports stdio transport (default) or sse.

@@ -2,7 +2,7 @@
 
 A lean MCP server and CLI for directly interacting with running Roblox Studio instances and managing Open Cloud assets.
 
-File-based development, headless Lune testing, and scene builds are handled by `RbxMCP2`. `StudioMCP` provides only the live runtime bridge into Studio.
+File-based development, headless Lune testing, and scene builds are handled by `bloxsmith`. `StudioMCP` provides only the live runtime bridge into Studio.
 
 ## Architecture
 

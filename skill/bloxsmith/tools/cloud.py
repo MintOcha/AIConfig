@@ -1,4 +1,4 @@
-"""Roblox cloud integration for Bloxsmith (formerly RbxMCP2):
+"""Roblox cloud integration for Bloxsmith:
 Toolbox, Creator Store, Catalog, Avatar, asset delivery (pulling .rbxm), and Open Cloud upload.
 """
 from __future__ import annotations
