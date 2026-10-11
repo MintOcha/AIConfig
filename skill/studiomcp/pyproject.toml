@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "studiomcp"
+version = "0.1.0"
+description = "Lean Roblox Studio MCP server, CLI, and receiver bridge"
+requires-python = ">=3.11"
+dependencies = ["mcp>=1.0.0", "Pillow>=11,<13"]
+
+[project.scripts]
+studiomcp = "studiomcp.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["studiomcp*"]

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bloxsmith"
+  short_description: "Forge Roblox games without Studio: build, test, view, animate"
+  default_prompt: "Use $bloxsmith to build, test, and visually preview this Roblox project."

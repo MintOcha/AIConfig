@@ -1,0 +1,4 @@
+interface:
+  display_name: "StudioMCP"
+  short_description: "Live Roblox Studio bridge for Luau execution, playtests, and Open Cloud"
+  default_prompt: "Use $studiomcp to inspect, execute Luau, control playtests, and capture viewports in the live Roblox Studio session."
