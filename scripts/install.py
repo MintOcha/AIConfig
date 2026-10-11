@@ -640,26 +640,59 @@ def install_skills(h_id: str, target_home: Path, dry_run: bool) -> None:
     for s in selected:
         src = skill_dir / s
         dst = dest_skills_dir / s
-        if dst.is_symlink() and dst.resolve() == src.resolve():
+        is_unc = os.name == "nt" and str(src).startswith("\\\\")
+        if not is_unc and dst.is_symlink() and dst.resolve() == src.resolve():
             print(f"Already linked: {s}")
+            _install_skill_shims(s, dst, dry_run)
             continue
         if dry_run:
-            print(f"Dry run: would link {s} -> {dst}")
+            print(f"Dry run: would install {s} -> {dst}")
             continue
+        if dst.is_symlink() or dst.is_file():
+            dst.unlink()
+        elif dst.is_dir():
+            shutil.rmtree(dst)
         try:
-            if dst.exists() or dst.is_symlink():
-                if dst.is_symlink():
-                    dst.unlink()
-                else:
-                    warning(f"Skipped existing non-symlink: {dst}")
-                    continue
+            if is_unc:
+                raise OSError("Prefer local copy when source is on a Windows UNC share")
             dst.symlink_to(src, target_is_directory=True)
             success(f"Linked skill: {s}")
         except OSError:
-            # Fallback for Windows without symlink permissions
-            shutil.copytree(src, dst, dirs_exist_ok=True)
+            shutil.copytree(src, dst, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
             success(f"Copied skill: {s}")
+        _install_skill_shims(s, dst, dry_run)
 
+
+SKILL_CLI_SHIMS: dict[str, tuple[str, ...]] = {
+    "rbxmcp2": ("rbxmcp", "rbxmcp2"),
+    "studiomcp": ("studiomcp",),
+}
+
+
+def _install_skill_shims(skill_name: str, skill_path: Path, dry_run: bool) -> None:
+    commands = SKILL_CLI_SHIMS.get(skill_name)
+    entry = skill_path / "main.py"
+    if not commands or not entry.is_file() or dry_run:
+        return
+    bin_dir = HOME / ".local" / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    entry_posix = str(entry.resolve() if not skill_path.is_symlink() else entry).replace("\\", "/")
+    entry_win = str(entry.resolve() if not skill_path.is_symlink() else entry)
+    for cmd in commands:
+        sh_file = bin_dir / cmd
+        sh_file.write_text(f'#!/usr/bin/env sh\nexec python "{entry_posix}" "$@"\n', encoding="utf-8", newline="\n")
+        try:
+            sh_file.chmod(0o755)
+        except OSError:
+            pass
+        if os.name == "nt":
+            cmd_file = bin_dir / f"{cmd}.cmd"
+            cmd_file.write_text(f'@echo off\r\npython "{entry_win}" %*\r\n', encoding="utf-8")
+    if skill_name == "studiomcp" and os.name == "nt":
+        try:
+            subprocess.run([sys.executable, str(entry), "savePlugin"], capture_output=True, timeout=15)
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # 4. OMP / Tracked Configs (Apply / Sync)

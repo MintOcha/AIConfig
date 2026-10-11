@@ -349,7 +349,10 @@ def uninstall_skills(h_id: str, target_home: Path, dry_run: bool) -> None:
             else:
                 shutil.rmtree(target)
             removed.append(s)
-
+            for shim in {"rbxmcp2": ("rbxmcp", "rbxmcp2"), "studiomcp": ("studiomcp",)}.get(s, ()):
+                for candidate in (HOME / ".local" / "bin" / shim, HOME / ".local" / "bin" / f"{shim}.cmd"):
+                    if candidate.is_file() or candidate.is_symlink():
+                        candidate.unlink(missing_ok=True)
     if removed:
         success(f"Removed skills: {', '.join(removed)}")
     else:
