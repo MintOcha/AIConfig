@@ -147,12 +147,12 @@ function Anim.parse(source, path)
 					table.insert(trackPath, (name:match("^%s*(.-)%s*$")))
 				end
 			else
-				local names = tokenize(rest)
-				if #names ~= 1 then
-					-- a bare name with spaces (track Right Arm) is one name
-					names = { (rest:gsub('"', "")) }
+				local quote = rest:sub(1, 1)
+				local name = rest
+				if #rest >= 2 and (quote == '"' or quote == "'") and rest:sub(-1) == quote then
+					name = rest:sub(2, -2)
 				end
-				trackPath = { names[1] }
+				trackPath = { name }
 				pendingShort[#clip.tracks + 1] = lineNo
 			end
 			if type(trackPath) ~= "table" or #trackPath == 0 then
