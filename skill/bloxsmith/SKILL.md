@@ -1,6 +1,6 @@
 ---
 name: bloxsmith
-description: Bloxsmith (formerly RbxMCP2) - forge a Roblox game without Studio. Build, test and view it headlessly (build, test, view, toolbox, catalog, avatar, pull, upload, publish), plus R6 animation helpers (pose solver, clip writer, camera sheets) and the Studio-vs-preview gotchas. Use for any Roblox project with the src/, assets/, tests/ layout.
+description: Bloxsmith (formerly RbxMCP2) - forge a Roblox game without Studio. Build, test and view it headlessly (build, test, view, toolbox, catalog, avatar, pull, upload, publish), a short .anim format (rig R6, key only what moves), eye>target cameras, member-name clash warnings and the Studio-vs-preview gotchas. Use for any Roblox project with the src/, assets/, tests/ layout.
 ---
 
 bloxsmith: build, test and look at a roblox game without studio. one project at a time.
