@@ -391,7 +391,7 @@ export async function buildWorld(data, { renderer, textureFor, imageFor }) {
         } else if (child.class === 'SurfaceGui') {
           surfaceGuis.push({ gui: child, part: node, group });
         } else if (child.class === 'PointLight' || child.class === 'SpotLight' || child.class === 'SurfaceLight') {
-          addLight(child, group, p.Size);
+          collectLight(child, world, p.Size);
         } else if (child.class === 'ParticleEmitter') {
           emitters.push({ node: child, world });
         }
@@ -406,6 +406,9 @@ export async function buildWorld(data, { renderer, textureFor, imageFor }) {
       world = parentWorld ? parentWorld.clone().multiply(local) : local;
       for (const child of node.children) {
         if (child.class === 'ParticleEmitter') emitters.push({ node: child, world });
+        else if (child.class === 'PointLight' || child.class === 'SpotLight' || child.class === 'SurfaceLight') {
+          collectLight(child, world, [1, 1, 1]);
+        }
       }
     } else if (node.class === 'BillboardGui') {
       billboards.push({ gui: node, world: parentWorld });
@@ -425,37 +428,117 @@ export async function buildWorld(data, { renderer, textureFor, imageFor }) {
       }
     }
   }
+  const pointCandidates = [];
+  const spotCandidates = [];
 
-  function addLight(node, group, size) {
+  function collectLight(node, worldMatrix, size) {
     const p = node.props;
     if (p.Enabled === false) return;
     const color = srgb(p.Color ?? [1, 1, 1]);
     const brightness = p.Brightness ?? 1;
     const range = p.Range ?? 16;
     if (node.class === 'PointLight') {
-      const light = new THREE.PointLight(color, brightness * POINT_SCALE, range, 1);
-      light.castShadow = p.Shadows === true;
-      group.add(light);
+      const worldPos = new THREE.Vector3().setFromMatrixPosition(worldMatrix);
+      pointCandidates.push({
+        worldPos,
+        color,
+        intensity: brightness * POINT_SCALE,
+        range,
+        castShadow: p.Shadows === true,
+      });
       return;
     }
     const face = p.Face ?? 'Front';
-    const n = FACE_NORMAL[face];
+    const n = FACE_NORMAL[face] ?? FACE_NORMAL.Front;
     const angle = Math.min(89, (p.Angle ?? 90) / 2) * (Math.PI / 180);
-    const light = new THREE.SpotLight(color, brightness * SPOT_SCALE, range, angle, 0.35, 1);
     const offset = node.class === 'SurfaceLight' ? n.map((v, i) => (v * size[i]) / 2) : [0, 0, 0];
-    light.position.set(...offset);
-    light.target.position.set(offset[0] + n[0], offset[1] + n[1], offset[2] + n[2]);
-    group.add(light, light.target);
-    if (p.Shadows) {
-      light.castShadow = true;
-      light.shadow.mapSize.set(2048, 2048);
-      light.shadow.bias = -0.0006;
-      light.shadow.normalBias = 0.02;
-      light.shadow.camera.near = 0.2;
-    }
+    const worldPos = new THREE.Vector3(...offset).applyMatrix4(worldMatrix);
+    const targetWorldPos = new THREE.Vector3(offset[0] + n[0], offset[1] + n[1], offset[2] + n[2]).applyMatrix4(worldMatrix);
+    spotCandidates.push({
+      worldPos,
+      targetWorldPos,
+      color,
+      intensity: brightness * SPOT_SCALE,
+      range,
+      angle,
+      castShadow: p.Shadows === true,
+    });
   }
 
   visit(data.workspace, null);
+
+  const MAX_POINT_LIGHTS = 24;
+  const MAX_SPOT_LIGHTS = 8;
+  const pointPoolSize = Math.min(MAX_POINT_LIGHTS, pointCandidates.length);
+  const spotPoolSize = Math.min(MAX_SPOT_LIGHTS, spotCandidates.length);
+
+  const pointPool = [];
+  for (let i = 0; i < pointPoolSize; i++) {
+    const pl = new THREE.PointLight(0xffffff, 0, 16, 1);
+    scene.add(pl);
+    pointPool.push(pl);
+  }
+
+  const spotPool = [];
+  for (let i = 0; i < spotPoolSize; i++) {
+    const sl = new THREE.SpotLight(0xffffff, 0, 16, Math.PI / 4, 0.35, 1);
+    scene.add(sl, sl.target);
+    spotPool.push(sl);
+  }
+
+  function updateLights(camera) {
+    if (pointPool.length === 0 && spotPool.length === 0) return;
+    const camPos = new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld);
+    const camForward = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 2).negate().normalize();
+
+    function score(light) {
+      const toLight = new THREE.Vector3().subVectors(light.worldPos, camPos);
+      const dist = toLight.length();
+      const dot = dist > 0.001 ? toLight.dot(camForward) / dist : 1;
+      if (dot >= -0.1) return dist - light.range * 0.5;
+      if (dist < light.range) return dist;
+      return dist * 10;
+    }
+
+    if (pointPool.length > 0) {
+      pointCandidates.sort((a, b) => score(a) - score(b));
+      for (let i = 0; i < pointPool.length; i++) {
+        const target = pointPool[i];
+        if (i < pointCandidates.length) {
+          const src = pointCandidates[i];
+          target.position.copy(src.worldPos);
+          target.color.copy(src.color);
+          target.intensity = src.intensity;
+          target.distance = src.range;
+          target.decay = 1;
+          target.castShadow = src.castShadow;
+        } else {
+          target.intensity = 0;
+        }
+      }
+    }
+
+    if (spotPool.length > 0) {
+      spotCandidates.sort((a, b) => score(a) - score(b));
+      for (let i = 0; i < spotPool.length; i++) {
+        const target = spotPool[i];
+        if (i < spotCandidates.length) {
+          const src = spotCandidates[i];
+          target.position.copy(src.worldPos);
+          target.target.position.copy(src.targetWorldPos);
+          target.color.copy(src.color);
+          target.intensity = src.intensity;
+          target.distance = src.range;
+          target.angle = src.angle;
+          target.penumbra = 0.35;
+          target.decay = 1;
+          target.castShadow = src.castShadow;
+        } else {
+          target.intensity = 0;
+        }
+      }
+    }
+  }
 
   // Terrain water: the top surface of each Water fill.
   const terrainNode = data.workspace.children.find((c) => c.class === 'Terrain');
@@ -516,5 +599,5 @@ export async function buildWorld(data, { renderer, textureFor, imageFor }) {
   buildParticles(particles, emitters, textureFor);
   scene.add(particles);
 
-  return { scene, sky, billboards, partsById, exposure: Math.pow(2, L.ExposureCompensation ?? 0) };
+  return { scene, sky, billboards, partsById, exposure: Math.pow(2, L.ExposureCompensation ?? 0), updateLights };
 }

@@ -375,7 +375,7 @@ async function main() {
   camera.matrixWorld.copy(camera.matrix);
   camera.matrixWorldInverse.copy(camera.matrix).invert();
   world.sky.position.setFromMatrixPosition(camera.matrix);
-
+  world.updateLights?.(camera);
   const composer = new EffectComposer(renderer);
   composer.addPass(new RenderPass(world.scene, camera));
   // A BloomEffect in Lighting sets the glow (Neon); without one the renderer's default glow applies
@@ -424,6 +424,7 @@ async function main() {
     camera.matrixWorld.copy(camera.matrix);
     camera.matrixWorldInverse.copy(camera.matrix).invert();
     world.sky.position.setFromMatrixPosition(camera.matrix);
+    world.updateLights?.(camera);
     composer.render();
     await drawOverlay();
     const out = document.createElement('canvas');

@@ -50,8 +50,10 @@ def serve() -> None:
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(data)))
             self.end_headers()
-            self.wfile.write(data)
-
+            try:
+                self.wfile.write(data)
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                pass
         def do_GET(self):
             last[0] = time.time()
             if self.path == "/quit":
@@ -80,7 +82,10 @@ def serve() -> None:
     info_file().write_text(json.dumps({"port": server.server_address[1], "pid": os.getpid(), "stamp": started_for}))
     try:
         while not quit_now[0] and time.time() - last[0] < IDLE and (_stamp() == started_for or os.environ.get("RBXMCP_NO_RELOAD")):
-            server.handle_request()
+            try:
+                server.handle_request()
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                pass
     finally:
         try:
             info_file().unlink()

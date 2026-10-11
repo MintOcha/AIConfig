@@ -25,6 +25,7 @@ class Renderer:
     def __init__(self):
         outer = self
         self.scene_path = None
+        self.pages = {}
         self.missing = []
         content_dir = os.path.abspath(str(ensure_content()))
 
@@ -105,30 +106,44 @@ class Renderer:
     def views(self, scene_path, views, topbar=False, nofog=True):
         """render several cameras from one page load; returns [(name, png_bytes)]"""
         key = (os.path.abspath(scene_path), os.stat(scene_path).st_mtime_ns, topbar, nofog)
-        if getattr(self, "kept_key", None) != key:
-            self._drop_kept()
-            self.kept = self._open(scene_path, topbar, nofog)
-            self.kept_key = key
+        page = self.pages.get(key)
+        if page is None or page.is_closed():
+            for k in list(self.pages.keys()):
+                if k[0] == key[0] and k != key:
+                    p = self.pages.pop(k)
+                    try:
+                        p.close()
+                    except Exception:
+                        pass
+            while len(self.pages) >= 6:
+                k, p = self.pages.pop(next(iter(self.pages)))
+                try:
+                    p.close()
+                except Exception:
+                    pass
+            page = self._open(scene_path, topbar, nofog)
+            self.pages[key] = page
         out = []
         try:
             for v in views:
-                url = self.kept.evaluate("v => window.__renderView(v)", v)
+                url = page.evaluate("v => window.__renderView(v)", v)
                 out.append((v["name"], base64.b64decode(url.split(",", 1)[1])))
         except Exception:
-            self._drop_kept()
-            raise
-        return out
-
-    def _drop_kept(self):
-        page, self.kept, self.kept_key = getattr(self, "kept", None), None, None
-        if page is not None:
+            self.pages.pop(key, None)
             try:
                 page.close()
             except Exception:
                 pass
+            raise
+        return out
 
     def close(self):
-        self._drop_kept()
+        for p in list(self.pages.values()):
+            try:
+                p.close()
+            except Exception:
+                pass
+        self.pages.clear()
         self.browser.close()
         self.pw.stop()
 
