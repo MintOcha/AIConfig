@@ -116,7 +116,7 @@ class Renderer:
                     except Exception:
                         pass
             while len(self.pages) >= 6:
-                k, p = self.pages.pop(next(iter(self.pages)))
+                p = self.pages.pop(next(iter(self.pages)))
                 try:
                     p.close()
                 except Exception:
