@@ -29,13 +29,24 @@ python scripts/upload.py /path/to/image.png
 python scripts/upload.py /path/to/dataset.zip
 ```
 
+### Batch Upload & High-Res Grid Collation (`--grid` / `--collate`)
+To avoid rate limits or present multiple screenshots/sheets cleanly, pass multiple files or globs with `--grid` (or `--collate`) to stitch them at full native resolution into a labeled grid before uploading:
+```bash
+# Collate multiple images into a single high-res labeled grid and upload
+python scripts/upload.py --grid --title "Aircraft Fleet" /path/to/renders/*.png
+
+# Customize grid columns, save locally, or hide tile labels
+python scripts/upload.py --grid --cols 3 --save-grid /tmp/grid.png img1.png img2.png img3.png
+
+# Batch upload individual files with rate-limit retry & pacing
+python scripts/upload.py --delay 1.5 img1.png img2.png img3.png
+```
+
 Explicit provider flags:
 ```bash
 python scripts/upload.py --provider ezhost /path/to/file.svg
 python scripts/upload.py --provider fuckingfast /path/to/file.csv
 ```
-
-### Dedicated CLIs
 
 - **E-Z.Host direct**:
   ```bash
