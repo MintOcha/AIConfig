@@ -698,8 +698,16 @@ class SearchRouter:
             start_index = self._next_provider_index
             self._next_provider_index = (start_index + 1) % len(SEARCH_PROVIDERS)
 
-        providers = SEARCH_PROVIDERS[start_index:] + SEARCH_PROVIDERS[:start_index]
+        rotated = SEARCH_PROVIDERS[start_index:] + SEARCH_PROVIDERS[:start_index]
+        configured = {
+            "codex_standalone": self._codex_standalone_keys.configured,
+            "brave": self._brave_keys.configured,
+            "duckduckgo": self.config.duckduckgo_enabled,
+            "tavily": self._tavily_keys.configured,
+        }
+        providers = [provider for provider in rotated if configured[provider]]
         failures: list[str] = []
+        any_provider_succeeded_empty = False
         for provider in providers:
             try:
                 if provider == "duckduckgo":
@@ -712,6 +720,7 @@ class SearchRouter:
                     results = await self._search_tavily(query, max_results)
                 if results:
                     return results
+                any_provider_succeeded_empty = True
             except (
                 BraveCooldown,
                 ConfigurationError,
@@ -730,7 +739,11 @@ class SearchRouter:
                 "Search exhausted without results; provider errors (credentials redacted):\n" + "\n".join(failures) +
                 "\n\n[Next Step: Check network/API keys or query with duckduckgo / web_search tool directly]"
             ) from None
-        return "No results found for query. Try broader keywords or removing specific operators."
+        if any_provider_succeeded_empty:
+            return "No results found for query. Try broader keywords or removing specific operators."
+        raise ConfigurationError(
+            "No search providers are configured. Set Brave, Tavily, or Codex standalone keys, or enable DuckDuckGo."
+        )
 
     async def fetch_content(self, urls: list[str]) -> list[dict[str, str]]:
         """Fetch page content through Codex native open command, with DuckDuckGo failover."""
@@ -911,6 +924,8 @@ def _fetch_yahoo_snapshot(symbol: str) -> dict[str, Any]:
         "price_to_book": _non_nan(info.get("priceToBook")),
         "dividend_yield_pct": _non_nan(info.get("dividendYield")),
         "beta": _non_nan(info.get("beta")),
+        "fifty_two_week_low": _non_nan(info.get("fiftyTwoWeekLow")),
+        "fifty_two_week_high": _non_nan(info.get("fiftyTwoWeekHigh")),
         "revenue": _non_nan(info.get("totalRevenue")),
         "operating_income": _latest_statement_value(income, "Operating Income"),
         "net_income": _non_nan(info.get("netIncomeToCommon")),
@@ -934,6 +949,12 @@ def _fmt_number(value: float | None, suffix: str = "") -> str:
     return "n/a" if value is None else f"{value:,.2f}{suffix}"
 
 
+def _fmt_range(low: float | None, high: float | None, currency: str | None) -> str:
+    if low is None or high is None:
+        return "n/a"
+    return f"{low:,.2f} - {high:,.2f} {currency or ''}".rstrip()
+
+
 def _fmt_statement(pair: tuple[str, float] | None, currency: str | None) -> str:
     if pair is None:
         return "n/a"
@@ -952,6 +973,7 @@ def _render_snapshot(snapshot: dict[str, Any], heading: str) -> str:
         ("P/B", _fmt_number(snapshot["price_to_book"])),
         ("Dividend yield", _fmt_number(snapshot["dividend_yield_pct"], "%")),
         ("Beta", _fmt_number(snapshot["beta"])),
+        ("52-week range", _fmt_range(snapshot["fifty_two_week_low"], snapshot["fifty_two_week_high"], cur)),
         ("Revenue (TTM)", _fmt_amount(snapshot["revenue"], cur)),
         ("Operating income (latest FY)", _fmt_statement(snapshot["operating_income"], cur)),
         ("Net income (TTM)", _fmt_amount(snapshot["net_income"], cur)),
