@@ -853,6 +853,14 @@ _MARKET_SUFFIXES: dict[str, str] = {
 _NO_BACKEND_RESPONSE = "Found no tool response"
 
 
+_SHARE_CLASS = re.compile(r"^([A-Z]{1,5})-([A-Z])$")
+
+
+def _backend_ticker(ticker: str) -> str:
+    """Codex finance backend spells share classes with a dot (BRK.B); Yahoo uses a hyphen (BRK-B)."""
+    return _SHARE_CLASS.sub(r"\1.\2", ticker.strip().upper())
+
+
 def normalize_yahoo_symbol(ticker: str, asset_type: str, market: str | None) -> str:
     """Map a user ticker plus optional market code to a Yahoo Finance symbol."""
     symbol = ticker.strip().upper()
@@ -992,7 +1000,7 @@ def _render_snapshot(snapshot: dict[str, Any], heading: str) -> str:
 async def lookup_finance(router: SearchRouter, ticker: str, asset_type: str, market: str | None) -> str:
     """Primary backend first, then Yahoo Finance; backend answers are enriched with fundamentals."""
     symbol = normalize_yahoo_symbol(ticker, asset_type, market)
-    payload: dict[str, Any] = {"ticker": ticker, "type": asset_type}
+    payload: dict[str, Any] = {"ticker": _backend_ticker(ticker), "type": asset_type}
     if market:
         payload["market"] = market
     backend_text = ""
