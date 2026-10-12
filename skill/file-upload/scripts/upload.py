@@ -158,7 +158,7 @@ def collate_images_to_grid(
         fd, out_file = tempfile.mkstemp(prefix="grid_", suffix=".png")
         os.close(fd)
 
-    canvas.convert("RGB").save(out_file, "PNG", optimize=True)
+    canvas.convert("RGB").save(out_file, "PNG", compress_level=6)
     return out_file
 
 def expand_paths(inputs: list[str]) -> list[str]:
