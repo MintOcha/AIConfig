@@ -229,7 +229,7 @@ function sunDirection(clockTime) {
 }
 
 function skyDome(top, horizon, stars, moonDir, showMoon) {
-  const geometry = new THREE.SphereGeometry(1400, 48, 24);
+  const geometry = new THREE.SphereGeometry(4000, 48, 24);
   const material = new THREE.ShaderMaterial({
     side: THREE.BackSide,
     depthWrite: false,
@@ -310,16 +310,24 @@ export async function buildWorld(data, { renderer, textureFor, imageFor }) {
     scene.fog = new THREE.FogExp2(horizon.clone(), density);
   }
 
-  // Ambient light: outdoor ambient from the sky, indoor ambient from below.
-  const outdoor = srgb(L.OutdoorAmbient ?? [0.5, 0.5, 0.5]);
-  const indoor = srgb(L.Ambient ?? [0, 0, 0]);
-  scene.add(new THREE.HemisphereLight(outdoor, indoor, 2.2 + (L.EnvironmentDiffuseScale ?? 0) * 1.5));
-  const brightness = L.Brightness ?? 2;
-  const celestial = new THREE.DirectionalLight(
-    night ? new THREE.Color(0.62, 0.7, 0.95) : new THREE.Color(1, 0.96, 0.88),
-    night ? brightness * 0.35 : brightness * 1.4,
+  // Ambient light: guaranteed ambient fill + outdoor hemisphere from sky and ground bounce.
+  const outdoor = srgb(L.OutdoorAmbient ?? [0.55, 0.58, 0.62]);
+  const rawIndoor = srgb(L.Ambient ?? [0.42, 0.44, 0.48]);
+  const indoor = new THREE.Color(
+    Math.max(rawIndoor.r, 0.28),
+    Math.max(rawIndoor.g, 0.29),
+    Math.max(rawIndoor.b, 0.32),
   );
-  celestial.position.copy((night ? moonDir : sun).clone().multiplyScalar(200));
+  const groundBounce = indoor.clone().lerp(outdoor, 0.45);
+  scene.add(new THREE.AmbientLight(indoor.clone().lerp(outdoor, 0.5), 0.7));
+  scene.add(new THREE.HemisphereLight(outdoor, groundBounce, 0.85 + (L.EnvironmentDiffuseScale ?? 0) * 0.5));
+  const brightness = Math.min(L.Brightness ?? 2, 2.5);
+  const celestialDir = (night ? moonDir : sun).clone();
+  const celestial = new THREE.DirectionalLight(
+    night ? new THREE.Color(0.62, 0.7, 0.95) : new THREE.Color(1, 0.97, 0.92),
+    night ? brightness * 0.4 : brightness * 0.75,
+  );
+  celestial.position.copy(celestialDir.clone().multiplyScalar(200));
   celestial.target.position.set(0, 0, -20);
   celestial.castShadow = L.GlobalShadows !== false;
   celestial.shadow.mapSize.set(2048, 2048);
@@ -327,7 +335,6 @@ export async function buildWorld(data, { renderer, textureFor, imageFor }) {
   celestial.shadow.bias = -0.0006;
   celestial.shadow.normalBias = 0.06;
   scene.add(celestial, celestial.target);
-
   // Environment for reflections: the sky itself.
   const envScene = new THREE.Scene();
   envScene.add(skyDome(top, horizon, 0, moonDir, false));
@@ -487,9 +494,26 @@ export async function buildWorld(data, { renderer, textureFor, imageFor }) {
   }
 
   function updateLights(camera) {
-    if (pointPool.length === 0 && spotPool.length === 0) return;
     const camPos = new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld);
     const camForward = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 2).negate().normalize();
+    const focusDist = data.notes?.distance ?? 80;
+    const focusCenter = data.notes?.center
+      ? new THREE.Vector3(data.notes.center[0], data.notes.center[1], data.notes.center[2])
+      : camPos.clone().addScaledVector(camForward, Math.min(focusDist, 200));
+    const shadowSpan = Math.max(80, Math.min(1200, focusDist * 1.1));
+    celestial.target.position.copy(focusCenter);
+    celestial.position.copy(focusCenter).addScaledVector(celestialDir, shadowSpan * 2.5);
+    Object.assign(celestial.shadow.camera, {
+      left: -shadowSpan,
+      right: shadowSpan,
+      top: shadowSpan,
+      bottom: -shadowSpan,
+      near: 1,
+      far: shadowSpan * 6,
+    });
+    celestial.shadow.camera.updateProjectionMatrix();
+    celestial.target.updateMatrixWorld();
+    if (pointPool.length === 0 && spotPool.length === 0) return;
 
     function score(light) {
       const toLight = new THREE.Vector3().subVectors(light.worldPos, camPos);

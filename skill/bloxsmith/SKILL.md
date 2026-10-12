@@ -25,7 +25,8 @@ view [target]       pictures, printed as absolute paths under <project>/dist/vie
                       a dotted path in the built game (Workspace.Coins, StarterGui.HUD): shown inside the whole world.
                       a .anim file or a KeyframeSequence: the clip drawn frame by frame on the rig that has every joint it keys (see animation).
                     world things -> one sheet, 9 angles (top, +x -x +z -z, 4 corners). gui things -> desktop above phone.
-                    --angles=top,+x picks some. --look=x,y,z>tx,ty,tz is your own camera (eye>target, repeat it). --cframe=12 numbers also works. --out=name names the picture. --fov=55. --rig=<model> and --samples=N for animations.
+                    --lookat=x,y,z|PartName sets the orbit center and --distance=N sets the orbit radius in studs across all 9 sheet angles (oversized scenes >500 studs warn and clamp to default lookat=0,0,0, distance=150).
+                    --angles=top,+x picks some. --look=x,y,z>tx,ty,tz is your own single camera (eye>target, repeat it). --cframe=12 numbers also works. --out=name names the picture. --fov=55. --rig=<model> and --samples=N for animations.
                     only the finished image is saved, never the single frames.
 toolbox <query>     search Creator Store / Toolbox assets (models, decals, audio). flags: --category=Model, --limit=10.
 catalog <query>     search Roblox Avatar Catalog items. flags: --category=All, --limit=10.

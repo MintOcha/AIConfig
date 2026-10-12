@@ -282,10 +282,11 @@ def _look_cframe(text: str) -> str:
 
 
 def cmd_view(args: list[str]) -> int:
-    """view [target] [--cframe=x,y,z,r00..r22] [--look=x,y,z>tx,ty,tz] [--angles=top,+x] [--fov=55] [--out=name]
+    """view [target] [--lookat=x,y,z|PartName] [--distance=N] [--cframe=x,y,z,r00..r22] [--look=x,y,z>tx,ty,tz] [--angles=top,+x] [--fov=55] [--out=name]
     target: dotted path in the built project (Workspace.Coins, StarterGui.HUD). none = the whole world.
     world targets get 9 angles as one contact sheet; gui targets get desktop and phone.
-    --look is a camera at an eye point looking at a target (repeat it for several). --out names the picture."""
+    --lookat sets the orbit center (x,y,z or part/model name); --distance sets orbit radius in studs across all sheet angles.
+    --look is a single camera at an eye point looking at a target (repeat it for several). --out names the picture."""
     import json as _json
     import tempfile
     import time

@@ -58,7 +58,9 @@ local function isolate(dm, targets, keepLighting, floorSize)
 	local ws = dm:GetService("Workspace")
 	if not keepLighting then
 		local light = dm:GetService("Lighting")
-		light.ClockTime, light.Brightness, light.GlobalShadows = 14, 3, true
+		light.ClockTime, light.Brightness, light.GlobalShadows = 14, 2, true
+		light.Ambient = roblox.Color3.fromRGB(120, 125, 135)
+		light.OutdoorAmbient = roblox.Color3.fromRGB(145, 152, 165)
 	end
 	for _, target in targets do -- a target nested in Map/Areas/... must not die with its container: hoist it first (parts hold world coordinates)
 		if target.Parent ~= ws and target:IsDescendantOf(ws) then
@@ -70,22 +72,29 @@ local function isolate(dm, targets, keepLighting, floorSize)
 			child:Destroy()
 		end
 	end
-	local lowest, sx, sz, n = nil, 0, 0, 0
+	local lowest, minX, maxX, minZ, maxZ, sx, sz, n = nil, nil, nil, nil, nil, 0, 0, 0
 	for _, inst in targets do
 		local nodes = inst:GetDescendants()
 		table.insert(nodes, inst)
 		for _, d in nodes do
 			if d:IsA("BasePart") and d:IsDescendantOf(ws) then
 				local p = d.CFrame.Position
-				lowest = lowest and math.min(lowest, p.Y - d.Size.Y / 2) or (p.Y - d.Size.Y / 2)
+				local s = d.Size
+				lowest = lowest and math.min(lowest, p.Y - s.Y / 2) or (p.Y - s.Y / 2)
+				minX = minX and math.min(minX, p.X - s.X / 2) or (p.X - s.X / 2)
+				maxX = maxX and math.max(maxX, p.X + s.X / 2) or (p.X + s.X / 2)
+				minZ = minZ and math.min(minZ, p.Z - s.Z / 2) or (p.Z - s.Z / 2)
+				maxZ = maxZ and math.max(maxZ, p.Z + s.Z / 2) or (p.Z + s.Z / 2)
 				sx, sz, n = sx + p.X, sz + p.Z, n + 1
 			end
 		end
 	end
 	if n > 0 then
+		local span = math.max((maxX or 0) - (minX or 0), (maxZ or 0) - (minZ or 0), 20)
+		local autoSize = floorSize or math.clamp(span * 2.2, 120, 2000)
 		local floor = roblox.Instance.new("Part")
 		floor.Name, floor.Anchored = "Floor", true
-		floor.Size = V3.new(floorSize or 120, 1, 120)
+		floor.Size = V3.new(autoSize, 1, autoSize)
 		floor.CFrame = CFrame.new(sx / n, lowest - 0.5, sz / n)
 		floor.Color = roblox.Color3.fromRGB(120, 140, 120)
 		floor.Parent = ws
@@ -470,8 +479,44 @@ local scenes = {}
 
 -- world scene: the whole workspace for context, camera fitted to the targets
 if hasParts then
-	local state = Scene.newState()
 	local ws = dm:GetService("Workspace")
+	local preLookPart = nil
+	if type(flags.lookat) == "string" and flags.lookat ~= "" and not tonumber(flags.distance) and not tonumber(flags.dist) then
+		local searchRoots = #targets > 0 and targets or { ws }
+		for _, r in searchRoots do
+			local f = r:FindFirstChild(flags.lookat, true)
+			if f and f:IsA("BasePart") and (f.Name == "EyePoint" or flags.pov) then
+				preLookPart = f
+				break
+			end
+		end
+	end
+	if preLookPart then
+		local modelRoot = preLookPart.Parent
+		local keepFolders = { Panel = true, Controls = true, Surfaces = true }
+		local keepNames = { PanelShell = true, PilotSeat = true, Seat = true, Floor = true, Windscreen = true, Windshield = true, Canopy = true, CockpitWindow = true }
+		if modelRoot then
+			for _, d in modelRoot:GetDescendants() do
+				if d:IsA("BasePart") then
+					local inKeep = keepNames[d.Name] == true or d.Material == roblox.Enum.Material.Glass
+					if not inKeep then
+						local p = d.Parent
+						while p and p ~= modelRoot do
+							if keepFolders[p.Name] then
+								inKeep = true
+								break
+							end
+							p = p.Parent
+						end
+					end
+					if not inKeep then
+						d.Transparency = 1
+					end
+				end
+			end
+		end
+	end
+	local state = Scene.newState()
 	local children = {}
 	for _, c in ws:GetChildren() do
 		if c.ClassName ~= "Terrain" and c.ClassName ~= "Camera" then
@@ -514,19 +559,108 @@ if hasParts then
 		local fov = tonumber(flags.fov) or 55
 		-- distance so the whole box fits the frame
 		local d = (size / 2) / math.tan(math.rad(fov / 2)) * 1.25 + size * 0.35
-		local function view(name, dx, dy, dz)
-			local dir = V3.new(dx, dy, dz).Unit
-			table.insert(views, { name = name, cframe = { Scene.lookAt(c + dir * d, c):GetComponents() }, fov = fov })
+
+		local customCenter = nil
+		local customLookPart = nil
+		if type(flags.lookat) == "string" and flags.lookat ~= "" then
+			local nums = {}
+			for x in flags.lookat:gmatch("[^,]+") do
+				local v = tonumber(x)
+				if v then
+					table.insert(nums, v)
+				end
+			end
+			if #nums == 3 then
+				customCenter = V3.new(nums[1], nums[2], nums[3])
+			else
+				local searchRoots = #targets > 0 and targets or { ws }
+				for _, r in searchRoots do
+					local found = nil
+					if flags.lookat:find(".", 1, true) then
+						local cur = r
+						for seg in flags.lookat:gmatch("[^%.]+") do
+							if cur.Name ~= seg then
+								cur = cur:FindFirstChild(seg, true)
+							end
+							if not cur then
+								break
+							end
+						end
+						found = cur
+					else
+						found = r:FindFirstChild(flags.lookat, true)
+					end
+					if found then
+						if found:IsA("BasePart") then
+							customCenter = found.CFrame.Position
+							customLookPart = found
+							break
+						end
+						local a, b = Scene.bounds(found)
+						if a and b then
+							customCenter = (a + b) / 2
+							break
+						end
+					end
+				end
+			end
 		end
-		view("top", 0.001, 1, 0.12)
-		view("+x", 1, 0.3, 0)
-		view("-x", -1, 0.3, 0)
-		view("+z", 0, 0.3, 1)
-		view("-z", 0, 0.3, -1)
-		view("+x+z", 0.7, 0.5, 0.7)
-		view("+x-z", 0.7, 0.5, -0.7)
-		view("-x+z", -0.7, 0.5, 0.7)
-		view("-x-z", -0.7, 0.5, -0.7)
+		local customDist = tonumber(flags.distance) or tonumber(flags.dist)
+		if customCenter then
+			c = customCenter
+		end
+		if customDist and customDist > 0 then
+			d = customDist
+		elseif size > 500 then
+			local defaultCenter = customCenter or (#targets == 0 and V3.new(0, 0, 0) or c)
+			local defaultDist = 150
+			table.insert(
+				notes,
+				string.format(
+					"WARNING: target bounding box is very large (%.0f studs across). Defaulting camera to lookat=(%.1f, %.1f, %.1f), distance=%.0f studs. Pass --lookat=x,y,z --distance=<studs> to inspect a specific area or zoom level.",
+					size,
+					defaultCenter.X,
+					defaultCenter.Y,
+					defaultCenter.Z,
+					defaultDist
+				)
+			)
+			c = defaultCenter
+			d = defaultDist
+		end
+		scene.notes.center = { c.X, c.Y, c.Z }
+		scene.notes.distance = d
+		scene.notes.span = size
+		if customLookPart and (customLookPart.Name == "EyePoint" or flags.pov) and not tonumber(flags.distance) and not tonumber(flags.dist) then
+			local cf = customLookPart.CFrame
+			local function povView(name, yawDeg, pitchDeg, rollOffset)
+				local camCf = cf * CFrame.new(0, 0.1, rollOffset or 0.2) * CFrame.Angles(math.rad(pitchDeg), math.rad(yawDeg), 0)
+				table.insert(views, { name = name, cframe = { camCf:GetComponents() }, fov = fov })
+			end
+			povView("forward", 0, -8, 0.2)
+			povView("panel", 0, -22, 0.35)
+			povView("pedestal", 0, -42, 0.2)
+			povView("left", 35, -10, 0.2)
+			povView("right", -35, -10, 0.2)
+			povView("up-fwd", 0, 12, 0.2)
+			povView("left-panel", 18, -20, 0.3)
+			povView("right-panel", -18, -20, 0.3)
+			povView("wide-cabin", 0, -15, 1.5)
+		else
+			local function view(name, dx, dy, dz)
+				local dir = V3.new(dx, dy, dz).Unit
+				table.insert(views, { name = name, cframe = { Scene.lookAt(c + dir * d, c):GetComponents() }, fov = fov })
+			end
+			view("top", 0.001, 1, 0.12)
+			view("+x", 1, 0.3, 0)
+			view("-x", -1, 0.3, 0)
+			view("+z", 0, 0.3, 1)
+			view("-z", 0, 0.3, -1)
+			view("+x+z", 0.7, 0.5, 0.7)
+			view("+x-z", 0.7, 0.5, -0.7)
+			view("-x+z", -0.7, 0.5, 0.7)
+			view("-x-z", -0.7, 0.5, -0.7)
+		end
 	end
 	if type(flags.angles) == "string" and not customViews then
 		local want = {}
@@ -554,7 +688,8 @@ end
 -- gui scenes: the target ScreenGui(s) forced on, at desktop and phone size
 if hasGui then
 	local sources = {}
-	if #targets == 0 or (#targets == 1 and targets[1].ClassName == "StarterGui") then
+	local forceEnable = not (#targets == 0 or (#targets == 1 and targets[1].ClassName == "StarterGui"))
+	if not forceEnable then
 		sources = dm:GetService("StarterGui"):GetChildren()
 	else
 		for _, target in targets do
@@ -569,11 +704,31 @@ if hasGui then
 		end
 	end
 	for _, screen in { { "desktop", 1280, 720 }, { "phone", 844, 390 } } do
+		local isPhone = screen[1] == "phone"
 		local state = Scene.newState()
 		local children = {}
 		for _, s in sources do
-			local node = Scene.node(s, state)
-			if s:IsA("LayerCollector") then
+			local copy = s:Clone()
+			local function applyBreakpoint(inst)
+				local doOnly = inst:GetAttribute("DesktopOnly")
+				if doOnly ~= nil and isPhone then
+					inst.Visible = false
+				end
+				local px = inst:GetAttribute(isPhone and "PhoneX" or "DeskX")
+				local py = inst:GetAttribute(isPhone and "PhoneY" or "DeskY")
+				local pw = inst:GetAttribute(isPhone and "PhoneW" or "DeskW")
+				local ph = inst:GetAttribute(isPhone and "PhoneH" or "DeskH")
+				if type(px) == "number" and type(py) == "number" and type(pw) == "number" and type(ph) == "number" then
+					inst.Position = roblox.UDim2.fromScale(px, py)
+					inst.Size = roblox.UDim2.fromScale(pw, ph)
+				end
+			end
+			applyBreakpoint(copy)
+			for _, d in copy:GetDescendants() do
+				applyBreakpoint(d)
+			end
+			local node = Scene.node(copy, state)
+			if forceEnable and s:IsA("LayerCollector") then
 				node.props.Enabled = true
 			end
 			table.insert(children, node)

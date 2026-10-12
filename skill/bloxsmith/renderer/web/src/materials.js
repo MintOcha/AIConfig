@@ -190,7 +190,7 @@ export function partMaterial({ material, color, transparency = 0, reflectance = 
   const opacity = 1 - transparency;
   if (name === 'Neon') {
     // Neon ignores lighting and glows; the bloom pass picks up values above 1.
-    const glow = srgb(color).multiplyScalar(2.2);
+    const glow = srgb(color).multiplyScalar(2.6);
     return new THREE.MeshBasicMaterial({
       color: glow,
       transparent: opacity < 1,

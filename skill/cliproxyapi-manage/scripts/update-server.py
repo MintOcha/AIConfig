@@ -12,8 +12,13 @@ from urllib.request import Request, urlopen
 import yaml
 
 
-MODELS_URL = "https://opencode.ai/zen/go/v1/models"
-OPENCODE_BASE_URL = "https://opencode.ai/zen/go/v1"
+OPENCODE_ENDPOINTS = {
+    "https://opencode.ai/zen/go/v1": ("https://opencode.ai/zen/go/v1/models", False),
+    "https://opencode.ai/zen/v1": ("https://opencode.ai/zen/v1/models", True),
+    "http://zen-free:8801/v1": ("https://opencode.ai/zen/v1/models", True),
+    "http://127.0.0.1:8801/v1": ("https://opencode.ai/zen/v1/models", True),
+}
+EXCLUDED_ZEN_MODELS = {"exo-free", "ling-3.0-flash-fin-free"}
 
 CLI_PROXY_CONTAINER = "cli-proxy-api"
 POSTGRES_CONTAINER = "cliproxyapi-postgres"
@@ -21,9 +26,10 @@ DASHBOARD_CONTAINER = "cliproxyapi-dashboard"
 USAGE_COLLECTOR_CONTAINER = "cliproxyapi-usage-collector"
 DASHBOARD_LOCAL_URL = "http://127.0.0.1:6868"
 
-def fetch_models() -> list[str]:
+
+def fetch_models(models_url: str) -> list[str]:
     request = Request(
-        MODELS_URL,
+        models_url,
         headers={
             "Accept": "application/json",
             "User-Agent": "CLIProxyAPI-model-updater/1.0",
@@ -33,7 +39,7 @@ def fetch_models() -> list[str]:
         payload = yaml.safe_load(response.read())
 
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-        raise ValueError("OpenCode returned an unexpected model response")
+        raise ValueError(f"OpenCode returned an unexpected model response from {models_url}")
 
     models = sorted(
         {
@@ -43,15 +49,14 @@ def fetch_models() -> list[str]:
         }
     )
     if not models:
-        raise ValueError("OpenCode returned no model IDs")
+        raise ValueError(f"OpenCode returned no model IDs from {models_url}")
     return models
-
 
 def normalize_url(value: object) -> str:
     return str(value).strip().rstrip("/")
 
 
-def update_config(config_path: Path, model_ids: list[str]) -> int:
+def update_config(config_path: Path) -> int:
     with config_path.open(encoding="utf-8") as config_file:
         config = yaml.safe_load(config_file)
 
@@ -62,22 +67,33 @@ def update_config(config_path: Path, model_ids: list[str]) -> int:
     if not isinstance(providers, list):
         return 0
 
+    cached_models: dict[str, list[str]] = {}
     updates = 0
     for provider in providers:
         if not isinstance(provider, dict):
             continue
-        if normalize_url(provider.get("base-url")) != OPENCODE_BASE_URL:
+        base_url = normalize_url(provider.get("base-url"))
+        endpoint_spec = OPENCODE_ENDPOINTS.get(base_url)
+        if not endpoint_spec:
             continue
+        models_url, free_only = endpoint_spec
+        if models_url not in cached_models:
+            cached_models[models_url] = fetch_models(models_url)
+        model_ids = [
+            m for m in cached_models[models_url]
+            if (not free_only or "free" in m.lower())
+            and not m.lower().startswith("jev-")
+            and m not in EXCLUDED_ZEN_MODELS
+        ]
         api_key_entries = provider.get("api-key-entries")
         api_configured = isinstance(api_key_entries, list) and any(
             isinstance(entry, dict) and str(entry.get("api-key", "")).strip()
             for entry in api_key_entries
         )
-        expected_models = [{"name": model_id} for model_id in model_ids] if api_configured else []
+        expected_models = [{"name": model_id, "alias": model_id} for model_id in model_ids] if api_configured else []
         if provider.get("models") != expected_models:
             provider["models"] = expected_models
             updates += 1
-
     if updates == 0:
         return 0
 
@@ -254,13 +270,13 @@ def update_dashboard(dashboard_dir: Path) -> tuple[str, str]:
     print("=== Updating Dashboard ===", flush=True)
     compose_command(dashboard_dir, compose_file, "pull", "dashboard")
     compose_command(dashboard_dir, compose_file, "up", "-d")
+    after_version = deployed_version(dashboard_dir, compose_file, "dashboard")
     return before_version, after_version
 
 
 def restart_stacks(project_dir: Path) -> None:
     print("=== Restarting CLIProxyAPI ===", flush=True)
-    compose_command(project_dir, None, "up", "-d")
-
+    compose_command(project_dir, None, "up", "-d", "--force-recreate")
 
 def verify_containers_running(include_dashboard: bool = True, dashboard_dir: Path | None = None) -> None:
     running = running_container_names()
@@ -324,8 +340,7 @@ def main() -> int:
         if dashboard_dir:
             trigger_usage_collection(dashboard_dir)
         run_recent_errors(project_dir)
-        model_ids = fetch_models()
-        updated_providers = update_config(config_path, model_ids)
+        updated_providers = update_config(config_path)
         if updated_providers == 0:
             print("No OpenCode provider configuration changed.")
         else:

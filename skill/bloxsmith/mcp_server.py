@@ -88,12 +88,25 @@ def create_server(name: str = "RbxMCP") -> FastMCP:
         }
 
     @server.tool()
-    def view(target: str = "", angles: str = "", cframe: str = "", fov: float = 0, project_dir: str = "") -> list:
-        """Render 3D world contact sheets, GUI desktop/phone previews, or .anim pose sheets."""
+    def view(
+        target: str = "",
+        lookat: str = "",
+        distance: float = 0,
+        angles: str = "",
+        cframe: str = "",
+        fov: float = 0,
+        project_dir: str = "",
+    ) -> list:
+        """Render 3D world contact sheets, GUI desktop/phone previews, or .anim pose sheets.
+        Use lookat ('x,y,z' or child/part name) and distance (studs from lookat) to orbit around a specific focal point across all sheet angles."""
         proj = Path(project_dir).resolve() if project_dir else current_project()
         cmd = [sys.executable, str(REPO / "main.py"), "--project", str(proj), "view"]
         if target:
             cmd.append(target)
+        if lookat:
+            cmd.append(f"--lookat={lookat}")
+        if distance > 0:
+            cmd.append(f"--distance={distance}")
         if angles:
             cmd.append(f"--angles={angles}")
         if cframe:

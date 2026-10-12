@@ -367,9 +367,12 @@ async function main() {
   document.getElementById('world').appendChild(renderer.domElement);
 
   const world = await buildWorld(data, { renderer, textureFor, imageFor });
-  renderer.toneMappingExposure = world.exposure * 1.05;
+  renderer.toneMappingExposure = world.exposure * 1.0;
 
-  const camera = new THREE.PerspectiveCamera(data.camera.fov ?? 70, W / H, 0.1, 3000);
+  const camDist = data.notes?.distance ?? 80;
+  const nearPlane = Math.max(0.15, Math.min(2, camDist * 0.002));
+  const farPlane = Math.max(15000, camDist * 10);
+  const camera = new THREE.PerspectiveCamera(data.camera.fov ?? 70, W / H, nearPlane, farPlane);
   camera.matrixAutoUpdate = false;
   camera.matrix.copy(cframeMatrix(data.camera.cframe));
   camera.matrixWorld.copy(camera.matrix);
@@ -378,9 +381,11 @@ async function main() {
   world.updateLights?.(camera);
   const composer = new EffectComposer(renderer);
   composer.addPass(new RenderPass(world.scene, camera));
-  // A BloomEffect in Lighting sets the glow (Neon); without one the renderer's default glow applies
-  const { Intensity = 0.55, Size = 25, Threshold = 0.92 } = activeEffect('BloomEffect')?.props ?? {};
-  composer.addPass(new UnrealBloomPass(new THREE.Vector2(W, H), Intensity, Math.min(1, Size / 56), Threshold));
+  // A BloomEffect in Lighting sets the glow (Neon); threshold > 1.35 ensures only Neon/HDR glints bloom, never diffuse white parts
+  const { Intensity = 0.25, Size = 24, Threshold = 0.95 } = activeEffect('BloomEffect')?.props ?? {};
+  composer.addPass(
+    new UnrealBloomPass(new THREE.Vector2(W, H), Intensity * 0.35, Math.min(1, Size / 56), Math.max(1.4, Threshold * 1.5)),
+  );
   const lighting = data.lighting;
   const cc = lighting.children.find((c) => c.class === 'ColorCorrectionEffect' && c.props.Enabled !== false);
   if (cc) {
