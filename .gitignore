@@ -5,4 +5,6 @@ kaggle/
 *.pyc
 # skill secrets
 skill/*/config.toml
+skill/*/config.yaml
 config.toml
+config.yaml

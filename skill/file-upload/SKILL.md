@@ -1,59 +1,92 @@
 ---
 name: file-upload
-description: Upload files, images, SVGs, documents, and archives using E-Z.Host (images, SVGs, hosted direct URLs) or FuckingFast (binaries, archives, datasets, general file downloads).
+description: Upload files (routing across Catbox, E-Z.Host, FuckingFast), view file details/links, and download from a link or id using scripts/upload.py.
 ---
 
 # Unified File Upload
 
-Provides two upload backends for publishing local artifacts and returning URLs:
-1. **E-Z.Host**: For images, SVGs, screenshots, visual charts, and direct media hosting.
-2. **FuckingFast**: For general files, datasets, ZIP/TAR archives, binaries, and remote file management.
+One CLI: `scripts/upload.py`. It routes uploads across a provider table
+(`config.toml`), and also views and downloads files.
 
-## Setup & Credentials
+## Setup
 
-- **E-Z.Host**: Place your API key in `config.toml` (git-ignored):
-  ```toml
-  [ezhost]
-  api_url = "https://api.e-z.host/files"
-  key = "YOUR_API_KEY"
-  ```
-  Or export `EZHOST_KEY`.
-- **FuckingFast**: Anonymous uploads require no setup. For account storage, export `FUCKINGFAST_ACCOUNT_ID`.
+None required. On first run `config.example.toml` is copied to `config.toml`
+(git-ignored) automatically. Fill in provider keys there:
 
-## Usage
+- `[providers.ezhost]` — set `key` (or export `EZHOST_KEY`); used for images <=10MB
+  and videos <=100MB.
+- `[providers.fuckingfast]` — anonymous by default; export `FUCKINGFAST_ACCOUNT_ID`
+  for account features. `mirrors` lists failover hosts for view/download.
+- `[providers.catbox]` — permanent hosting, <=200MB, no key needed.
 
-### Auto Dispatcher (`scripts/upload.py`)
-Auto-routes images and SVGs to E-Z.Host, and general files/archives to FuckingFast:
+## Upload
+
+Prints the share URL (add `--json` for full JSON):
+
 ```bash
-python scripts/upload.py /path/to/image.png
-python scripts/upload.py /path/to/dataset.zip
+python scripts/upload.py /path/to/file.zip          # routes automatically
+python scripts/upload.py upload /path/to/file.zip --permanent   # Catbox (<=200MB)
+python scripts/upload.py upload file.zip --provider fuckingfast
+python scripts/upload.py upload img.png --provider ezhost
+python scripts/upload.py upload secret.zip --encrypt             # password-protected zip
 ```
 
-### Batch Upload & High-Res Grid Collation (`--grid` / `--collate`)
-To avoid rate limits or present multiple screenshots/sheets cleanly, pass multiple files or globs with `--grid` (or `--collate`) to stitch them at full native resolution into a labeled grid before uploading:
+A bare file path defaults to `upload`. Routing picks `catbox` with `--permanent`
+if the file is <=200MB (otherwise warns `permanent ignored due to file size too large`
+and uses FuckingFast), `ezhost` for small images/videos with a key, else FuckingFast.
+
+Before uploading anything, delete personal info from it first: home paths,
+usernames, emails, tokens, API keys, internal hostnames. There is no flag for
+this — inspect the file and strip or regenerate anything identifying.
+
+### Batch upload & grid
+
+Multiple files and globs upload in one run (1s pacing between uploads;
+rate-limit 429s are retried with backoff automatically):
+
 ```bash
-# Collate multiple images into a single high-res labeled grid and upload
-python scripts/upload.py --grid --title "Aircraft Fleet" /path/to/renders/*.png
-
-# Customize grid columns, save locally, or hide tile labels
-python scripts/upload.py --grid --cols 3 --save-grid /tmp/grid.png img1.png img2.png img3.png
-
-# Batch upload individual files with rate-limit retry & pacing
-python scripts/upload.py --delay 1.5 img1.png img2.png img3.png
+python scripts/upload.py upload out1.png out2.png out3.png
+python scripts/upload.py upload "renders/*.png" --delay 1.5
 ```
 
-Explicit provider flags:
+`--grid` (alias `--collate`) stitches the images into one labeled
+high-resolution grid PNG before uploading, for presenting many screenshots as
+a single link:
+
 ```bash
-python scripts/upload.py --provider ezhost /path/to/file.svg
-python scripts/upload.py --provider fuckingfast /path/to/file.csv
+python scripts/upload.py upload "renders/*.png" --grid --title "Aircraft Fleet"
+python scripts/upload.py upload a.png b.png c.png --grid --cols 3 --save-grid /tmp/grid.png
+python scripts/upload.py upload "renders/*.png" --grid --no-labels
 ```
 
-- **E-Z.Host direct**:
-  ```bash
-  python scripts/ezhost.py /path/to/chart.svg
-  ```
-- **FuckingFast direct & management**:
-  ```bash
-  python scripts/fuckingfast.py upload /path/to/file.zip
-  python scripts/fuckingfast.py ls
-  ```
+## View
+
+Id or full link, any mirror; returns name, size, downloads/views, hashes, note,
+and a fresh direct `downloadUrl`:
+
+```bash
+python scripts/upload.py view imhnttk9fbm4
+python scripts/upload.py view https://fuckingfast.net/imhnttk9fbm4 --json
+```
+
+## Download
+
+Resolves the id/link and saves it. Uses `aria2c` with 15 connections by default,
+falling back to a built-in threaded downloader if aria2c is missing:
+
+```bash
+python scripts/upload.py download imhnttk9fbm4
+python scripts/upload.py download https://fuckingfast.net/IMHNTTK9FBM4 -o out.7z -c 8
+```
+
+## Account management
+
+Requires `FUCKINGFAST_ACCOUNT_ID`:
+
+```bash
+python scripts/upload.py ls [DIRECTORY_ID]
+python scripts/upload.py mkdir PARENT_ID NAME
+python scripts/upload.py rename ITEM_ID NAME
+python scripts/upload.py note ITEM_ID TEXT
+python scripts/upload.py delete DIRECTORY_ID --yes
+```

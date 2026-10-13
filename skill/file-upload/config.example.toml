@@ -1,3 +1,30 @@
-[ezhost]
+# Unified File Upload Configuration
+
+[providers.catbox]
+enabled = true
+permanent = true
+max_size_mb = 200
+api_url = "https://catbox.moe/user/api.php"
+
+[providers.ezhost]
+enabled = true
+media_only = true
+image_max_size_mb = 10
+video_max_size_mb = 100
+image_extensions = [".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp", ".bmp", ".ico"]
+video_extensions = [".mp4", ".webm", ".mov", ".mkv", ".avi"]
 api_url = "https://api.e-z.host/files"
 key = "YOUR_API_KEY_HERE"
+
+[providers.fuckingfast]
+enabled = true
+upload_url = "https://w.fuckingfast.net"
+fallback_upload_url = "https://w.buzzheavier.com"
+api_url = "https://fuckingfast.net/api"
+mirrors = [
+    "https://fuckingfast.net",
+    "https://bzzhr.to",
+    "https://fuckingfast.co",
+    "https://buzzheavier.com",
+    "https://bzzhr.co",
+]
