@@ -174,15 +174,22 @@ def choose_provider(args: argparse.Namespace, path: Path, size: int) -> str:
 
 
 def upload_catbox(path: Path) -> dict:
+    userhash = CB_CFG.get("userhash") or os.environ.get("CATBOX_USERHASH")
     boundary = secrets.token_hex(16)
     mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     parts = [
         f"--{boundary}\r\nContent-Disposition: form-data; name=\"reqtype\"\r\n\r\nfileupload\r\n".encode(),
+    ]
+    if userhash and "YOUR_" not in userhash:
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"userhash\"\r\n\r\n{userhash}\r\n".encode()
+        )
+    parts.extend([
         f"--{boundary}\r\nContent-Disposition: form-data; name=\"fileToUpload\"; filename=\"{path.name}\"\r\n"
         f"Content-Type: {mime}\r\n\r\n".encode(),
         path.read_bytes(),
         f"\r\n--{boundary}--\r\n".encode(),
-    ]
+    ])
     req = Request(CATBOX_API, data=b"".join(parts), headers={
         "Content-Type": f"multipart/form-data; boundary={boundary}",
         "User-Agent": UA,

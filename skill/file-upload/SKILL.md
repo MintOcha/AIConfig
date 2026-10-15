@@ -17,7 +17,7 @@ None required. On first run `config.example.toml` is copied to `config.toml`
   and videos <=100MB.
 - `[providers.fuckingfast]` — anonymous by default; export `FUCKINGFAST_ACCOUNT_ID`
   for account features. `mirrors` lists failover hosts for view/download.
-- `[providers.catbox]` — permanent hosting, <=200MB, no key needed.
+- `[providers.catbox]` — permanent hosting, <=200MB, no key needed. Optional `userhash` (or `CATBOX_USERHASH` env var) links uploads to your Catbox account.
 
 ## Upload
 

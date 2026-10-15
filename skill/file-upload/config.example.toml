@@ -5,6 +5,7 @@ enabled = true
 permanent = true
 max_size_mb = 200
 api_url = "https://catbox.moe/user/api.php"
+# userhash = "YOUR_USERHASH_HERE"   # optional: from https://catbox.moe/user/manage.php to link to account
 
 [providers.ezhost]
 enabled = true
