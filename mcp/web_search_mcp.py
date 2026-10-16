@@ -1214,6 +1214,17 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="Validate configuration and exit without starting the MCP server",
     )
+    parser.add_argument(
+        "--search",
+        metavar="QUERY",
+        help="Run one web search, print JSON results to stdout, and exit (no MCP server)",
+    )
+    parser.add_argument(
+        "--max-results",
+        type=int,
+        default=10,
+        help="Result count for --search (1-20)",
+    )
     return parser.parse_args()
 
 
@@ -1228,6 +1239,11 @@ def main() -> None:
             f"Codex standalone keys: {len(config.codex_standalone_keys)}, "
             f"Tavily keys: {len(config.tavily_keys)})"
         )
+        return
+
+    if arguments.search is not None:
+        results = asyncio.run(SearchRouter(config).search(arguments.search, arguments.max_results))
+        print(json.dumps(results, ensure_ascii=False))
         return
 
     global router

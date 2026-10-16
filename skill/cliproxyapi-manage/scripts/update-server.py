@@ -18,7 +18,7 @@ OPENCODE_ENDPOINTS = {
     "http://zen-free:8801/v1": ("https://opencode.ai/zen/v1/models", True),
     "http://127.0.0.1:8801/v1": ("https://opencode.ai/zen/v1/models", True),
 }
-EXCLUDED_ZEN_MODELS = {"exo-free", "ling-3.0-flash-fin-free"}
+EXCLUDED_ZEN_MODELS = {"exo-free", "ling-3.0-flash-fin-free", "ling-3.1-flash-free", "test"}
 
 CLI_PROXY_CONTAINER = "cli-proxy-api"
 POSTGRES_CONTAINER = "cliproxyapi-postgres"
@@ -81,7 +81,7 @@ def update_config(config_path: Path) -> int:
             cached_models[models_url] = fetch_models(models_url)
         model_ids = [
             m for m in cached_models[models_url]
-            if (not free_only or "free" in m.lower())
+            if (not free_only or "free" in m.lower() or m == "big-pickle")
             and not m.lower().startswith("jev-")
             and m not in EXCLUDED_ZEN_MODELS
         ]
@@ -276,8 +276,11 @@ def update_dashboard(dashboard_dir: Path) -> tuple[str, str]:
 
 def restart_stacks(project_dir: Path) -> None:
     print("=== Restarting CLIProxyAPI ===", flush=True)
-    compose_command(project_dir, None, "up", "-d", "--force-recreate")
-
+    # Clean up any stale created/stopped replacement containers before recreating
+    compose_command(project_dir, None, "down", "--remove-orphans")
+    # --build keeps local working-tree changes (e.g. dataset logging) in the image;
+    # set CLI_PROXY_PULL_POLICY=always to force upstream :latest instead.
+    compose_command(project_dir, None, "up", "-d", "--build")
 def verify_containers_running(include_dashboard: bool = True, dashboard_dir: Path | None = None) -> None:
     running = running_container_names()
     required = [CLI_PROXY_CONTAINER, POSTGRES_CONTAINER]

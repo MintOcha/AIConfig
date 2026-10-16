@@ -1,10 +1,10 @@
 modelRoles:
-  smol: v-rail/gpt-6-luna:auto
-  slow: v-rail/gpt-5.6-sol
+  smol: v-rail/gemini-3.8-flash-high:auto
+  slow: v-rail/claude-haiku-5-5
   designer: v-rail/claude-opus-5
   web: openai-codex/gpt-5.6-luna
   tiny: v-rail/gpt-6-luna
-  task: v-rail/gpt-6.1-sol
+  task: v-rail/claude-haiku-5-5
   default: v-rail/gemini-3.8-flash-high
 disabledProviders:
   - claude
@@ -35,7 +35,7 @@ compaction:
 dev:
   autoqaConsent: granted
 defaultThinkingLevel: auto
-hideThinkingBlock: true
+hideThinkingBlock: false
 retry:
   fallbackChains:
     web:
@@ -70,3 +70,6 @@ find:
   enabled: "off"
 ask:
   timeout: 30
+proseOnlyThinking: false
+todo:
+  remindersMax: 10

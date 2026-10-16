@@ -1,0 +1,4 @@
+interface:
+  display_name: "OSINT"
+  short_description: "Run entity-resolved OSINT investigations with provable links"
+  default_prompt: "Use $osint to investigate this target with entity resolution."
