@@ -2,9 +2,12 @@
 import asyncio
 from collections import deque
 import json
+from pathlib import Path
 import sys
-
 import time
+
+CACHE_DIR = Path('/tmp/kaggle_logs_cache')
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 STREAM = r'''
 import json, re, sys
 from contextlib import redirect_stdout
@@ -51,6 +54,13 @@ class LogStream:
         self.env = env
         self.accessed = time.monotonic()
         self.lines = deque(maxlen=200)
+        self.cache_file = CACHE_DIR / f"{ref.replace('/', '_')}_v{version}.log"
+        if self.cache_file.exists():
+            try:
+                cached = [line.strip() for line in self.cache_file.read_text(errors='replace').splitlines() if line.strip()]
+                self.lines.extend(cached[-200:])
+            except Exception:
+                pass
         self.last_line_at = None
         self.error = None
         self.ready = asyncio.Event()
@@ -69,18 +79,19 @@ class LogStream:
                     async with asyncio.timeout(90):
                         raw = await process.stdout.readline()
                 except TimeoutError:
-                    if time.monotonic() - self.accessed >= 90:
-                        break
+                    # Keep collecting continuously for active runs without disconnecting
                     continue
                 except ValueError as error:
                     raise RuntimeError('Kaggle log worker produced an oversized line; inspect the session log directly') from error
                 if not raw:
                     break
                 try:
-                    self.lines.append(json.loads(raw))
+                    parsed_line = json.loads(raw)
+                    self.lines.append(parsed_line)
+                    with self.cache_file.open('a', encoding='utf-8') as f:
+                        f.write(parsed_line + '\n')
                 except json.JSONDecodeError as error:
                     raise RuntimeError(f'Kaggle log worker returned non-JSON stdout: {raw[:200].decode(errors="replace").strip()!r}') from error
-                self.last_line_at = time.monotonic()
                 self.ready.set()
             await process.wait()
             if process.returncode:
@@ -106,26 +117,32 @@ class LogStream:
 streams = {}
 
 
-async def logs(ref, version, env, wait=8):
+async def logs(ref, version, env, wait=0, background=True):
     key = ref, version
+    cache_file = CACHE_DIR / f"{ref.replace('/', '_')}_v{version}.log"
+    if not background:
+        if cache_file.exists():
+            try:
+                lines = [line.strip() for line in cache_file.read_text(errors='replace').splitlines() if line.strip()]
+                return lines[-200:], None
+            except Exception:
+                pass
+        return [], None
     stream = streams.get(key)
     if stream is None or stream.task.done():
         stream = streams[key] = LogStream(ref, version, env)
     stream.accessed = time.monotonic()
-    deadline = stream.accessed + wait
-    if not stream.ready.is_set():
+    if not stream.lines and wait > 0 and not stream.ready.is_set():
         try:
             await asyncio.wait_for(stream.ready.wait(), wait)
         except TimeoutError:
             pass
-    # The stream replays historical events in a burst. Returning on its first
-    # event discards the rest when a one-shot CLI invocation exits.
-    while stream.last_line_at is not None and not stream.task.done():
-        remaining = deadline - time.monotonic()
-        idle = 0.5 - (time.monotonic() - stream.last_line_at)
-        if remaining <= 0 or idle <= 0:
-            break
-        await asyncio.sleep(min(remaining, idle))
+    if not stream.lines and cache_file.exists():
+        try:
+            lines = [line.strip() for line in cache_file.read_text(errors='replace').splitlines() if line.strip()]
+            return lines[-200:], stream.error
+        except Exception:
+            pass
     return list(stream.lines), stream.error
 
 

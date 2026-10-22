@@ -446,17 +446,101 @@ class SearchRouter:
         self._codex_client_factory = codex_client_factory
         self.session_id = str(uuid.uuid4())
         self._url_to_view_ref: dict[str, str] = {}
+        self._recent_view_refs: list[str] = []
+        self._last_fetched_view_refs: list[str] = []
 
-    def record_view_ref(self, ref_id: str, output: str) -> None:
-        m = re.search(r"cite(turn\d+view\d+)", output)
+    def record_view_ref(self, ref_id: str, output: str) -> str | None:
+        m = re.search(r"cite(turn\d+view\d+)", output) or re.search(r"\b(turn\d+view\d+)\b", output)
         if m:
             view_ref = m.group(1)
             self._url_to_view_ref[ref_id] = view_ref
             self._url_to_view_ref[view_ref] = view_ref
+            if view_ref in self._recent_view_refs:
+                self._recent_view_refs.remove(view_ref)
+            self._recent_view_refs.append(view_ref)
+            return view_ref
+        if ref_id and re.fullmatch(r"turn\d+view\d+", str(ref_id).strip()):
+            cleaned = str(ref_id).strip()
+            self._url_to_view_ref[cleaned] = cleaned
+            if cleaned in self._recent_view_refs:
+                self._recent_view_refs.remove(cleaned)
+            self._recent_view_refs.append(cleaned)
+            return cleaned
+        return None
 
-    def resolve_view_ref(self, ref_id: str) -> str:
-        return self._url_to_view_ref.get(ref_id, ref_id)
+    def resolve_view_ref(self, ref_id: str | None = None) -> str:
+        if ref_id is None or not str(ref_id).strip():
+            if self._recent_view_refs:
+                return self._recent_view_refs[-1]
+            return ""
 
+        cleaned = str(ref_id).strip()
+
+        try:
+            idx = int(cleaned)
+            is_int = True
+        except ValueError:
+            is_int = False
+
+        if is_int:
+            if self._last_fetched_view_refs and 0 <= idx < len(self._last_fetched_view_refs):
+                return self._last_fetched_view_refs[idx]
+            if self._recent_view_refs:
+                if 0 <= idx < len(self._recent_view_refs):
+                    return self._recent_view_refs[idx]
+                if -len(self._recent_view_refs) <= idx < 0:
+                    return self._recent_view_refs[idx]
+                return self._recent_view_refs[-1]
+            return cleaned
+
+        if urlsplit(cleaned).scheme in {"http", "https"}:
+            return self._url_to_view_ref.get(cleaned, cleaned)
+
+        if cleaned in self._url_to_view_ref:
+            return self._url_to_view_ref[cleaned]
+
+        m = re.search(r"turn\d+view\d+", cleaned)
+        if m:
+            return m.group(0)
+
+        return cleaned
+
+    async def ensure_view_ref(self, target: str | None = None) -> str:
+        resolved = self.resolve_view_ref(target)
+        if re.search(r"turn\d+view\d+", resolved):
+            return re.search(r"turn\d+view\d+", resolved).group(0)
+
+        url_target: str | None = None
+        if target and urlsplit(str(target).strip()).scheme in {"http", "https"}:
+            url_target = str(target).strip()
+        elif resolved and urlsplit(resolved).scheme in {"http", "https"}:
+            url_target = resolved
+
+        if url_target:
+            res = await self.execute_codex_command("open", [{"ref_id": url_target}])
+            raw_output = res.get("output", "")
+            view_ref = self.record_view_ref(url_target, raw_output)
+            if not view_ref:
+                resolved_after = self.resolve_view_ref(url_target)
+                if re.search(r"turn\d+view\d+", resolved_after):
+                    view_ref = re.search(r"turn\d+view\d+", resolved_after).group(0)
+            if view_ref:
+                return view_ref
+            raise ProviderRequestError(
+                f"Failed to obtain view reference after opening URL '{url_target}': {raw_output[:200]}"
+            )
+
+        if (target is None or not str(target).strip()) and self._recent_view_refs:
+            return self._recent_view_refs[-1]
+
+        if target is not None and str(target).strip():
+            raise ProviderRequestError(
+                f"Could not resolve page reference '{target}'. Provide a valid URL, 'turnNviewM', or open a page first."
+            )
+
+        raise ProviderRequestError(
+            "No active page reference available. Please open a page or provide a valid 'url' or 'ref_id'."
+        )
     def _duckduckgo_client(self) -> Client:
         transport = StdioTransport(
             command=self.config.duckduckgo_command,
@@ -580,7 +664,7 @@ class SearchRouter:
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
                 },
                 json={
-                    "id": str(uuid.uuid4()),
+                    "id": self.session_id,
                     "model": self.config.codex_standalone_model,
                     "commands": {"open": [{"ref_id": url}]},
                 },
@@ -590,6 +674,7 @@ class SearchRouter:
             raw_output = payload.get("output", "")
             if not raw_output:
                 return None
+            self.record_view_ref(url, raw_output)
             lines = []
             for line in raw_output.splitlines():
                 if line.startswith("L") and ":" in line[:6]:
@@ -617,7 +702,11 @@ class SearchRouter:
         missing: list[str] = []
         for url, outcome in zip(urls, outcomes, strict=True):
             if isinstance(outcome, str) and outcome:
-                fetched.append({"url": url, "content": outcome})
+                fetched.append({
+                    "url": url,
+                    "content": outcome,
+                    "ref_id": self._url_to_view_ref.get(url, url),
+                })
             else:
                 missing.append(url)
         return fetched, missing
@@ -645,7 +734,11 @@ class SearchRouter:
             except ProviderRequestError:
                 content = None
             if content:
-                fetched.append({"url": url, "content": content})
+                fetched.append({
+                    "url": url,
+                    "content": content,
+                    "ref_id": self._url_to_view_ref.get(url, url),
+                })
             else:
                 missing.append(url)
         return fetched, missing
@@ -746,8 +839,11 @@ class SearchRouter:
         )
 
     async def fetch_content(self, urls: list[str]) -> list[dict[str, str]]:
-        """Fetch page content through Codex native open command, with DuckDuckGo failover."""
-        fetched_all: dict[str, str] = {}
+        """Fetch page content through Codex native open command, with DuckDuckGo failover.
+
+        Returns a list of dictionaries with 'url', 'content', and 'ref_id' (which can be passed to click-link or find-in-page).
+        """
+        fetched_all: dict[str, dict[str, str]] = {}
         remaining_urls = list(urls)
 
         # 1. Try Codex standalone first if configured
@@ -755,7 +851,7 @@ class SearchRouter:
             try:
                 codex_fetched, codex_missing = await self._fetch_codex_standalone(remaining_urls)
                 for item in codex_fetched:
-                    fetched_all[item["url"]] = item["content"]
+                    fetched_all[item["url"]] = item
                 remaining_urls = codex_missing
             except Exception:  # noqa: BLE001
                 pass
@@ -765,7 +861,7 @@ class SearchRouter:
             try:
                 ddg_fetched, ddg_missing = await self._fetch_duckduckgo(remaining_urls)
                 for item in ddg_fetched:
-                    fetched_all[item["url"]] = item["content"]
+                    fetched_all[item["url"]] = item
                 remaining_urls = ddg_missing
             except Exception:  # noqa: BLE001
                 pass
@@ -778,7 +874,19 @@ class SearchRouter:
             )
 
         # Return in original requested order for successfully fetched URLs
-        return [{"url": u, "content": fetched_all[u]} for u in urls if u in fetched_all]
+        results = [
+            {
+                "url": u,
+                "content": fetched_all[u]["content"],
+                "ref_id": fetched_all[u].get("ref_id") or self._url_to_view_ref.get(u, u),
+            }
+            for u in urls
+            if u in fetched_all
+        ]
+        self._last_fetched_view_refs = [
+            item["ref_id"] for item in results if item.get("ref_id") and re.search(r"turn\d+view\d+", str(item["ref_id"]))
+        ]
+        return results
 
     async def research(self, task: str) -> str:
         payload = await self._call_tavily(
@@ -1055,6 +1163,7 @@ def register_tools(app: FastMCP, cfg: RouterConfig) -> None:
         ) -> list[dict[str, str]]:
             """Fetch readable page content for given URLs using Codex native page extraction, with automatic DuckDuckGo failover.
 
+            Returns a list of dictionaries with 'url', 'content', and 'ref_id' (which can be passed to click-link or find-in-page).
             REQUIRED parameter: `urls` (list of URLs, e.g. ["https://example.com"]) or `url` (single string URL).
             """
             if router is None:
@@ -1071,36 +1180,97 @@ def register_tools(app: FastMCP, cfg: RouterConfig) -> None:
             return await router.fetch_content(_validate_urls(resolved_urls))
     if cfg.codex_standalone_keys:
         @app.tool(name="open-page")
-        async def open_page(ref_id: str, lineno: int | None = None) -> str:
-            """Open the page indicated by `ref_id` or URL and position viewport at line `lineno`."""
+        async def open_page(
+            ref_id: str | None = None,
+            url: str | None = None,
+            lineno: int | str | None = None,
+        ) -> str:
+            """Open the page indicated by `ref_id` or `url` and position viewport at line `lineno`."""
             if router is None:
                 raise RuntimeError("Web search router has not been configured")
-            res = await router.execute_codex_command("open", [{"ref_id": ref_id, "lineno": lineno}])
+            target = ref_id or url
+            if not target or not str(target).strip():
+                raise ValueError("open-page requires either 'ref_id' or 'url' (e.g. open_page(url='https://example.com')).")
+            target = str(target).strip()
+            resolved_ref = router.resolve_view_ref(target)
+            target_to_send = target if urlsplit(target).scheme in {"http", "https"} else (
+                resolved_ref if re.search(r"turn\d+view\d+", resolved_ref) else target
+            )
+            payload: dict[str, Any] = {"ref_id": target_to_send}
+            if lineno is not None:
+                try:
+                    payload["lineno"] = int(lineno)
+                except (ValueError, TypeError):
+                    pass
+            res = await router.execute_codex_command("open", [payload])
             output = res.get("output", "")
-            router.record_view_ref(ref_id, output)
+            router.record_view_ref(target, output)
+            if target_to_send != target:
+                router.record_view_ref(target_to_send, output)
             return output
 
         @app.tool(name="click-link")
-        async def click_link(ref_id: str, link_id: int) -> str:
-            """Open the link `link_id` (numbered link `【{id}†.*】`) from previously opened page `ref_id`."""
+        async def click_link(
+            link_id: int | None = None,
+            ref_id: str | None = None,
+            url: str | None = None,
+            id: int | None = None,
+        ) -> str:
+            """Open the link `link_id` (numbered link `【{id}†.*】`) from page indicated by `ref_id` or `url`."""
             if router is None:
                 raise RuntimeError("Web search router has not been configured")
-            resolved_ref = router.resolve_view_ref(ref_id)
-            res = await router.execute_codex_command("click", [{"ref_id": resolved_ref, "id": link_id}])
+            effective_link_id = link_id if link_id is not None else id
+            if effective_link_id is None:
+                raise ValueError(
+                    "click-link requires a link identifier: provide 'link_id' (or 'id') as an integer "
+                    "(e.g. click_link(link_id=1, ref_id='0'))."
+                )
+            try:
+                effective_link_id = int(effective_link_id)
+            except (ValueError, TypeError):
+                raise ValueError(f"Invalid link identifier '{effective_link_id}': link_id must be an integer.") from None
+
+            target_ref = ref_id or url or None
+            resolved_ref = await router.ensure_view_ref(target_ref)
+            res = await router.execute_codex_command("click", [{"ref_id": resolved_ref, "id": effective_link_id}])
             output = res.get("output", "")
-            router.record_view_ref(ref_id, output)
-            router.record_view_ref(resolved_ref, output)
+            if "Unable to resolve click call due to invalid arguments" in output and router._recent_view_refs:
+                latest_ref = router._recent_view_refs[-1]
+                if latest_ref != resolved_ref:
+                    res_fallback = await router.execute_codex_command("click", [{"ref_id": latest_ref, "id": effective_link_id}])
+                    output_fallback = res_fallback.get("output", "")
+                    if "Unable to resolve click call due to invalid arguments" not in output_fallback:
+                        output = output_fallback
+                        resolved_ref = latest_ref
+            if target_ref:
+                router.record_view_ref(target_ref, output)
             return output
 
         @app.tool(name="find-in-page")
-        async def find_in_page(ref_id: str, pattern: str) -> str:
-            """Find text pattern in page indicated by `ref_id` or URL."""
+        async def find_in_page(
+            pattern: str | None = None,
+            ref_id: str | None = None,
+            url: str | None = None,
+            query: str | None = None,
+            text: str | None = None,
+        ) -> str:
+            """Find text pattern in page indicated by `ref_id` or `url`."""
             if router is None:
                 raise RuntimeError("Web search router has not been configured")
-            resolved_ref = router.resolve_view_ref(ref_id)
-            res = await router.execute_codex_command("find", [{"ref_id": resolved_ref, "pattern": pattern}])
+            effective_pattern = pattern or query or text
+            if not effective_pattern or not str(effective_pattern).strip():
+                raise ValueError(
+                    "find-in-page requires a search pattern: provide 'pattern' (or 'query'/'text') "
+                    "(e.g. find_in_page(pattern='pricing', ref_id='0'))."
+                )
+            effective_pattern = str(effective_pattern).strip()
+
+            target_ref = ref_id or url or None
+            resolved_ref = await router.ensure_view_ref(target_ref)
+            res = await router.execute_codex_command("find", [{"ref_id": resolved_ref, "pattern": effective_pattern}])
             output = res.get("output", "")
-            router.record_view_ref(ref_id, output)
+            if target_ref:
+                router.record_view_ref(target_ref, output)
             router.record_view_ref(resolved_ref, output)
             return output
 

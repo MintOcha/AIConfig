@@ -28,29 +28,35 @@ DASHBOARD_LOCAL_URL = "http://127.0.0.1:6868"
 
 
 def fetch_models(models_url: str) -> list[str]:
-    request = Request(
-        models_url,
-        headers={
-            "Accept": "application/json",
-            "User-Agent": "CLIProxyAPI-model-updater/1.0",
-        },
-    )
-    with urlopen(request) as response:
-        payload = yaml.safe_load(response.read())
-
-    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-        raise ValueError(f"OpenCode returned an unexpected model response from {models_url}")
-
-    models = sorted(
-        {
-            item["id"].strip()
-            for item in payload["data"]
-            if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip()
-        }
-    )
-    if not models:
-        raise ValueError(f"OpenCode returned no model IDs from {models_url}")
-    return models
+    urls = [models_url]
+    if "zen" in models_url:
+        urls.append("http://127.0.0.1:8801/v1/models")
+    last_err = None
+    for url in urls:
+        try:
+            request = Request(
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "CLIProxyAPI-model-updater/1.0",
+                },
+            )
+            with urlopen(request, timeout=10) as response:
+                payload = yaml.safe_load(response.read())
+            if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+                models = sorted(
+                    {
+                        item["id"].strip()
+                        for item in payload["data"]
+                        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip()
+                    }
+                )
+                if models:
+                    return models
+        except Exception as err:
+            last_err = err
+            continue
+    raise ValueError(f"OpenCode returned an unexpected model response from {models_url}: {last_err}")
 
 def normalize_url(value: object) -> str:
     return str(value).strip().rstrip("/")
@@ -73,7 +79,10 @@ def update_config(config_path: Path) -> int:
         if not isinstance(provider, dict):
             continue
         base_url = normalize_url(provider.get("base-url"))
+        provider_name = str(provider.get("name", "")).strip().lower()
         endpoint_spec = OPENCODE_ENDPOINTS.get(base_url)
+        if not endpoint_spec and ("zen" in provider_name or "8801" in base_url or "zen" in base_url):
+            endpoint_spec = ("https://opencode.ai/zen/v1/models", True)
         if not endpoint_spec:
             continue
         models_url, free_only = endpoint_spec
@@ -97,14 +106,8 @@ def update_config(config_path: Path) -> int:
     if updates == 0:
         return 0
 
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=config_path.parent, delete=False
-    ) as temp_file:
-        temp_path = Path(temp_file.name)
-        yaml.safe_dump(config, temp_file, allow_unicode=True, default_flow_style=False, sort_keys=False)
-
-    temp_path.chmod(config_path.stat().st_mode)
-    temp_path.replace(config_path)
+    with config_path.open("w", encoding="utf-8") as config_file:
+        yaml.safe_dump(config, config_file, allow_unicode=True, default_flow_style=False, sort_keys=False)
     return updates
 
 def trigger_usage_collection(dashboard_dir: Path | None) -> bool:
@@ -263,6 +266,49 @@ def resolve_compose_file(directory: Path) -> Path | None:
             return p
     return None
 
+def sync_git_repo(repo_dir: Path) -> None:
+    """Fetch and fast-forward the git repository to upstream origin if on a tracking branch."""
+    if not (repo_dir / ".git").exists():
+        return
+    print(f"=== Syncing git repository in {repo_dir.name} ===", flush=True)
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        branch = res.stdout.strip()
+        if branch and branch != "HEAD":
+            subprocess.run(["git", "fetch", "origin"], cwd=repo_dir, check=True)
+            check_remote = subprocess.run(
+                ["git", "rev-parse", "--verify", f"origin/{branch}"],
+                cwd=repo_dir,
+                capture_output=True,
+                text=True,
+            )
+            if check_remote.returncode == 0:
+                pull_res = subprocess.run(
+                    ["git", "merge", "--ff-only", f"origin/{branch}"],
+                    cwd=repo_dir,
+                    capture_output=True,
+                    text=True,
+                )
+                if pull_res.returncode == 0:
+                    status_msg = pull_res.stdout.strip()
+                    if status_msg:
+                        print(f"Git repo {repo_dir.name} ({branch}): {status_msg}", flush=True)
+                    else:
+                        print(f"Git repo {repo_dir.name} ({branch}) is up to date.", flush=True)
+                else:
+                    print(
+                        f"Warning: Git repo {repo_dir.name} ({branch}) could not fast-forward cleanly: {pull_res.stderr.strip()}",
+                        file=sys.stderr,
+                    )
+    except Exception as error:
+        print(f"Warning: Failed to sync git repository in {repo_dir.name}: {error}", file=sys.stderr)
+
 
 def update_dashboard(dashboard_dir: Path) -> tuple[str, str]:
     compose_file = resolve_compose_file(dashboard_dir)
@@ -276,11 +322,20 @@ def update_dashboard(dashboard_dir: Path) -> tuple[str, str]:
 
 def restart_stacks(project_dir: Path) -> None:
     print("=== Restarting CLIProxyAPI ===", flush=True)
+    try:
+        compose_command(project_dir, None, "pull", "cli-proxy-api")
+    except subprocess.CalledProcessError as error:
+        print(f"Warning: docker compose pull cli-proxy-api failed: {error}", file=sys.stderr)
+
+    if (project_dir / "ZenFree").is_dir():
+        try:
+            compose_command(project_dir, None, "build", "zen-free")
+        except subprocess.CalledProcessError as error:
+            print(f"Warning: building zen-free failed: {error}", file=sys.stderr)
+
     # Clean up any stale created/stopped replacement containers before recreating
     compose_command(project_dir, None, "down", "--remove-orphans")
-    # --build keeps local working-tree changes (e.g. dataset logging) in the image;
-    # set CLI_PROXY_PULL_POLICY=always to force upstream :latest instead.
-    compose_command(project_dir, None, "up", "-d", "--build")
+    compose_command(project_dir, None, "up", "-d")
 def verify_containers_running(include_dashboard: bool = True, dashboard_dir: Path | None = None) -> None:
     running = running_container_names()
     required = [CLI_PROXY_CONTAINER, POSTGRES_CONTAINER]
@@ -352,6 +407,9 @@ def main() -> int:
         ensure_postgres_running()
 
         if not args.no_restart:
+            sync_git_repo(project_dir)
+            if dashboard_dir:
+                sync_git_repo(dashboard_dir)
             project_before = deployed_version(project_dir, None, "cli-proxy-api")
             restart_stacks(project_dir)
             project_after = deployed_version(project_dir, None, "cli-proxy-api")

@@ -2150,8 +2150,7 @@ async def push_notebook(
         f"{attached_msg}\n"
         f"Notebook successfully queued on Kaggle.\n\n"
         f"[Next Step: To monitor execution, use CLI in background without blocking:\n"
-        f"uv run --script {Path(__file__).resolve()} wait {canonical_ref} --version {version} --timeout 3600 --poll-interval 30\n"
-        f"Or view live logs:\n"
+        f"uv run --script {Path(__file__).resolve()} wait {canonical_ref} --version {version} --timeout 3600\n"
         f"uv run --script {Path(__file__).resolve()} status {canonical_ref} --version {version} --logs --log-timeout 300]"
     )
 
@@ -2231,7 +2230,6 @@ async def wait(
     version: int | str | None = None,
     versions: list[int | str] | None = None,
     timeout: int = 600,
-    poll_interval: int = 5,
     label: str | None = None,
 ) -> str:
     """Wait until notebook terminates or a literal string appears in available logs.
@@ -2249,8 +2247,8 @@ async def wait(
     """
     if until not in {"complete", "log"} or (until == "log" and not text):
         raise ValueError("until must be complete or log; log requires nonempty text")
-    if timeout < 1 or poll_interval < 1:
-        raise ValueError("timeout and poll_interval must be positive")
+    if timeout < 1:
+        raise ValueError("timeout must be positive")
     ref = _notebook_ref(notebook)
 
     # Parse targets
@@ -2325,7 +2323,7 @@ async def wait(
                             rem = deadline - asyncio.get_running_loop().time()
                             if rem <= 0:
                                 break
-                            await asyncio.sleep(min(30, max(10, min(poll_interval, rem))))
+                            await asyncio.sleep(min(30, max(10, rem)))
                         continue
                     provider_failures = 0
                     lines = snapshot["logs"]
@@ -2338,7 +2336,17 @@ async def wait(
                     if status in TERMINAL_RUN_STATUSES or status not in ACTIVE_RUN_STATUSES:
                         reason = "terminal" if status in TERMINAL_RUN_STATUSES else "not_running"
                         return _format_run(ref, snapshot, lines[-5:], reason=reason)
-                await asyncio.sleep(min(poll_interval, max(0, deadline - asyncio.get_running_loop().time())))
+                # Wait for next live log event or fallback poll (default 2s for live stream, 10s fallback)
+                key = (ref, target_versions[0]) if target_versions else None
+                stream = kaggle_logs.streams.get(key) if key else None
+                if stream and not stream.task.done():
+                    try:
+                        stream.ready.clear()
+                        await asyncio.wait_for(stream.ready.wait(), timeout=min(5, max(1, deadline - asyncio.get_running_loop().time())))
+                    except (TimeoutError, asyncio.TimeoutError):
+                        pass
+                else:
+                    await asyncio.sleep(min(30, max(1, deadline - asyncio.get_running_loop().time())))
     except TimeoutError as error:
         if not wait_deadline.expired():
             raise RuntimeError(f"Kaggle request timed out while waiting for {ref}; the {timeout}s wait deadline was not reached. Completion was not observed.") from error
@@ -2439,6 +2447,23 @@ def _format_run(ref: str, snapshot: dict, logs: list[str], reason: str | None = 
     folder = _find_notebook_folder_by_ref(ref)
     record = next((r for r in (_load_version_records(folder) if folder else [])
                    if r.get("version") == snapshot.get("version")), {})
+    pushed_utc = record.get("pushed_utc")
+    if pushed_utc:
+        try:
+            p_dt = datetime.fromisoformat(pushed_utc)
+            now_utc = datetime.now(timezone.utc)
+            elapsed_sec = max(0, int((now_utc - p_dt).total_seconds()))
+            hours, rem = divmod(elapsed_sec, 3600)
+            mins, secs = divmod(rem, 60)
+            if hours > 0:
+                duration_str = f"{hours}h {mins}m {secs}s"
+            elif mins > 0:
+                duration_str = f"{mins}m {secs}s"
+            else:
+                duration_str = f"{secs}s"
+            header += f" (running for {duration_str})"
+        except Exception:
+            pass
     if record.get("label"):
         header += f" · label {record['label']}"
     if record.get("parameters"):
@@ -2446,6 +2471,7 @@ def _format_run(ref: str, snapshot: dict, logs: list[str], reason: str | None = 
     if reason:
         header += f" · {reason}"
     lines = [header, f"Hardware: {snapshot.get('hardware', 'unknown')} | Training outcome: unknown"]
+    formatted_logs = []
     for line in logs:
         try:
             event = json.loads(line)
@@ -2453,7 +2479,18 @@ def _format_run(ref: str, snapshot: dict, logs: list[str], reason: str | None = 
             event = None
         if isinstance(event, dict):
             line = " ".join(f"{key}={value:.6g}" if isinstance(value, float) else f"{key}={value}" for key, value in event.items())
-        lines.append(line if len(line) <= 600 else line[:597] + "...")
+        formatted_logs.append(line if len(line) <= 600 else line[:597] + "...")
+    max_n = 50
+    half = max_n // 2
+    if len(formatted_logs) > max_n:
+        display_logs = (
+            formatted_logs[:half]
+            + [f"... [{len(formatted_logs) - max_n} log lines omitted] ..."]
+            + formatted_logs[-half:]
+        )
+    else:
+        display_logs = formatted_logs
+    lines.extend(display_logs)
     if snapshot.get("logs_error"):
         lines.append(f"Logs: {snapshot['logs_error']}")
     return "\n".join(lines)
@@ -2542,6 +2579,13 @@ async def view_status(
         selected_logs = [raw_logs[index] for index in indices]
     else:
         selected_logs = raw_logs[-tail:]
+    # Sync fresh logs to global disk cache for CLI access
+    if raw_logs:
+        cache_file = kaggle_logs.CACHE_DIR / f"{ref.replace('/', '_')}_v{snapshot.get('version')}.log"
+        try:
+            cache_file.write_text("\n".join(raw_logs) + "\n", encoding="utf-8")
+        except Exception:
+            pass
     out = _format_run(ref, snapshot, selected_logs)
     if snapshot.get("logs_error"):
         out += "\nStatus is available; log retrieval was incomplete. Use fetch_logs=false for a status-only request."
@@ -2552,15 +2596,17 @@ async def _run_snapshot(ref: str, version: int | None = None, logs: bool = False
         raise ValueError("Run number must be a positive Kaggle version")
     if log_timeout < 1:
         raise ValueError("log_timeout must be positive")
-    baseline = await _run_snapshot(ref, version) if logs else None
-    if logs and baseline['status'] in ACTIVE_RUN_STATUSES:
-        lines, error = await kaggle_logs.logs(ref, baseline['version'], _cli_env(_account_owner(ref)),
-                                              wait=min(log_timeout, 8))
-        baseline['logs'] = lines
-        baseline['logs_error'] = error or (None if lines else 'Waiting for first streamed log event')
-        return baseline
-    if baseline and baseline['version'] is not None:
-        await kaggle_logs.close(ref, baseline['version'])
+    # If logs requested and disk cache exists, retrieve buffered logs immediately without blocking
+    if logs and version is not None:
+        key = ref, version
+        cache_file = kaggle_logs.CACHE_DIR / f"{ref.replace('/', '_')}_v{version}.log"
+        if key in kaggle_logs.streams or cache_file.exists():
+            lines, error = await kaggle_logs.logs(ref, version, _cli_env(_account_owner(ref)), wait=0, background=False)
+            if lines:
+                folder = _find_notebook_folder_by_ref(ref)
+                record = next((r for r in (_load_version_records(folder) if folder else []) if r.get("version") == version), {})
+                status = record.get("status", "RUNNING")
+                return dict(version=version, status=status, hardware="NvidiaTeslaT4", logs=lines, logs_error=error, training_outcome="unknown")
     proc_timeout = max(35, log_timeout + 15)
     code = '''
 import sys, json, threading, re, time
@@ -2638,13 +2684,12 @@ with api.build_kaggle_client() as client:
                         lines.extend((body or '').splitlines())
             except Exception as error:
                 errors.append(str(error))
-        limit_sec = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4].isdigit() else 300
+        limit_sec = min(int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4].isdigit() else 3, 5)
         worker = threading.Thread(target=collect, daemon=True)
         worker.start(); worker.join(limit_sec)
         result['logs'] = list(lines)
-        result['logs_error'] = '; '.join(errors) or (f'Live log stream reached bound ({limit_sec}s); Kaggle stream is slow' if worker.is_alive() else None)
-        if not result['logs'] and not result['logs_error']:
-            result['logs_error'] = 'Kaggle returned no log events for this version'
+        if not result['logs'] and errors:
+            result['logs_error'] = '; '.join(errors)
     print(json.dumps(result), flush=True)
 '''
     try:
@@ -3529,7 +3574,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_wait = subparsers.add_parser("wait", help="Wait for notebook completion or log text")
     p_wait.add_argument("notebook", help="Notebook name or owner/slug")
     p_wait.add_argument("--timeout", type=int, default=60, help="Wait timeout in seconds for CLI mode (default 60)")
-    p_wait.add_argument("--poll-interval", type=int, default=5)
     p_wait.add_argument("--until", choices=("complete", "log"), default="complete")
     p_wait.add_argument("--text")
     p_wait.add_argument("--version", type=int)
@@ -3664,7 +3708,7 @@ def main() -> None:
         elif cmd == "save":
             _print_result(asyncio.run(save_notebook(args.notebook, accelerator=getattr(args, "accelerator", None))))
         elif cmd == "wait":
-            _print_result(asyncio.run(wait(args.notebook, until=args.until, text=args.text, timeout=args.timeout, poll_interval=args.poll_interval, version=args.version, versions=args.versions, label=args.label)))
+            _print_result(asyncio.run(wait(args.notebook, until=args.until, text=args.text, timeout=args.timeout, version=args.version, versions=args.versions, label=args.label)))
         elif cmd == "output":
             _print_result(asyncio.run(fetch_output(args.notebook, version=args.version, label=args.label, pattern=args.pattern, timeout=args.timeout)))
         elif cmd == "upload":

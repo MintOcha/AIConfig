@@ -137,8 +137,10 @@ def extract_prompt(body: dict):
     for role, text in turns:
         text = (text or "").strip()
         if text:
-            out.append(f"[{role}]\n{text}" if role else text)
-    return system, "\n\n".join(out)
+            out.append((role, f"[{role}]\n{text}" if role else text))
+    # delta rule (mirrors Go): keep only turns after the last assistant message
+    last_asst = max((i for i, (role, _) in enumerate(out) if role == "assistant"), default=-1)
+    return system, "\n\n".join(t for _, t in out[last_asst + 1:])
 
 
 def content_text(content) -> str:
