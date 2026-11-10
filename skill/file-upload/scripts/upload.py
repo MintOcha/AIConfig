@@ -45,7 +45,7 @@ DEFAULT_MIRRORS = [
 
 CATBOX_MAX_BYTES = 200 * 1024 * 1024
 CATBOX_API = "https://catbox.moe/user/api.php"
-
+LITTERBOX_API = "https://litterbox.catbox.moe/resources/internals/api.php"
 EZ_HOST_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp", ".bmp", ".ico"}
 EZ_HOST_VIDEO_EXTS = {".mp4", ".webm", ".mov", ".mkv", ".avi"}
 EZ_HOST_IMAGE_MAX = 10 * 1024 * 1024
@@ -166,7 +166,9 @@ def choose_provider(args: argparse.Namespace, path: Path, size: int) -> str:
             file=sys.stderr,
         )
         return "fuckingfast"
-    if getattr(args, "temp", False) or getattr(args, "large", False) or size > 100 * 1024 * 1024:
+    if getattr(args, "temp", False):
+        return "litterbox"
+    if getattr(args, "large", False) or size > 100 * 1024 * 1024:
         return "fuckingfast"
     if ezhost_ok(ext, size):
         return "ezhost"
@@ -199,9 +201,45 @@ def upload_catbox(path: Path) -> dict:
             raw = resp.read().decode("utf-8", errors="replace").strip()
     except HTTPError as e:
         raise SystemExit(f"Catbox HTTP {e.code}: {e.read().decode(errors='replace')}") from None
+    except (URLError, TimeoutError) as e:
+        raise SystemExit(f"Catbox connection error: {getattr(e, 'reason', e)}") from None
     if not raw.startswith("http"):
         raise SystemExit(f"Catbox upload error: {raw}")
     return {"code": 201, "provider": "catbox", "url": raw, "data": {"name": path.name}}
+
+
+def upload_litterbox(path: Path, time_str: str = "72h") -> dict:
+    if time_str not in ("1h", "12h", "24h", "72h"):
+        time_str = "72h"
+    boundary = secrets.token_hex(16)
+    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    data_bytes = path.read_bytes()
+    parts = [
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"reqtype\"\r\n\r\nfileupload\r\n".encode(),
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"time\"\r\n\r\n{time_str}\r\n".encode(),
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"fileToUpload\"; filename=\"{path.name}\"\r\n"
+        f"Content-Type: {mime}\r\n\r\n".encode(),
+        data_bytes,
+        f"\r\n--{boundary}--\r\n".encode(),
+    ]
+    body = b"".join(parts)
+    req = Request(LITTERBOX_API, data=body, headers={
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "Content-Length": str(len(body)),
+        "User-Agent": UA,
+        "Accept": "*/*",
+    }, method="POST")
+    try:
+        with retry_429(lambda: urlopen(req, timeout=120), "litterbox") as resp:
+            raw = resp.read().decode("utf-8", errors="replace").strip()
+    except HTTPError as e:
+        err_msg = e.read().decode(errors="replace").strip()
+        raise SystemExit(f"Litterbox HTTP {e.code}: {err_msg}") from None
+    except (URLError, TimeoutError) as e:
+        raise SystemExit(f"Litterbox connection error: {getattr(e, 'reason', e)}") from None
+    if not raw.startswith("http"):
+        raise SystemExit(f"Litterbox upload error: {raw}")
+    return {"code": 201, "provider": "litterbox", "url": raw, "data": {"name": path.name, "time": time_str}}
 
 
 def upload_ezhost(path: Path) -> dict:
@@ -383,7 +421,24 @@ def upload_one(path: Path, args: argparse.Namespace) -> dict:
     size = path.stat().st_size
     provider = choose_provider(args, path, size)
     if provider == "catbox":
-        resp = upload_catbox(path)
+        try:
+            resp = upload_catbox(path)
+        except SystemExit as e:
+            if getattr(args, "provider", "auto") == "auto":
+                print(f"Catbox upload failed ({e}); falling back to FuckingFast...", file=sys.stderr)
+                resp = upload_fuckingfast(path, args)
+            else:
+                raise
+    elif provider == "litterbox":
+        time_str = getattr(args, "expire", None) or getattr(args, "time", None) or "72h"
+        try:
+            resp = upload_litterbox(path, time_str=time_str)
+        except SystemExit as e:
+            if getattr(args, "provider", "auto") == "auto":
+                print(f"Litterbox upload failed ({e}); falling back to FuckingFast...", file=sys.stderr)
+                resp = upload_fuckingfast(path, args)
+            else:
+                raise
     elif provider == "ezhost":
         try:
             resp = upload_ezhost(path)
@@ -394,7 +449,7 @@ def upload_one(path: Path, args: argparse.Namespace) -> dict:
         resp = upload_fuckingfast(path, args)
 
     # Annotate with canonical share link where we know the id.
-    if isinstance(resp, dict) and resp.get("provider") != "catbox":
+    if isinstance(resp, dict) and resp.get("provider") not in ("catbox", "litterbox"):
         data = resp.get("data") or {}
         if data.get("id"):
             resp["url"] = f"https://fuckingfast.net/{data['id']}"
@@ -721,10 +776,12 @@ def main() -> None:
 
     p = subs.add_parser("upload", help="Upload one or more files")
     p.add_argument("files", nargs="+", help="File path(s) or glob pattern(s)")
-    p.add_argument("--provider", choices=["auto", "ezhost", "catbox", "fuckingfast"], default="auto")
+    p.add_argument("--provider", choices=["auto", "ezhost", "catbox", "litterbox", "fuckingfast"], default="auto")
     p.add_argument("--permanent", action="store_true", help="Permanent hosting (Catbox, <=200MB)")
     p.add_argument("--temp", action="store_true")
     p.add_argument("--large", action="store_true")
+    p.add_argument("--expire", "--time", choices=["1h", "12h", "24h", "72h"], default="72h",
+                   help="Litterbox expiry time: 1h, 12h, 24h, 72h (default: 72h)")
     p.add_argument("--name")
     p.add_argument("--parent-id")
     p.add_argument("--location-id")

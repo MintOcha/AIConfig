@@ -1522,14 +1522,52 @@ def _write_metadata(name_or_folder: str | Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(existing, indent=2))
 
 
+def _normalize_version_records(raw_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not raw_records:
+        return []
+    # If notebook was recreated on Kaggle, version numbering restarts at 1.
+    # Prune any stale records preceding the latest version 1.
+    v1_indices = [i for i, r in enumerate(raw_records) if r.get("version") == 1]
+    if v1_indices:
+        raw_records = raw_records[v1_indices[-1]:]
+    by_version: dict[int, dict[str, Any]] = {}
+    for r in raw_records:
+        v = r.get("version")
+        if v is not None:
+            try:
+                by_version[int(v)] = dict(r)
+            except (ValueError, TypeError):
+                continue
+    return sorted(by_version.values(), key=lambda r: int(r.get("version", 0)))
+
+
 def _load_version_records(name_or_folder: str | Path) -> list[dict[str, Any]]:
     """Per-version records: version, label, parameters, status, pushed_utc."""
-    return [dict(record) for record in (_read_metadata(name_or_folder).get("versions") or [])]
+    raw = [dict(record) for record in (_read_metadata(name_or_folder).get("versions") or [])]
+    return _normalize_version_records(raw)
 
 
 def _find_notebook_folder_by_ref(ref: str) -> Path | None:
-    for folder in sorted(get_kaggle_root().iterdir()):
-        if folder.is_dir() and _read_metadata(folder).get("id") == ref:
+    if not ref:
+        return None
+    kaggle_root = get_kaggle_root()
+    if not kaggle_root.exists():
+        return None
+    ref_clean = ref.strip().removeprefix("https://www.kaggle.com/code/").rstrip("/")
+    for folder in sorted(kaggle_root.iterdir()):
+        if not folder.is_dir():
+            continue
+        meta_id = _read_metadata(folder).get("id") or ""
+        if meta_id == ref_clean:
+            return folder
+    if "/" in ref_clean:
+        return None
+    ref_slug = ref_clean
+    for folder in sorted(kaggle_root.iterdir()):
+        if not folder.is_dir():
+            continue
+        meta_id = _read_metadata(folder).get("id") or ""
+        if meta_id.split("/")[-1] == ref_slug or folder.name == ref_slug or _slugify(folder.name) == ref_slug:
             return folder
     return None
 
@@ -1545,7 +1583,7 @@ def _resolve_version(ref: str, version: int | None, label: str | None) -> int | 
                if record.get("label") == label]
     if not matches:
         raise ValueError(f"No pushed version of '{ref}' has label {label!r}; use push_notebook(label=...) or pass version.")
-    resolved = int(matches[0]["version"])
+    resolved = int(matches[-1]["version"])
     if version is not None and version != resolved:
         raise ValueError(f"version {version} and label {label!r} select different versions ({resolved}); pass only one")
     return resolved
@@ -1556,12 +1594,11 @@ def _update_version_status(ref: str, version: int | None, status: str | None) ->
     if folder is None or version is None or not status:
         return
     records = _load_version_records(folder)
-    for record in records:
+    for record in reversed(records):
         if record.get("version") == version and record.get("status") != status:
             record["status"] = status
             _write_metadata(folder, {"versions": records})
             return
-
 
 def _clean_status_label(status: str | None) -> str:
     if not status:
@@ -1627,6 +1664,9 @@ def _resolve_notebook_folder(notebook: str) -> tuple[str, Path]:
                 shutil.copy(candidate, target)
             return candidate.stem, folder.resolve()
         return candidate.parent.name, candidate.parent.resolve()
+    by_ref = _find_notebook_folder_by_ref(notebook)
+    if by_ref is not None and by_ref.is_dir():
+        return by_ref.name, by_ref.resolve()
 
     name = notebook.strip().strip("/")
     folder = kaggle_root / name
@@ -1639,8 +1679,6 @@ def _resolve_notebook_folder(notebook: str) -> tuple[str, Path]:
         ]
         if matches:
             folder = matches[0]
-        else:
-            folder.mkdir(parents=True, exist_ok=True)
     return folder.name, folder.resolve()
 @app.tool()
 async def init_notebook(
@@ -2118,8 +2156,12 @@ async def push_notebook(
     else:
         canonical_ref = ref
 
-    # Per-version tracking; concurrent versions never overwrite each other
+    # Per-version tracking; recreate / reset version counter on version 1 or restarted sequence
     records = _load_version_records(folder)
+    if version == 1:
+        records = []
+    elif any(int(r.get("version", 0)) >= version for r in records):
+        records = [r for r in records if int(r.get("version", 0)) < version]
     records.append({
         "version": version,
         "label": run_label,
@@ -2128,6 +2170,24 @@ async def push_notebook(
         "pushed_utc": datetime.now(timezone.utc).isoformat(),
     })
     _write_metadata(folder, {"id": canonical_ref, "versions": records})
+
+    # Invalidate stale log cache for this version/ref
+    cache_file = kaggle_logs.CACHE_DIR / f"{canonical_ref.replace('/', '_')}_v{version}.log"
+    try:
+        cache_file.unlink(missing_ok=True)
+    except Exception:
+        pass
+    if version == 1:
+        for old_cache in kaggle_logs.CACHE_DIR.glob(f"{canonical_ref.replace('/', '_')}_v*.log"):
+            try:
+                old_cache.unlink(missing_ok=True)
+            except Exception:
+                pass
+    key = (canonical_ref, version)
+    if key in kaggle_logs.streams:
+        stream = kaggle_logs.streams.pop(key, None)
+        if stream and not stream.task.done():
+            stream.task.cancel()
     attached = []
     if full_meta.get("dataset_sources"):
         attached.append(f"datasets: {', '.join(full_meta['dataset_sources'])}")
@@ -2368,6 +2428,21 @@ async def delete_notebook(notebook: str) -> str:
 
     proc = _run_kaggle(["kernels", "delete", "-y", ref], timeout=60, owner=_account_owner(ref))
     out = proc.stdout.strip() or f"Kernel {ref} deleted successfully"
+
+    target_folder = _find_notebook_folder_by_ref(ref) or (folder if folder.is_dir() else None)
+    if target_folder and (target_folder / "kernel-metadata.json").exists():
+        _write_metadata(target_folder, {"versions": []})
+
+    for cache_file in kaggle_logs.CACHE_DIR.glob(f"{ref.replace('/', '_')}_v*.log"):
+        try:
+            cache_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+    for k in list(kaggle_logs.streams.keys()):
+        if k and k[0] == ref:
+            stream = kaggle_logs.streams.pop(k, None)
+            if stream and not stream.task.done():
+                stream.task.cancel()
     return out
 
 
@@ -2445,7 +2520,7 @@ async def list_active_runs(limit: int = 50, head: int = 15) -> str:
 def _format_run(ref: str, snapshot: dict, logs: list[str], reason: str | None = None) -> str:
     header = f"{ref} · version {snapshot.get('version') or 'unknown'} · {snapshot['status']}"
     folder = _find_notebook_folder_by_ref(ref)
-    record = next((r for r in (_load_version_records(folder) if folder else [])
+    record = next((r for r in reversed(_load_version_records(folder) if folder else [])
                    if r.get("version") == snapshot.get("version")), {})
     pushed_utc = record.get("pushed_utc")
     if pushed_utc:
@@ -2604,7 +2679,7 @@ async def _run_snapshot(ref: str, version: int | None = None, logs: bool = False
             lines, error = await kaggle_logs.logs(ref, version, _cli_env(_account_owner(ref)), wait=0, background=False)
             if lines:
                 folder = _find_notebook_folder_by_ref(ref)
-                record = next((r for r in (_load_version_records(folder) if folder else []) if r.get("version") == version), {})
+                record = next((r for r in reversed(_load_version_records(folder) if folder else []) if r.get("version") == version), {})
                 status = record.get("status", "RUNNING")
                 return dict(version=version, status=status, hardware="NvidiaTeslaT4", logs=lines, logs_error=error, training_outcome="unknown")
     proc_timeout = max(35, log_timeout + 15)
@@ -2852,7 +2927,7 @@ async def fetch_output(
             raise RuntimeError(f"Could not resolve Kaggle kernel for '{name}'.")
 
     version, status = await _completed_run(ref, _resolve_version(ref, version, label))
-    record = next((r for r in _load_version_records(_find_notebook_folder_by_ref(ref) or name)
+    record = next((r for r in reversed(_load_version_records(_find_notebook_folder_by_ref(ref) or name))
                    if r.get("version") == version), {})
     record_label = record.get("label")
     record_params = record.get("parameters", {})

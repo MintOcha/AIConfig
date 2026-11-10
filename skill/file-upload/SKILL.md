@@ -26,6 +26,8 @@ Prints the share URL (add `--json` for full JSON):
 ```bash
 python scripts/upload.py /path/to/file.zip          # routes automatically
 python scripts/upload.py upload /path/to/file.zip --permanent   # Catbox (<=200MB)
+python scripts/upload.py upload /path/to/file.zip --temp        # Litterbox temporary (default 72h)
+python scripts/upload.py upload /path/to/file.zip --temp --expire 24h # 1h, 12h, 24h, 72h
 python scripts/upload.py upload file.zip --provider fuckingfast
 python scripts/upload.py upload img.png --provider ezhost
 python scripts/upload.py upload secret.zip --encrypt             # password-protected zip
@@ -33,7 +35,8 @@ python scripts/upload.py upload secret.zip --encrypt             # password-prot
 
 A bare file path defaults to `upload`. Routing picks `catbox` with `--permanent`
 if the file is <=200MB (otherwise warns `permanent ignored due to file size too large`
-and uses FuckingFast), `ezhost` for small images/videos with a key, else FuckingFast.
+and uses FuckingFast), `litterbox` with `--temp` (retention: 1h, 12h, 24h, 72h),
+`ezhost` for small images/videos with a key, else FuckingFast.
 
 Before uploading anything, delete personal info from it first: home paths,
 usernames, emails, tokens, API keys, internal hostnames. There is no flag for

@@ -1,20 +1,23 @@
 modelRoles:
   smol: v-rail/gemini-3.8-flash-high:auto
-  slow: v-rail/claude-haiku-5-5
+  slow: v-rail/gemini-3.8-flash-high
   designer: v-rail/claude-opus-5
   web: openai-codex/gpt-5.6-luna
   tiny: v-rail/gpt-6-luna
-  task: v-rail/claude-haiku-5-5
+  task: v-rail/gemini-3.8-flash-high
   default: v-rail/gemini-3.8-flash-high
+  advisor: v-rail/gemini-3.8-flash-high
 disabledProviders:
   - claude
 symbolPreset: unicode
+tui:
+  titleState: false
 composer:
   shape: claude
 theme:
   dark: titanium
   light: light
-setupVersion: 2
+setupVersion: 3
 steeringMode: all
 followUpMode: all
 statusLine:
@@ -44,8 +47,7 @@ retry:
       - google/gemini-2.5-flash
       - google-antigravity/gemini-2.5-flash
       - anthropic/claude-haiku-4-5
-      - openai-codex/gpt-5.6
-      - openai-codex/gpt-5.5
+      - openai-codex/gpt-5.6-sol
       - xai/grok-4.5
       - xai-oauth/grok-4.5
       - web/zai
@@ -73,3 +75,6 @@ ask:
 proseOnlyThinking: false
 todo:
   remindersMax: 10
+task:
+  agentModelOverrides:
+    reviewer: v-rail/gemini-3.8-flash-high

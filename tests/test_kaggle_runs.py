@@ -271,5 +271,83 @@ class RunSafetyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(meta_gpu["enable_gpu"], "true")
                 self.assertEqual(meta_gpu["accelerator"], "NvidiaTeslaT4")
 
+    def test_normalize_version_records_prunes_recreated_predecessors(self):
+        raw = [
+            {
+                "version": 1,
+                "label": "external-vless-check",
+                "status": "ERROR",
+                "pushed_utc": "2026-10-31T13:29:17.566298+00:00",
+            },
+            {
+                "version": 1,
+                "label": "external-xhttp-check",
+                "status": "QUEUED",
+                "pushed_utc": "2026-10-31T13:44:16.125195+00:00",
+            },
+        ]
+        normalized = module._normalize_version_records(raw)
+        self.assertEqual(len(normalized), 1)
+        self.assertEqual(normalized[0]["label"], "external-xhttp-check")
+        self.assertEqual(normalized[0]["version"], 1)
+
+        # Prior version sequence truncated on recreated version 1
+        multi_cycle = [
+            {"version": 1, "label": "old-v1"},
+            {"version": 2, "label": "old-v2"},
+            {"version": 1, "label": "new-v1"},
+            {"version": 2, "label": "new-v2"},
+        ]
+        norm_cycle = module._normalize_version_records(multi_cycle)
+        self.assertEqual(len(norm_cycle), 2)
+        self.assertEqual([r["label"] for r in norm_cycle], ["new-v1", "new-v2"])
+
+        # Test _resolve_version and _format_run with duplicate version records on disk
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            kaggle_dir = root / "kaggle"
+            nb_dir = kaggle_dir / "my-notebook"
+            nb_dir.mkdir(parents=True)
+            meta = {
+                "id": "owner/my-notebook",
+                "title": "My Notebook",
+                "versions": raw,
+            }
+            (nb_dir / "kernel-metadata.json").write_text(json.dumps(meta))
+            with patch.object(module, "get_kaggle_root", return_value=kaggle_dir):
+                # Resolving new label returns version 1
+                self.assertEqual(module._resolve_version("owner/my-notebook", None, "external-xhttp-check"), 1)
+                # Resolving stale label raises ValueError
+                with self.assertRaises(ValueError):
+                    module._resolve_version("owner/my-notebook", None, "external-vless-check")
+                # Formatting run selects the new record label and time
+                fmt = module._format_run("owner/my-notebook", {"version": 1, "status": "QUEUED"}, [])
+                self.assertIn("external-xhttp-check", fmt)
+                self.assertNotIn("external-vless-check", fmt)
+    async def test_delete_notebook_invalidates_local_versions(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            kaggle_dir = root / "kaggle"
+            nb_dir = kaggle_dir / "my-notebook"
+            nb_dir.mkdir(parents=True)
+            meta = {
+                "id": "owner/my-notebook",
+                "title": "My Notebook",
+                "versions": [{"version": 1, "label": "old-run", "status": "COMPLETE"}],
+            }
+            (nb_dir / "kernel-metadata.json").write_text(json.dumps(meta))
+
+            with patch.object(module, "get_workspace_root", return_value=root), \
+                 patch.object(module, "get_kaggle_root", return_value=kaggle_dir), \
+                 patch.object(module, "_accounts", return_value={"owner"}), \
+                 patch.object(module, "_account_owner", return_value="owner"), \
+                 patch.object(module, "_run_kaggle", return_value=SimpleNamespace(stdout="Kernel deleted")), \
+                 patch.object(module, "_find_kernel", return_value=(True, {"ref": "owner/my-notebook"})):
+                out = await module.delete_notebook("owner/my-notebook")
+                self.assertIn("deleted", out.lower())
+                updated_meta = json.loads((nb_dir / "kernel-metadata.json").read_text())
+                self.assertEqual(updated_meta.get("versions"), [])
 if __name__ == "__main__":
     unittest.main()

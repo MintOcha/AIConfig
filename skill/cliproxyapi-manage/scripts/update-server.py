@@ -15,8 +15,6 @@ import yaml
 OPENCODE_ENDPOINTS = {
     "https://opencode.ai/zen/go/v1": ("https://opencode.ai/zen/go/v1/models", False),
     "https://opencode.ai/zen/v1": ("https://opencode.ai/zen/v1/models", True),
-    "http://zen-free:8801/v1": ("https://opencode.ai/zen/v1/models", True),
-    "http://127.0.0.1:8801/v1": ("https://opencode.ai/zen/v1/models", True),
 }
 EXCLUDED_ZEN_MODELS = {"exo-free", "ling-3.0-flash-fin-free", "ling-3.1-flash-free", "test"}
 
@@ -29,8 +27,6 @@ DASHBOARD_LOCAL_URL = "http://127.0.0.1:6868"
 
 def fetch_models(models_url: str) -> list[str]:
     urls = [models_url]
-    if "zen" in models_url:
-        urls.append("http://127.0.0.1:8801/v1/models")
     last_err = None
     for url in urls:
         try:
@@ -81,7 +77,7 @@ def update_config(config_path: Path) -> int:
         base_url = normalize_url(provider.get("base-url"))
         provider_name = str(provider.get("name", "")).strip().lower()
         endpoint_spec = OPENCODE_ENDPOINTS.get(base_url)
-        if not endpoint_spec and ("zen" in provider_name or "8801" in base_url or "zen" in base_url):
+        if not endpoint_spec and ("zen" in provider_name or "zen" in base_url):
             endpoint_spec = ("https://opencode.ai/zen/v1/models", True)
         if not endpoint_spec:
             continue
@@ -327,15 +323,11 @@ def restart_stacks(project_dir: Path) -> None:
     except subprocess.CalledProcessError as error:
         print(f"Warning: docker compose pull cli-proxy-api failed: {error}", file=sys.stderr)
 
-    if (project_dir / "ZenFree").is_dir():
-        try:
-            compose_command(project_dir, None, "build", "zen-free")
-        except subprocess.CalledProcessError as error:
-            print(f"Warning: building zen-free failed: {error}", file=sys.stderr)
 
     # Clean up any stale created/stopped replacement containers before recreating
     compose_command(project_dir, None, "down", "--remove-orphans")
     compose_command(project_dir, None, "up", "-d")
+    time.sleep(3)
 def verify_containers_running(include_dashboard: bool = True, dashboard_dir: Path | None = None) -> None:
     running = running_container_names()
     required = [CLI_PROXY_CONTAINER, POSTGRES_CONTAINER]
