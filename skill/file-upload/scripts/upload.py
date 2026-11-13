@@ -24,6 +24,10 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, build_opener, HTTPRedirectHandler, urlopen
 
+try:
+    from curl_cffi import requests as cffi_requests
+except ImportError:
+    cffi_requests = None
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR.parent / "config.toml"
 EXAMPLE_PATH = SCRIPT_DIR.parent / "config.example.toml"
@@ -522,6 +526,14 @@ def fetch_direct_link(page_url: str, dl_path: str, method: str = "GET") -> str |
         "HX-Current-URL": page_url,
         "Referer": page_url,
     }
+    if cffi_requests is not None:
+        try:
+            r = cffi_requests.request(
+                method, target, headers=headers, impersonate="chrome120", allow_redirects=False, timeout=15
+            )
+            return r.headers.get("hx-redirect") or r.headers.get("location")
+        except Exception:
+            pass
     data = None
     if method == "POST":
         headers["Origin"] = host
@@ -605,14 +617,23 @@ def resolve_file(item: str) -> dict:
     last_error: Exception | None = None
     for mirror in mirrors:
         page_url = f"{mirror}/{file_id}"
-        try:
-            with urlopen(Request(page_url, headers=HTML_HEADERS), timeout=15) as resp:
-                if resp.status != 200:
-                    continue
-                body = resp.read().decode("utf-8", errors="replace")
-        except Exception as e:
-            last_error = e
-            continue
+        body = None
+        if cffi_requests is not None:
+            try:
+                r = cffi_requests.get(page_url, headers=HTML_HEADERS, impersonate="chrome120", timeout=15)
+                if r.status_code == 200:
+                    body = r.text
+            except Exception as e:
+                last_error = e
+        if body is None:
+            try:
+                with urlopen(Request(page_url, headers=HTML_HEADERS), timeout=15) as resp:
+                    if resp.status != 200:
+                        continue
+                    body = resp.read().decode("utf-8", errors="replace")
+            except Exception as e:
+                last_error = e
+                continue
         details = parse_page(body)
         if details is None:
             continue
@@ -769,12 +790,16 @@ def run_response(result, args):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Upload, view, and download files via configured providers.")
-    parser.add_argument("--account-id", help=argparse.SUPPRESS)
-    parser.add_argument("--json", action="store_true", help="Output JSON")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--account-id", help=argparse.SUPPRESS)
+    common.add_argument("--json", action="store_true", help="Output JSON")
+    parser = argparse.ArgumentParser(
+        description="Upload, view, and download files via configured providers.",
+        parents=[common],
+    )
     subs = parser.add_subparsers(dest="command")
 
-    p = subs.add_parser("upload", help="Upload one or more files")
+    p = subs.add_parser("upload", parents=[common], help="Upload one or more files")
     p.add_argument("files", nargs="+", help="File path(s) or glob pattern(s)")
     p.add_argument("--provider", choices=["auto", "ezhost", "catbox", "litterbox", "fuckingfast"], default="auto")
     p.add_argument("--permanent", action="store_true", help="Permanent hosting (Catbox, <=200MB)")
@@ -796,11 +821,11 @@ def main() -> None:
     p.add_argument("--no-labels", action="store_true", help="Hide tile filename labels in grid")
     p.add_argument("--save-grid", help="Also save the generated grid image to this path")
 
-    p = subs.add_parser("view", help="View file details from an id or link")
+    p = subs.add_parser("view", parents=[common], help="View file details from an id or link")
     p.add_argument("target")
     p.add_argument("--check", action="store_true", help="HEAD-check the direct download link")
 
-    p = subs.add_parser("download", help="Download a file from an id or link")
+    p = subs.add_parser("download", parents=[common], help="Download a file from an id or link")
     p.add_argument("target")
     p.add_argument("-o", "--output", help="Output file or directory")
     p.add_argument("-c", "--connections", type=int, default=15, help="Parallel connections (default 15)")

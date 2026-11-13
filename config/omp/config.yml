@@ -5,7 +5,7 @@ modelRoles:
   web: openai-codex/gpt-5.6-luna
   tiny: v-rail/gpt-6-luna
   task: v-rail/gemini-3.8-flash-high
-  default: v-rail/gemini-3.8-flash-high
+  default: v-rail/gemini-4-hydrogen-xhigh
   advisor: v-rail/gemini-3.8-flash-high
 disabledProviders:
   - claude
@@ -78,3 +78,5 @@ todo:
 task:
   agentModelOverrides:
     reviewer: v-rail/gemini-3.8-flash-high
+update:
+  auto: true
