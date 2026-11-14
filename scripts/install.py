@@ -2,7 +2,7 @@
 """Unified interactive installer and configuration manager for AIConfig.
 
 Merges and replaces install.sh, install.ps1, setup-agent.py, and sync-omp-config.py.
-Supports Oh My Pi (omp), Codex, Claude Code, Freebuff, OpenCode, and KiloCode.
+Supports Oh My Pi (omp), Codex, Claude Code, Freebuff, OpenCode, KiloCode, and Antigravity (agy).
 """
 
 from __future__ import annotations
@@ -47,6 +47,7 @@ HARNESSES = [
     ("Freebuff", "freebuff", HOME / ".agents"),
     ("OpenCode", "opencode", HOME / ".config" / "opencode"),
     ("KiloCode", "kilocode", HOME / ".local" / "share" / "kilo"),
+    ("Antigravity", "agy", HOME / ".gemini" / "config"),
 ]
 
 HARNESS_MAP = {h[1]: h for h in HARNESSES}
@@ -488,8 +489,8 @@ def install_mcps(h_id: str, target_home: Path, dry_run: bool) -> None:
 
 
 def _write_mcp_to_harness(h_id: str, target_home: Path, server_id: str, mcp_def: dict) -> None:
-    if h_id in ("omp", "freebuff"):
-        mcp_file = target_home / "mcp.json"
+    if h_id in ("omp", "freebuff", "agy"):
+        mcp_file = target_home / ("mcp_config.json" if h_id == "agy" else "mcp.json")
         data = read_json(mcp_file)
         servers = data.setdefault("mcpServers", {})
         servers[server_id] = mcp_def
@@ -563,7 +564,26 @@ def install_prompt(h_id: str, target_home: Path, dry_run: bool) -> None:
         return
 
     target = (HOME / ".AGENTS.md") if h_id == "freebuff" else (target_home / ("CLAUDE.md" if h_id == "claude" else "AGENTS.md"))
-    import_line = f"@{selected_prompt.resolve()}"
+    resolved_prompt = selected_prompt.resolve()
+
+    if h_id == "agy":
+        if target.is_symlink() and target.resolve() == resolved_prompt:
+            print(f"Already linked: {target} -> {resolved_prompt}")
+            return
+        if not target.exists() or target.is_symlink():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.is_symlink():
+                target.unlink()
+            try:
+                target.symlink_to(resolved_prompt)
+                success(f"Linked prompt: {target} -> {resolved_prompt}")
+                return
+            except OSError:
+                pass
+        import_line = f"@[{selected_prompt.stem}]({resolved_prompt})"
+    else:
+        import_line = f"@{resolved_prompt}"
+
     target.parent.mkdir(parents=True, exist_ok=True)
     existing = target.read_text(encoding="utf-8") if target.exists() else ""
     if import_line in existing:
@@ -1048,6 +1068,7 @@ def main() -> None:
     parser.add_argument("--codex", action="store_true", help="Shortcut to select Codex (~/.codex)")
     parser.add_argument("--claude", action="store_true", help="Shortcut to select Claude Code (~/.claude)")
     parser.add_argument("--freebuff", action="store_true", help="Shortcut to select Freebuff (~/.agents)")
+    parser.add_argument("--agy", action="store_true", help="Shortcut to select Antigravity (~/.gemini/config)")
     parser.add_argument("--models-only", action="store_true", help="Directly launch model & provider setup without menu")
 
     args = parser.parse_args()
@@ -1062,6 +1083,8 @@ def main() -> None:
         selected_harness_id = "claude"
     elif args.freebuff:
         selected_harness_id = "freebuff"
+    elif args.agy:
+        selected_harness_id = "agy"
     elif args.harness:
         selected_harness_id = args.harness
 

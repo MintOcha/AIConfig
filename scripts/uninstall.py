@@ -2,7 +2,7 @@
 """Unified uninstaller for AIConfig.
 
 Removes AIConfig MCPs, prompts (@ references), skills, and model configurations
-from Oh My Pi (omp), Codex, Claude Code, Freebuff, OpenCode, and KiloCode.
+from Oh My Pi (omp), Codex, Claude Code, Freebuff, OpenCode, KiloCode, and Antigravity (agy).
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ HARNESSES = [
     ("Freebuff", "freebuff", HOME / ".agents"),
     ("OpenCode", "opencode", HOME / ".config" / "opencode"),
     ("KiloCode", "kilocode", HOME / ".local" / "share" / "kilo"),
+    ("Antigravity", "agy", HOME / ".gemini" / "config"),
 ]
 
 HARNESS_MAP = {h[1]: h for h in HARNESSES}
@@ -173,8 +174,8 @@ def uninstall_mcps(h_id: str, target_home: Path, dry_run: bool) -> None:
     mcp_scripts = get_mcp_folder_scripts()
     print(f"\n{BOLD}Scanning for installed MCPs originating from {REPO_ROOT / 'mcp'} in {h_id}...{RESET}")
 
-    if h_id in ("omp", "freebuff"):
-        mcp_file = target_home / "mcp.json"
+    if h_id in ("omp", "freebuff", "agy"):
+        mcp_file = target_home / ("mcp_config.json" if h_id == "agy" else "mcp.json")
         if mcp_file.is_file():
             data = read_json(mcp_file)
             servers = data.get("mcpServers", {})
@@ -261,15 +262,33 @@ def uninstall_mcps(h_id: str, target_home: Path, dry_run: bool) -> None:
 
 def uninstall_prompts(h_id: str, target_home: Path, dry_run: bool) -> None:
     target = (HOME / ".AGENTS.md") if h_id == "freebuff" else (target_home / ("CLAUDE.md" if h_id == "claude" else "AGENTS.md"))
-    if not target.is_file():
+    if not target.is_file() and not target.is_symlink():
         print(f"No prompt file found at {target}")
+        return
+
+    prompts_dir = (REPO_ROOT / "prompts").resolve()
+    repo_str = str(REPO_ROOT).replace("\\", "/")
+    known_prompt_names = {p.name for p in prompts_dir.glob("*.md")}
+
+    if target.is_symlink():
+        resolved = target.resolve()
+        is_aiconfig_link = (
+            resolved.parent == prompts_dir
+            or repo_str in str(resolved).replace("\\", "/")
+            or resolved.name in known_prompt_names
+        )
+        if is_aiconfig_link:
+            if dry_run:
+                print(f"Dry run: would remove prompt symlink {target}")
+            else:
+                target.unlink()
+                success(f"Removed prompt symlink: {target}")
+        else:
+            print(f"No AIConfig prompt references found in {target}")
         return
 
     print(f"\n{BOLD}Scanning and removing '@' prompt references from {target}...{RESET}")
     content = target.read_text(encoding="utf-8")
-    repo_str = str(REPO_ROOT).replace("\\", "/")
-    prompts_dir = (REPO_ROOT / "prompts").resolve()
-    known_prompt_names = {p.name for p in prompts_dir.glob("*.md")}
 
     lines = content.splitlines()
     filtered: list[str] = []
@@ -445,6 +464,7 @@ def main() -> None:
     parser.add_argument("--codex", action="store_true", help="Shortcut to select Codex (~/.codex)")
     parser.add_argument("--claude", action="store_true", help="Shortcut to select Claude Code (~/.claude)")
     parser.add_argument("--freebuff", action="store_true", help="Shortcut to select Freebuff (~/.agents)")
+    parser.add_argument("--agy", action="store_true", help="Shortcut to select Antigravity (~/.gemini/config)")
     parser.add_argument("--all", action="store_true", help="Uninstall everything for the selected harness non-interactively")
 
     args = parser.parse_args()
@@ -458,6 +478,8 @@ def main() -> None:
         selected_harness_id = "claude"
     elif args.freebuff:
         selected_harness_id = "freebuff"
+    elif args.agy:
+        selected_harness_id = "agy"
     elif args.harness:
         selected_harness_id = args.harness
 
