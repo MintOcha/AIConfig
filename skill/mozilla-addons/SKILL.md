@@ -11,7 +11,7 @@ Use `uv run --script /path/to/skill/mozilla-addons/scripts/amo.py` as `amo` in t
 
 Sign in to the [AMO Developer Hub API credentials page](https://addons.mozilla.org/en-US/developers/addon/api/key/) with the account that will submit the add-on. For a version update, that account must already be an author of the add-on. Accept the developer agreement if AMO prompts for it.
 
-Store both credentials in [pass](https://www.passwordstore.org/). If this is a new store, create a passphrase-protected GPG key (`gpg --full-generate-key`) and initialize it with `pass init <GPG-key-fingerprint>`. Skip initialization if you already use pass. These commands prompt for the values without echoing them:
+Store both credentials in [pass](https://www.passwordstore.org/). If this is a new store, create a GPG key (`gpg --full-generate-key`) and initialize it with `pass init <GPG-key-fingerprint>`. Prefer a passphrase for interactive use. An unattended key without a passphrase lets any process running as your user decrypt the entries; use it only on a trusted account, with private GPG and password-store directories (`0700`) and a home directory other users cannot write to. Skip initialization if you already use pass. These commands prompt for the values without echoing them:
 
 ```bash
 pass insert aiconfig/mozilla-addons/jwt-issuer
