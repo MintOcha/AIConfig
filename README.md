@@ -33,7 +33,7 @@ codex plugin add ponytail@ponytail
 
 ## Setup agents
 
-Launch the setup menu:
+Launch the setup menu with Python 3.11 or newer. No `uv`, `pip`, or third-party Python packages are required.
 
 ```bash
 ./scripts/install.py
@@ -60,8 +60,7 @@ without replacing existing role selections; there is no separate hardcoded role 
 The installer's **Configure Models & Auth** action generates OMP's credential-bearing
 `models.yml` locally, including provider-wide `v-rail` reasoning-effort forwarding.
 **OMP / Tracked Configs → Apply tracked settings** also merges those compatibility
-flags into an existing `v-rail` provider, preserving credentials, other providers,
-and unrelated model settings. This merge requires PyYAML; no per-model list is needed.
+flags into an existing `v-rail` provider if `models.yml` is JSON-compatible or PyYAML is already installed. Otherwise it asks before replacing the entire provider file; declining leaves it untouched and still installs tracked settings. API key discovery checks existing harness configs first, then `pass:aiconfig/cliproxyapi/client/1` if available, then prompts. Ordinary YAML credentials in existing `models.yml` require an already installed YAML parser for discovery.
 On a fresh machine, configure models first, then apply tracked OMP settings to
 restore your saved preferences and keybindings. Restart existing OMP sessions afterward.
 

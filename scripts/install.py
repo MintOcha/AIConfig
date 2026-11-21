@@ -19,19 +19,13 @@ import tempfile
 import urllib.error
 import urllib.request
 import uuid
-
-try:
-    import tomllib
-except ImportError:
-    try:
-        import tomli as tomllib  # type: ignore
-    except ImportError:
-        tomllib = None  # type: ignore
+import tomllib
 
 try:
     import yaml
 except ImportError:
     yaml = None
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOME = Path.home()
@@ -102,10 +96,11 @@ def write_json(path: Path | str, data: dict) -> None:
 
 def read_yaml(path: Path | str) -> dict:
     p = Path(path)
-    if not p.is_file() or yaml is None:
+    if not p.is_file():
         return {}
     try:
-        return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        text = p.read_text(encoding="utf-8")
+        return (yaml.safe_load(text) if yaml is not None else json.loads(text)) or {}
     except Exception:
         return {}
 
@@ -113,11 +108,7 @@ def read_yaml(path: Path | str) -> dict:
 def write_yaml(path: Path | str, data: dict) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    if yaml is not None:
-        content = yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
-    else:
-        # Simple fallback YAML emitter for basic dicts
-        content = _dump_simple_yaml(data)
+    content = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=p.parent, delete=False) as f:
         f.write(content)
         temp_path = f.name
@@ -126,39 +117,17 @@ def write_yaml(path: Path | str, data: dict) -> None:
     success(f"Written: {p}")
 
 
-def _dump_simple_yaml(data: dict, indent: int = 0) -> str:
-    lines = []
-    prefix = "  " * indent
-    for k, v in data.items():
-        if isinstance(v, dict):
-            lines.append(f"{prefix}{k}:")
-            lines.append(_dump_simple_yaml(v, indent + 1))
-        elif isinstance(v, list):
-            lines.append(f"{prefix}{k}:")
-            for item in v:
-                lines.append(f"{prefix}  - {json.dumps(item) if isinstance(item, (dict, list)) else item}")
-        elif isinstance(v, bool):
-            lines.append(f"{prefix}{k}: {'true' if v else 'false'}")
-        elif v is None:
-            lines.append(f"{prefix}{k}: null")
-        else:
-            lines.append(f"{prefix}{k}: {v}")
-    return "\n".join(lines)
-
-
 def read_toml(path: Path | str) -> dict:
     p = Path(path)
     if not p.is_file():
         return {}
-    if tomllib is None:
-        raise RuntimeError("tomllib is required (Python 3.11+ or tomli)")
     return tomllib.loads(p.read_text(encoding="utf-8"))
 
 
 def find_existing_api_key() -> tuple[str | None, str | None]:
     candidates = [
         (HOME / ".claude" / "settings.json", lambda d: d.get("env", {}).get("ANTHROPIC_AUTH_TOKEN") if d.get("env", {}).get("ANTHROPIC_BASE_URL") == BASE_URL else None),
-        (HOME / ".omp" / "agent" / "models.yml", lambda d: next((p.get("apiKey") for p in d.get("providers", {}).values() if str(p.get("baseUrl", "")).startswith(BASE_URL) and p.get("apiKey")), None) if yaml else None),
+        (HOME / ".omp" / "agent" / "models.yml", lambda d: next((p.get("apiKey") for p in d.get("providers", {}).values() if str(p.get("baseUrl", "")).startswith(BASE_URL) and p.get("apiKey")), None)),
         (HOME / ".config" / "opencode" / "opencode.json", lambda d: next((p.get("options", {}).get("apiKey") for p in d.get("provider", {}).values() if str(p.get("options", {}).get("baseURL", "")).startswith(BASE_URL) and p.get("options", {}).get("apiKey")), None)),
         (HOME / ".local" / "share" / "kilo" / "auth.json", lambda d: d.get("cliproxyapi", {}).get("key")),
         (HOME / ".codex" / "auth.json", lambda d: d.get("OPENAI_API_KEY")),
@@ -175,6 +144,14 @@ def find_existing_api_key() -> tuple[str | None, str | None]:
                     return key, str(path)
             except Exception:
                 pass
+    pass_command = shutil.which("pass")
+    if pass_command:
+        entry = "aiconfig/cliproxyapi/client/1"
+        result = subprocess.run([pass_command, "show", entry], stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True)
+        key = result.stdout.partition("\n")[0].strip()
+        if result.returncode == 0 and key:
+            return key, f"pass:{entry}"
     return None, None
 
 # ---------------------------------------------------------------------------
@@ -753,9 +730,19 @@ def _apply_omp_provider_settings(target_home: Path, dry_run: bool) -> None:
     if not path.is_file():
         warning("No models.yml found; use Configure Models & Auth to set up v-rail.")
         return
-    if yaml is None:
-        raise RuntimeError("PyYAML is required to safely update existing models.yml")
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
+    try:
+        data = yaml.safe_load(text) if yaml is not None else json.loads(text)
+    except (ValueError,) if yaml is None else (ValueError, yaml.YAMLError):
+        if dry_run:
+            print(f"Dry run: would ask before replacing {path}")
+            return
+        warning(f"Cannot safely merge {path}. Replacing it removes existing providers and credentials.")
+        if confirm_omp_models_replacement(path):
+            setup_models_and_provider("omp", target_home, False, replace_omp_models=True)
+        else:
+            warning(f"Provider settings not applied: {path} left unchanged.")
+        return
     if not isinstance(data, dict) or not isinstance(data.get("providers"), dict):
         raise ValueError(f"Invalid provider configuration in {path}; file left unchanged")
     provider = data["providers"].get("v-rail")
@@ -890,8 +877,12 @@ def detect_standalone_web_search(api_key: str, models: list[str]) -> bool:
 
 
 
-def setup_models_and_provider(h_id: str, target_home: Path, dry_run: bool) -> None:
+def setup_models_and_provider(h_id: str, target_home: Path, dry_run: bool, *, replace_omp_models: bool = False) -> None:
     print(f"\n{BOLD}{CYAN}Configure LiteLLM / v-rail Provider & Models for {h_id}{RESET}")
+    models_path = target_home / "models.yml"
+    if h_id == "omp" and models_path.exists() and not (dry_run or replace_omp_models):
+        if not confirm_omp_models_replacement(models_path):
+            return
 
     existing_key, src = find_existing_api_key()
     api_key = existing_key
@@ -939,6 +930,13 @@ def setup_models_and_provider(h_id: str, target_home: Path, dry_run: bool) -> No
         success(f"Models and API key verified: {len(models)} models.")
 
 
+def confirm_omp_models_replacement(path: Path) -> bool:
+    try:
+        return input(f"Replace {path} and remove its existing providers and credentials? [y/N]: ").strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
 def _setup_omp_provider(target_home: Path, api_key: str, models: list[str]) -> None:
     models_path = target_home / "models.yml"
     models_data = {
@@ -961,23 +959,9 @@ def _setup_omp_provider(target_home: Path, api_key: str, models: list[str]) -> N
     write_yaml(models_path, models_data)
 
     config_path = target_home / "config.yml"
-    config_data = read_yaml(config_path) if config_path.is_file() else {}
-    roles = config_data.setdefault("modelRoles", {})
-    tracked_config = read_yaml(REPO_ROOT / "config" / "omp" / "config.yml")
-    for role, model in tracked_config.get("modelRoles", {}).items():
-        roles.setdefault(role, model)
-
-    config_data["steeringMode"] = "all"
-    config_data["followUpMode"] = "all"
-    config_data["interruptMode"] = "wait"
-    config_data["symbolPreset"] = "unicode"
-    config_data["composer"] = {"shape": "claude"}
-    config_data["theme"] = {"dark": "titanium", "light": "light"}
-    config_data["statusLine"] = {"preset": "nerd"}
-    config_data["display"] = {"showTokenUsage": True}
-    config_data["tools"] = {"approvalMode": "yolo"}
-    config_data.setdefault("providers", {})["webSearchOrder"] = ["codex"]
-    write_yaml(config_path, config_data)
+    if not config_path.exists():
+        shutil.copyfile(REPO_ROOT / "config" / "omp" / "config.yml", config_path)
+        os.chmod(config_path, 0o600)
 
     keybindings_path = target_home / "keybindings.json"
     kb_data = read_json(keybindings_path)
