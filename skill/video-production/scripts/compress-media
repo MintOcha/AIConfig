@@ -81,6 +81,12 @@ def rotations(stream):
     return [side['displaymatrix'] for side in stream.get('side_data_list', []) if 'displaymatrix' in side]
 
 
+def video_timestamps(ffprobe, path):
+    data = json.loads(run([ffprobe, '-v', 'error', '-threads', '2', '-select_streams', 'v:0', '-show_frames',
+                           '-show_entries', 'frame=best_effort_timestamp_time', '-of', 'json', path]))
+    return [float(frame['best_effort_timestamp_time']) for frame in data['frames']]
+
+
 def encode_video(ffmpeg, ffprobe, source, output, device):
     before = probe(ffprobe, source)
     streams = before['streams']
@@ -122,10 +128,15 @@ def encode_video(ffmpeg, ffprobe, source, output, device):
         for key in keys:
             if old.get(key) != new.get(key):
                 raise RuntimeError(f"{old['codec_type']} {key} changed: {old.get(key)} → {new.get(key)}")
-        if old.get('nb_frames') and old['nb_frames'] != new.get('nb_frames'):
-            raise RuntimeError(f"{old['codec_type']} frame count changed: {old['nb_frames']} → {new.get('nb_frames')}")
-        if abs(float(old['duration']) - float(new['duration'])) > 0.05:
-            raise RuntimeError('Video or audio stream duration changed')
+        frames_changed = old.get('nb_frames') and old['nb_frames'] != new.get('nb_frames')
+        duration_changed = abs(float(old['duration']) - float(new['duration'])) > 0.05
+        if frames_changed or duration_changed:
+            if old['codec_type'] == 'video':
+                # An MP4 edit list can exclude stored preroll frames from playback.
+                old_pts, new_pts = (video_timestamps(ffprobe, path) for path in (source, output))
+                if old_pts and len(old_pts) == len(new_pts) and all(abs(a - b) <= 0.001 for a, b in zip(old_pts, new_pts)):
+                    continue
+            raise RuntimeError(f"{old['codec_type']} playback frame count or timing changed")
     return None
 
 
