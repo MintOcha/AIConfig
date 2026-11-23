@@ -81,7 +81,7 @@ def rotations(stream):
     return [side['displaymatrix'] for side in stream.get('side_data_list', []) if 'displaymatrix' in side]
 
 
-def encode_video(ffmpeg, ffprobe, source, output):
+def encode_video(ffmpeg, ffprobe, source, output, device):
     before = probe(ffprobe, source)
     streams = before['streams']
     layout = video_layout(streams)
@@ -95,9 +95,14 @@ def encode_video(ffmpeg, ffprobe, source, output):
         return 'HDR, nonstandard pixel/color format, or auxiliary video data'
     if video.get('field_order', 'progressive') not in {'progressive', 'unknown'}:
         return 'interlaced video'
-    run([ffmpeg, *FFMPEG, '-threads', '2', '-noautorotate', '-i', source, '-map', '0', '-map_metadata', '0',
-         '-map_chapters', '0', '-c', 'copy', '-c:v', 'libx265', '-preset', 'medium', '-crf', '20',
-         '-x265-params', 'pools=2:frame-threads=2:log-level=error', '-fps_mode', 'passthrough',
+    hardware = ['-vaapi_device', device] if device else []
+    if device:
+        encoding = ['-c:v', 'hevc_vaapi', '-vf', 'format=nv12,hwupload', '-rc_mode', 'CQP', '-qp', '23']
+    else:
+        encoding = ['-c:v', 'libx265', '-preset', 'medium', '-crf', '20',
+                    '-x265-params', 'pools=2:frame-threads=2:log-level=error']
+    run([ffmpeg, *FFMPEG, *hardware, '-threads', '2', '-noautorotate', '-i', source, '-map', '0', '-map_metadata', '0',
+         '-map_chapters', '0', '-c', 'copy', *encoding, '-fps_mode', 'passthrough',
          '-tag:v', 'hvc1', '-movflags', '+faststart+use_metadata_tags', output])
     after = probe(ffprobe, output)
     if video_layout(after['streams']) != layout:
@@ -117,14 +122,14 @@ def encode_video(ffmpeg, ffprobe, source, output):
     return None
 
 
-def inputs(root):
+def inputs(root, extensions):
     if root.is_file():
         yield root, Path(root.name)
         return
     for folder, _, names in os.walk(root):
         for name in names:
             path = Path(folder, name)
-            if path.suffix.lower() in PHOTOS | VIDEOS and path.is_file() and not path.is_symlink():
+            if path.suffix.lower() in extensions and path.is_file() and not path.is_symlink():
                 yield path, path.relative_to(root)
 
 
@@ -133,6 +138,8 @@ def main():
     parser.add_argument('input', type=Path, help='source file or directory (recursive)')
     parser.add_argument('output', type=Path, help='separate output directory')
     parser.add_argument('--min-savings', type=int, default=15, metavar='PERCENT', help='minimum size reduction (default: 15)')
+    parser.add_argument('--videos-only', action='store_true', help='ignore photos when compressing a directory')
+    parser.add_argument('--hevc-device', metavar='PATH', help='use a VAAPI HEVC encoder on this render device')
     data = Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share')
     local = data / 'compress-media/ffmpeg-jxl/usr/bin/ffmpeg'
     parser.add_argument('--photo-ffmpeg', default=str(local) if local.is_file() else 'ffmpeg', help='FFmpeg with libjxl, for photos')
@@ -143,13 +150,14 @@ def main():
         parser.error('source must exist and the output directory must be outside it')
     if not 1 <= args.min_savings <= 99:
         parser.error('--min-savings must be between 1 and 99')
-    if source.is_file() and source.suffix.lower() not in PHOTOS | VIDEOS:
-        parser.error('supported inputs: JPEG photos and SDR MOV/MP4 videos')
+    extensions = VIDEOS if args.videos_only else PHOTOS | VIDEOS
+    if source.is_file() and source.suffix.lower() not in extensions:
+        parser.error('input must be a supported media file for the selected mode')
     destination.mkdir(parents=True, exist_ok=True)
     counts = {'saved': 0, 'skipped': 0, 'failed': 0}
     savings = 0
     with TemporaryDirectory(prefix='.compress-media-', dir=destination) as temp:
-        for path, relative in inputs(source):
+        for path, relative in inputs(source, extensions):
             photo = path.suffix.lower() in PHOTOS
             target = (destination / relative).with_suffix('.jxl' if photo else '.mp4')
             output = Path(temp) / f'candidate{target.suffix}'
@@ -160,8 +168,12 @@ def main():
                 if not target.parent.resolve().is_relative_to(destination):
                     raise RuntimeError('output path escapes its directory')
                 size = path.stat().st_size
-                encode = encode_photo if photo else encode_video
-                reason = 'output already exists' if os.path.lexists(target) else encode(ffmpeg, ffprobe, path, output)
+                if os.path.lexists(target):
+                    reason = 'output already exists'
+                elif photo:
+                    reason = encode_photo(ffmpeg, ffprobe, path, output)
+                else:
+                    reason = encode_video(ffmpeg, ffprobe, path, output, args.hevc_device)
                 if not reason and output.stat().st_size * 100 > size * (100 - args.min_savings):
                     reason = f'less than {args.min_savings}% smaller'
                 if reason:

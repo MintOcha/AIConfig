@@ -43,9 +43,11 @@ compress-media /path/to/input /path/to/compressed
 
 Pass a single JPEG, MOV, or MP4, or a directory to process recursively. Use a separate output directory; relative folder layout is retained. The output contains only smaller copies, not a complete mirror. By default each output must save at least 15%; change the cutoff with `--min-savings PERCENT`. Never delete or replace the originals without separate authorization. Check the intended photo app can display `.jxl` and preview representative outputs before promoting them into the library.
 
+Use `--videos-only` to leave photos out of a batch. On a machine with VAAPI HEVC support, pass `--hevc-device /dev/dri/renderD128` to use the hardware encoder at constant QP 23 instead of software HEVC. Sample representative footage to check quality and savings before using either encoder for an archive.
+
 - **JPEG → JPEG XL:** FFmpeg `libjxl`, distance 1.0. Keeps resolution, EXIF/XMP and the defined sRGB or Display P3 color encoding. Skips detected auxiliary images, motion photos, nonstandard orientation/color and unsupported metadata. Existing HEIC, AVIF, PNG and other formats are not converted.
 - **SDR video → HEVC MP4:** FFmpeg `libx265`, CRF 20. Keeps resolution, timestamps, orientation and audio streams; skips HDR and clips with auxiliary tracks. Decodes accepted outputs end to end before publication.
-- **Dependencies:** Python 3.9+, ExifTool, FFmpeg with `libjxl` for JPEGs and `libx265` for videos. Use `--photo-ffmpeg PATH` / `--ffmpeg PATH` to select a build; the tool uses its sibling `ffprobe` when available. The NAS's JPEG XL build is under `${XDG_DATA_HOME:-$HOME/.local/share}/compress-media/ffmpeg-jxl/usr/bin/`; its default FFmpeg remains unchanged. If the command is not on `PATH`, run `scripts/compress-media` directly from this skill.
+- **Dependencies:** Python 3.9+, ExifTool, FFmpeg with `libjxl` for JPEGs and `libx265` (or `hevc_vaapi` with a compatible render device) for videos. Use `--photo-ffmpeg PATH` / `--ffmpeg PATH` to select a build; the tool uses its sibling `ffprobe` when available. The NAS's JPEG XL build is under `${XDG_DATA_HOME:-$HOME/.local/share}/compress-media/ffmpeg-jxl/usr/bin/`; its default FFmpeg remains unchanged. If the command is not on `PATH`, run `scripts/compress-media` directly from this skill.
 
 Python tools require OpenCV, Pillow, and NumPy. If unavailable, create a project-local environment with `uv venv` and install `opencv-python-headless pillow numpy`; do not mutate the system Python environment.
 
