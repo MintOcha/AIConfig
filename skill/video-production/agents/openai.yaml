@@ -1,4 +1,4 @@
 interface:
   display_name: "Video Production"
-  short_description: "Prepare, subtitle, design, and compress video"
-  default_prompt: "Use $design to establish the visual direction, then use $video-production to build, subtitle, inspect, and deliver the video."
+  short_description: "Prepare video and compress photos and videos"
+  default_prompt: "Use $video-production to build or inspect video, or to make verified JPEG XL and HEVC copies of large media files."

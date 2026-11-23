@@ -1,6 +1,6 @@
 ---
 name: video-production
-description: Build, edit, subtitle, inspect, prepare, and compress video through reusable FFmpeg, OpenCV, Pillow, and NumPy workflows. Use when Codex needs to create kinetic word-highlight subtitles, composite configurable wave or motion graphics, generate contact sheets to visually inspect a video, tone-map HDR/HLG footage to Rec.709, preserve aspect ratio through horizontal or vertical crops, verify exports, or create quality-based compressed deliverables.
+description: Build, edit, subtitle, inspect, and compress media with FFmpeg, OpenCV, Pillow, and NumPy. Use for graphics, contact sheets, HDR tone-mapping, crops, video exports, or making large photo and video files smaller with JPEG XL and HEVC.
 ---
 
 # Video Production
@@ -23,16 +23,29 @@ For visually led work, use `$design` to establish the audience, experience, hier
 - `scripts/kinetic_subtitles.py`: burn word-timed, active-word-highlighted captions from JSON. Read `references/subtitle-timings.md` for the schema.
 - `scripts/motion_graphics.py`: composite JSON-driven waves, deterministic dots/sparkles, animated rectangles, circles, and route lines. Read `references/motion-graphics.md` before adapting an effect.
 - `scripts/prepare_hdr_sdr.sh`: create a 10-bit Rec.709 ProRes mezzanine from HLG/BT.2020 footage with a Hable tone map.
+- `scripts/compress-media`: batch or single-file compression for existing media archives; JPEG XL for eligible JPEGs and HEVC for SDR MOV/MP4. Keeps the source untouched and publishes only verified copies that meet the savings threshold.
 - `scripts/compress_video.sh`: make a resolution-preserving, quality-based sharing copy. Its default `auto` mode probes and prefers the saved Intel AV1 QSV profile (`global_quality 30`, `preset slow`, look-ahead depth 80, AAC 64 kbps), then falls back to slow quality-based H.264 only when that exact hardware profile cannot run. Explicit `libx264`, `libsvtav1`, and `av1_qsv` modes remain available.
 - `scripts/verify_video.sh`: print delivery metadata and fully decode video and audio to catch corruption.
 
-For ordinary compression, run the default command without choosing an encoder:
+For video sharing exports, run the default command without choosing an encoder:
 
 ```bash
 scripts/compress_video.sh INPUT OUTPUT
 ```
 
 Only pass the optional encoder argument when the user has a special codec, compatibility, or delivery requirement. Do not tune the saved quality profile by default.
+
+### Compressing existing media
+
+```bash
+compress-media /path/to/input /path/to/compressed
+```
+
+Pass a single JPEG, MOV, or MP4, or a directory to process recursively. Use a separate output directory; relative folder layout is retained. The output contains only smaller copies, not a complete mirror. By default each output must save at least 15%; change the cutoff with `--min-savings PERCENT`. Never delete or replace the originals without separate authorization. Check the intended photo app can display `.jxl` and preview representative outputs before promoting them into the library.
+
+- **JPEG → JPEG XL:** FFmpeg `libjxl`, distance 1.0. Keeps resolution, EXIF/XMP and the defined sRGB or Display P3 color encoding. Skips detected auxiliary images, motion photos, nonstandard orientation/color and unsupported metadata. Existing HEIC, AVIF, PNG and other formats are not converted.
+- **SDR video → HEVC MP4:** FFmpeg `libx265`, CRF 20. Keeps resolution, timestamps, orientation and audio streams; skips HDR and clips with auxiliary tracks. Decodes accepted outputs end to end before publication.
+- **Dependencies:** Python 3.9+, ExifTool, FFmpeg with `libjxl` for JPEGs and `libx265` for videos. Use `--photo-ffmpeg PATH` / `--ffmpeg PATH` to select a build; the tool uses its sibling `ffprobe` when available. The NAS's JPEG XL build is under `${XDG_DATA_HOME:-$HOME/.local/share}/compress-media/ffmpeg-jxl/usr/bin/`; its default FFmpeg remains unchanged. If the command is not on `PATH`, run `scripts/compress-media` directly from this skill.
 
 Python tools require OpenCV, Pillow, and NumPy. If unavailable, create a project-local environment with `uv venv` and install `opencv-python-headless pillow numpy`; do not mutate the system Python environment.
 

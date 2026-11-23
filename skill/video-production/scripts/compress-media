@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""Make verified, smaller JPEG XL and HEVC copies without changing the source."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+from tempfile import TemporaryDirectory
+
+
+PHOTOS = {'.jpg', '.jpeg'}
+VIDEOS = {'.mov', '.mp4'}
+PHOTO_TAGS = ('EXIF', 'XMP')
+FFMPEG = ('-nostdin', '-hide_banner', '-v', 'error', '-xerror')
+
+
+def run(command):
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if result.returncode:
+        raise RuntimeError(result.stderr.decode(errors='replace').strip() or f'{command[0]} exited {result.returncode}')
+    return result.stdout
+
+
+def exif(path, *tags):
+    row, = json.loads(run(['exiftool', '-j', '-G1', '-n', '-b', *tags, path]))
+    row.pop('SourceFile')
+    if any(key.endswith(':Error') for key in row):
+        raise RuntimeError(f'ExifTool could not read {path}')
+    return row
+
+
+def probe(ffprobe, path):
+    return json.loads(run([ffprobe, '-v', 'error', '-show_streams', '-show_format', '-of', 'json', path]))
+
+
+def encode_photo(ffmpeg, ffprobe, source, output):
+    before = exif(source, '-ImageWidth', '-ImageHeight', '-Orientation', '-ProfileDescription', '-ColorSpace',
+                  '-MPF:All', '-Trailer:All', '-XMP-GCamera:All', '-XMP-Container:All', '-IPTC:All', '-Validate',
+                  *('-' + tag for tag in PHOTO_TAGS))
+    if any(key.startswith(('MPF', 'MPImage', 'Trailer', 'XMP-GCamera', 'XMP-Container', 'IPTC')) for key in before):
+        return 'auxiliary images, motion photo data, or unsupported metadata'
+    if before.get('IFD0:Orientation', 1) != 1:
+        return 'JPEG orientation must be preserved; leaving source as-is'
+    profile = before.get('ICC_Profile:ProfileDescription', '')
+    if profile == 'Display P3':
+        primaries = 'smpte432'
+    elif re.fullmatch(r'sRGB(?:[ -]IEC\s*61966-2\.1)?', profile, re.IGNORECASE) or (
+        not profile and before.get('ExifIFD:ColorSpace', 1) == 1
+    ):
+        primaries = 'bt709'
+    else:
+        return f'unsupported JPEG color profile ({profile or "untagged non-sRGB"})'
+    transfer = 'iec61966-2-1'
+    run([ffmpeg, *FFMPEG, '-noautorotate', '-pattern_type', 'none', '-i', source,
+         '-vf', 'sidedata=mode=delete:type=ICC_PROFILE',
+         '-frames:v', '1', '-c:v', 'libjxl', '-pix_fmt', 'rgb24', '-color_primaries', primaries,
+         '-color_trc', transfer, '-colorspace', 'rgb', '-distance', '1', '-effort', '4', '-threads', '2', output])
+    if any(f'{tag}:{tag}' in before for tag in PHOTO_TAGS):
+        run(['exiftool', '-m', '-overwrite_original', '-TagsFromFile', source,
+             *('-' + tag for tag in PHOTO_TAGS), output])
+    stream, = probe(ffprobe, output)['streams']
+    if (stream['codec_name'], stream['width'], stream['height'], stream.get('color_primaries'), stream.get('color_transfer')) != (
+        'jpegxl', before['File:ImageWidth'], before['File:ImageHeight'], primaries, transfer
+    ):
+        raise RuntimeError('JPEG XL dimensions or color changed')
+    after = exif(output, '-Validate', *('-' + tag for tag in PHOTO_TAGS))
+    if after.get('ExifTool:Validate') != '0 0 0' or any(before.get(f'{tag}:{tag}') != after.get(f'{tag}:{tag}') for tag in PHOTO_TAGS):
+        raise RuntimeError('JPEG XL metadata did not round-trip')
+    return None
+
+
+def video_layout(streams):
+    return [s['codec_type'] for s in streams]
+
+
+def rotations(stream):
+    return [side['displaymatrix'] for side in stream.get('side_data_list', []) if 'displaymatrix' in side]
+
+
+def encode_video(ffmpeg, ffprobe, source, output):
+    before = probe(ffprobe, source)
+    streams = before['streams']
+    layout = video_layout(streams)
+    if layout.count('video') != 1 or any(kind not in {'video', 'audio'} for kind in layout):
+        return 'extra tracks or multiple video streams'
+    video = next(s for s in streams if s['codec_type'] == 'video')
+    if (video.get('pix_fmt') != 'yuv420p' or video.get('color_transfer') not in (None, 'bt709', 'smpte170m', 'iec61966-2-1')
+        or video.get('color_primaries') not in (None, 'bt709', 'smpte170m', 'bt470bg')
+        or video.get('disposition', {}).get('attached_pic')
+        or any(s.get('side_data_type') != 'Display Matrix' for s in video.get('side_data_list', []))):
+        return 'HDR, nonstandard pixel/color format, or auxiliary video data'
+    if video.get('field_order', 'progressive') not in {'progressive', 'unknown'}:
+        return 'interlaced video'
+    run([ffmpeg, *FFMPEG, '-threads', '2', '-noautorotate', '-i', source, '-map', '0', '-map_metadata', '0',
+         '-map_chapters', '0', '-c', 'copy', '-c:v', 'libx265', '-preset', 'medium', '-crf', '20',
+         '-x265-params', 'pools=2:frame-threads=2:log-level=error', '-fps_mode', 'passthrough',
+         '-tag:v', 'hvc1', '-movflags', '+faststart+use_metadata_tags', output])
+    after = probe(ffprobe, output)
+    if video_layout(after['streams']) != layout:
+        raise RuntimeError('Video stream layout changed')
+    for old, new in zip(streams, after['streams']):
+        if old['codec_type'] == 'audio':
+            keys = ('codec_name', 'channels', 'sample_rate')
+        else:
+            keys = ('width', 'height', 'pix_fmt', 'color_primaries', 'color_transfer', 'color_space',
+                    'color_range', 'sample_aspect_ratio')
+            if new['codec_name'] != 'hevc' or rotations(old) != rotations(new):
+                raise RuntimeError('Video codec or display orientation is incorrect')
+        if any(old.get(key) != new.get(key) for key in keys) or (old.get('nb_frames') and old['nb_frames'] != new.get('nb_frames')):
+            raise RuntimeError('Video or audio stream properties changed')
+        if abs(float(old['duration']) - float(new['duration'])) > 0.05:
+            raise RuntimeError('Video or audio stream duration changed')
+    return None
+
+
+def inputs(root):
+    if root.is_file():
+        yield root, Path(root.name)
+        return
+    for folder, _, names in os.walk(root):
+        for name in names:
+            path = Path(folder, name)
+            if path.suffix.lower() in PHOTOS | VIDEOS and path.is_file() and not path.is_symlink():
+                yield path, path.relative_to(root)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('input', type=Path, help='source file or directory (recursive)')
+    parser.add_argument('output', type=Path, help='separate output directory')
+    parser.add_argument('--min-savings', type=int, default=15, metavar='PERCENT', help='minimum size reduction (default: 15)')
+    data = Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share')
+    local = data / 'compress-media/ffmpeg-jxl/usr/bin/ffmpeg'
+    parser.add_argument('--photo-ffmpeg', default=str(local) if local.is_file() else 'ffmpeg', help='FFmpeg with libjxl, for photos')
+    parser.add_argument('--ffmpeg', default='ffmpeg', help='FFmpeg with libx265, for videos')
+    args = parser.parse_args()
+    source, destination = args.input.resolve(), args.output.resolve()
+    if not source.exists() or destination == source or destination.is_relative_to(source):
+        parser.error('source must exist and the output directory must be outside it')
+    if not 1 <= args.min_savings <= 99:
+        parser.error('--min-savings must be between 1 and 99')
+    if source.is_file() and source.suffix.lower() not in PHOTOS | VIDEOS:
+        parser.error('supported inputs: JPEG photos and SDR MOV/MP4 videos')
+    destination.mkdir(parents=True, exist_ok=True)
+    counts = {'saved': 0, 'skipped': 0, 'failed': 0}
+    savings = 0
+    with TemporaryDirectory(prefix='.compress-media-', dir=destination) as temp:
+        for path, relative in inputs(source):
+            photo = path.suffix.lower() in PHOTOS
+            target = (destination / relative).with_suffix('.jxl' if photo else '.mp4')
+            output = Path(temp) / f'candidate{target.suffix}'
+            ffmpeg = args.photo_ffmpeg if photo else args.ffmpeg
+            sibling = Path(ffmpeg).with_name('ffprobe')
+            ffprobe = sibling if Path(ffmpeg).parent != Path('.') and sibling.is_file() else 'ffprobe'
+            try:
+                if not target.parent.resolve().is_relative_to(destination):
+                    raise RuntimeError('output path escapes its directory')
+                size = path.stat().st_size
+                encode = encode_photo if photo else encode_video
+                reason = 'output already exists' if os.path.lexists(target) else encode(ffmpeg, ffprobe, path, output)
+                if not reason and output.stat().st_size * 100 > size * (100 - args.min_savings):
+                    reason = f'less than {args.min_savings}% smaller'
+                if reason:
+                    counts['skipped'] += 1
+                    print(f'SKIP {relative}: {reason}', flush=True)
+                    continue
+                run([ffmpeg, *FFMPEG, '-threads', '2', '-i', output, '-map', '0:v', '-map', '0:a?', '-f', 'null', '-'])
+                shutil.copystat(path, output)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.link(output, target)  # Publish the verified file without overwriting an existing one.
+                reduction = size - output.stat().st_size
+                savings += reduction
+                counts['saved'] += 1
+                print(f'SAVED {relative}: {reduction:,} bytes smaller', flush=True)
+            except (KeyError, OSError, RuntimeError, ValueError) as exc:
+                counts['failed'] += 1
+                print(f'ERROR {relative}: {exc}', file=sys.stderr, flush=True)
+            finally:
+                output.unlink(missing_ok=True)
+    print(f"Saved {counts['saved']}; skipped {counts['skipped']}; failed {counts['failed']}; {savings:,} bytes smaller than matched originals.")
+    return int(counts['failed'] > 0)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
