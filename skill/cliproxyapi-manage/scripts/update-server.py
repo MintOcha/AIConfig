@@ -369,6 +369,11 @@ def main() -> int:
     parser.add_argument("--dashboard-dir", type=Path, default=None, help="Dashboard_CPA project directory")
     parser.add_argument("--config", type=Path, default=None, help="Path to config.yaml")
     parser.add_argument(
+        "--dash",
+        action="store_true",
+        help="Also sync and update the Dashboard stack",
+    )
+    parser.add_argument(
         "--no-restart",
         action="store_true",
         help="Update config without restarting Docker Compose",
@@ -400,19 +405,20 @@ def main() -> int:
 
         if not args.no_restart:
             sync_git_repo(project_dir)
-            if dashboard_dir:
+            if args.dash and dashboard_dir:
                 sync_git_repo(dashboard_dir)
             project_before = deployed_version(project_dir, None, "cli-proxy-api")
             restart_stacks(project_dir)
             project_after = deployed_version(project_dir, None, "cli-proxy-api")
 
-            if dashboard_dir:
-                dashboard_before, dashboard_after = update_dashboard(dashboard_dir)
-            else:
-                print("Dashboard directory not found; skipping Dashboard update.", flush=True)
+            if args.dash:
+                if dashboard_dir:
+                    dashboard_before, dashboard_after = update_dashboard(dashboard_dir)
+                else:
+                    print("Dashboard directory not found; skipping Dashboard update.", flush=True)
 
         verify_containers_running(
-            include_dashboard=dashboard_dir is not None and not args.no_restart,
+            include_dashboard=args.dash and dashboard_dir is not None and not args.no_restart,
             dashboard_dir=dashboard_dir,
         )
     except (OSError, subprocess.CalledProcessError, ValueError, RuntimeError) as error:
@@ -424,9 +430,11 @@ def main() -> int:
     else:
         print()
         print_version_result("CLIProxyAPI", project_before, project_after)
-        if dashboard_dir:
+        if args.dash and dashboard_dir:
             print_version_result("Dashboard", dashboard_before, dashboard_after)
-        print("Successfully updated and restarted CLIProxyAPI and Dashboard.")
+            print("Successfully updated and restarted CLIProxyAPI and Dashboard.")
+        else:
+            print("Successfully updated and restarted CLIProxyAPI.")
     return 0
 
 

@@ -34,3 +34,7 @@ The issuer is the API key; the secret is the API secret. Don't paste them in cha
 4. Check `amo GET addons/addon/<addon>/versions/<version-id>/`. For a version number without dots, use the `v` prefix to distinguish it from a numeric version ID. Report the add-on ID, version, channel, and observed review/signing status. Upload and validation are not publication; don't report a public listing or a signed artifact before AMO confirms it. Use the returned `file.url` for the signed package once available.
 
 References: [AMO JWT authentication](https://mozilla.github.io/addons-server/topics/api/auth.html), [AMO add-on endpoints and payloads](https://mozilla.github.io/addons-server/topics/api/addons.html), [Firefox submission requirements](https://extensionworkshop.com/documentation/publish/submitting-an-add-on/).
+
+## Delete an add-on
+
+Deletion removes every version and permanently retires the Firefox ID. Only proceed with explicit authorization for the exact add-on. Fetch `addons/addon/<id>/delete_confirm/`, URL-encode its `delete_confirm` value, and within 60 seconds run `amo DELETE 'addons/addon/<id>/?delete_confirm=<encoded-token>'`. Verify that the old ID is absent from the authenticated add-on list.

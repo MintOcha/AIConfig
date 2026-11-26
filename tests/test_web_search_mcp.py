@@ -315,5 +315,327 @@ class TestToolRegistrations(unittest.IsolatedAsyncioTestCase):
             await find_tool.run({"pattern": "   "})
         self.assertIn("find-in-page requires a search pattern", str(ctx3.exception))
 
+
+class TestCodexModelResolutionAndFailover(unittest.IsolatedAsyncioTestCase):
+    async def test_codex_discovers_model_when_config_model_empty(self):
+        cfg = make_dummy_config()
+        cfg = RouterConfig(**{**cfg.__dict__, "codex_standalone_model": ""})
+        seen_posts = []
+        get_calls = 0
+
+        class MockClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, headers=None):
+                nonlocal get_calls
+                get_calls += 1
+                req = httpx.Request("GET", url)
+                return httpx.Response(
+                    200,
+                    request=req,
+                    json={
+                        "data": [
+                            {"id": "gpt-image-2", "owned_by": "openai"},
+                            {"id": "nvidia/nemotron", "owned_by": "nvidia"},
+                            {"id": "gpt-5.6-sol", "owned_by": "openai"},
+                        ]
+                    },
+                )
+
+            async def post(self, url, headers=None, json=None):
+                seen_posts.append(json)
+                req = httpx.Request("POST", url)
+                return httpx.Response(
+                    200,
+                    request=req,
+                    json={
+                        "results": [
+                            {"title": "Result", "url": "https://example.com", "snippet": "Snippet"}
+                        ]
+                    },
+                )
+
+        router = SearchRouter(cfg, codex_client_factory=lambda **kw: MockClient())
+        results = await router._search_codex_standalone("python", 5)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(seen_posts[0]["model"], "gpt-5.6-sol")
+
+        # Second call reuses cached model without querying /models again.
+        await router._search_codex_standalone("python 2", 5)
+        self.assertEqual(get_calls, 1)
+        self.assertEqual(seen_posts[1]["model"], "gpt-5.6-sol")
+
+    async def test_codex_omits_empty_model_when_discovery_unavailable_and_retries_on_400(self):
+        cfg = make_dummy_config()
+        cfg = RouterConfig(**{**cfg.__dict__, "codex_standalone_model": "stale-model"})
+        seen_models = []
+
+        class MockClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, headers=None):
+                req = httpx.Request("GET", url)
+                return httpx.Response(
+                    200,
+                    request=req,
+                    json={
+                        "data": [
+                            {"id": "stale-model", "owned_by": "openai"},
+                            {"id": "gpt-6.1-sol", "owned_by": "openai"},
+                        ]
+                    },
+                )
+
+            async def post(self, url, headers=None, json=None):
+                seen_models.append(json.get("model"))
+                req = httpx.Request("POST", url)
+                if json.get("model") == "stale-model":
+                    return httpx.Response(
+                        400,
+                        request=req,
+                        json={
+                            "error": {
+                                "message": "Invalid model ID.",
+                                "type": "invalid_request_error",
+                                "param": "model",
+                                "code": "invalid_value",
+                            }
+                        },
+                    )
+                return httpx.Response(
+                    200,
+                    request=req,
+                    json={
+                        "results": [
+                            {"title": "OK", "url": "https://example.org", "snippet": "Worked"}
+                        ]
+                    },
+                )
+
+        router = SearchRouter(cfg, codex_client_factory=lambda **kw: MockClient())
+        results = await router._search_codex_standalone("query", 3)
+        self.assertEqual(seen_models, ["stale-model", "gpt-6.1-sol"])
+        self.assertEqual(results[0]["url"], "https://example.org")
+
+        # When discovery fails and configured model is empty, "model" key is omitted.
+        cfg_empty = RouterConfig(**{**cfg.__dict__, "codex_standalone_model": ""})
+        seen_empty_payloads = []
+
+        class NoModelsClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, headers=None):
+                req = httpx.Request("GET", url)
+                return httpx.Response(404, request=req)
+
+            async def post(self, url, headers=None, json=None):
+                seen_empty_payloads.append(json)
+                req = httpx.Request("POST", url)
+                return httpx.Response(200, request=req, json={"results": []})
+
+        router_no_models = SearchRouter(cfg_empty, codex_client_factory=lambda **kw: NoModelsClient())
+        self.assertEqual(await router_no_models._search_codex_standalone("query", 3), [])
+        self.assertNotIn("model", seen_empty_payloads[0])
+
+    async def test_search_fails_over_on_codex_400_to_duckduckgo(self):
+        cfg = RouterConfig(
+            duckduckgo_command="duckduckgo-mcp",
+            duckduckgo_args=(),
+            brave_command="brave-search-mcp",
+            brave_args=(),
+            brave_keys=(),
+            duckduckgo_enabled=True,
+            codex_standalone_keys=("secret-codex-key",),
+            codex_standalone_base_url="https://codex.test/v1",
+            codex_standalone_model="",
+            tavily_keys=(),
+            tavily_endpoint="",
+            brave_cooldown_seconds=0.0,
+            duckduckgo_cooldown_seconds=60.0,
+            request_timeout_seconds=5.0,
+        )
+
+        class FailingCodexClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, headers=None):
+                return httpx.Response(404, request=httpx.Request("GET", url))
+
+            async def post(self, url, headers=None, json=None):
+                return httpx.Response(
+                    400,
+                    request=httpx.Request("POST", url),
+                    json={"error": {"message": "Invalid model ID.", "param": "model"}},
+                )
+
+        ddg_result = MagicMock(
+            is_error=False,
+            structured_content=None,
+            data=None,
+            content=[
+                MagicMock(
+                    text="1. Fallback Hit\n   URL: https://ddg.example/hit\n   Summary: DDG fallback worked"
+                )
+            ],
+        )
+
+        class WorkingDDGClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def call_tool(self, name, args):
+                return ddg_result
+
+        router = SearchRouter(
+            cfg,
+            codex_client_factory=lambda **kw: FailingCodexClient(),
+            duckduckgo_client_factory=lambda *a, **kw: WorkingDDGClient(),
+        )
+        results = await router.search("test query", 5)
+        self.assertEqual(
+            results,
+            [{"title": "Fallback Hit", "url": "https://ddg.example/hit", "snippet": "DDG fallback worked"}],
+        )
+
+    async def test_search_fails_over_when_duckduckgo_returns_error_text_or_exception(self):
+        cfg = RouterConfig(
+            duckduckgo_command="duckduckgo-mcp",
+            duckduckgo_args=(),
+            brave_command="brave-search-mcp",
+            brave_args=(),
+            brave_keys=(),
+            duckduckgo_enabled=True,
+            codex_standalone_keys=("secret-codex-key",),
+            codex_standalone_base_url="https://codex.test/v1",
+            codex_standalone_model="gpt-5.6-sol",
+            tavily_keys=(),
+            tavily_endpoint="",
+            brave_cooldown_seconds=0.0,
+            duckduckgo_cooldown_seconds=60.0,
+            request_timeout_seconds=5.0,
+        )
+
+        class WorkingCodexClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def post(self, url, headers=None, json=None):
+                return httpx.Response(
+                    200,
+                    request=httpx.Request("POST", url),
+                    json={
+                        "results": [
+                            {"title": "Codex Hit", "url": "https://codex.example/hit", "snippet": "Codex worked"}
+                        ]
+                    },
+                )
+
+        ddg_error_result = MagicMock(
+            is_error=False,
+            structured_content=None,
+            data=None,
+            content=[MagicMock(text="An error occurred while searching: upstream 429")],
+        )
+
+        class ErrorTextDDGClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def call_tool(self, name, args):
+                return ddg_error_result
+
+        router = SearchRouter(
+            cfg,
+            codex_client_factory=lambda **kw: WorkingCodexClient(),
+            duckduckgo_client_factory=lambda *a, **kw: ErrorTextDDGClient(),
+        )
+        # Force duckduckgo first on this search call.
+        router._next_provider_index = 1
+        results = await router.search("test query", 5)
+        self.assertEqual(results[0]["url"], "https://codex.example/hit")
+
+    async def test_search_exhausted_reports_all_provider_outcomes_and_redacts_secrets(self):
+        cfg = RouterConfig(
+            duckduckgo_command="duckduckgo-mcp",
+            duckduckgo_args=(),
+            brave_command="brave-search-mcp",
+            brave_args=(),
+            brave_keys=(),
+            duckduckgo_enabled=True,
+            codex_standalone_keys=("super-secret-token-123",),
+            codex_standalone_base_url="https://codex.test/v1",
+            codex_standalone_model="gpt-5.6-sol",
+            tavily_keys=(),
+            tavily_endpoint="",
+            brave_cooldown_seconds=0.0,
+            duckduckgo_cooldown_seconds=60.0,
+            request_timeout_seconds=5.0,
+        )
+
+        class FailingCodexClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def post(self, url, headers=None, json=None):
+                raise RuntimeError("Bearer super-secret-token-123 failed")
+
+        ddg_empty = MagicMock(
+            is_error=False,
+            structured_content=None,
+            data=None,
+            content=[MagicMock(text="No results were found for your search query.")],
+        )
+
+        class EmptyDDGClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def call_tool(self, name, args):
+                return ddg_empty
+
+        router = SearchRouter(
+            cfg,
+            codex_client_factory=lambda **kw: FailingCodexClient(),
+            duckduckgo_client_factory=lambda *a, **kw: EmptyDDGClient(),
+        )
+        with self.assertRaises(ProviderRequestError) as ctx:
+            await router.search("query", 5)
+        msg = str(ctx.exception)
+        self.assertIn("[codex_standalone]", msg)
+        self.assertIn("[duckduckgo]", msg)
+        self.assertIn("Returned 0 results", msg)
+        self.assertNotIn("super-secret-token-123", msg)
+
 if __name__ == "__main__":
     unittest.main()

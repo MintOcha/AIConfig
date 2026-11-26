@@ -56,7 +56,7 @@ def field(argument):
 
 def main():
     parser = argparse.ArgumentParser(description="Call the Mozilla Add-ons (AMO) API v5.")
-    parser.add_argument("method", choices=("GET", "POST", "PATCH"))
+    parser.add_argument("method", choices=("GET", "POST", "PATCH", "DELETE"))
     parser.add_argument("endpoint", help="Path relative to /api/v5/, including its trailing slash")
     parser.add_argument("--public", action="store_true", help="Make an unauthenticated GET")
     parser.add_argument("--json", type=Path, metavar="PATH", help="Read the request JSON from a file")
@@ -69,8 +69,8 @@ def main():
     if (endpoint.scheme or endpoint.netloc or endpoint.fragment or path.startswith("/")
             or ".." in path.split("/") or not path.endswith("/")):
         parser.error("provide a relative API endpoint ending in '/', not a URL")
-    if args.method == "GET" and (args.json or args.field or args.file):
-        parser.error("GET does not take a request body")
+    if args.method in ("GET", "DELETE") and (args.json or args.field or args.file):
+        parser.error(f"{args.method} does not take a request body")
     if args.public and args.method != "GET":
         parser.error("--public is only for GET")
     if args.json and (args.field or args.file):

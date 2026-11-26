@@ -9,12 +9,11 @@ Sends plain-text messages, status updates, and file attachments to a configured 
 
 ## Setup & Credentials
 
-Place your webhook URL in `config.toml` (git-ignored):
-```toml
-[discord]
-webhook_url = "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
+Store the webhook in `pass` under `aiconfig/discord/webhook-url`:
+
+```bash
+pass insert aiconfig/discord/webhook-url
 ```
-Or export `DISCORD_WEBHOOK_URL`.
 
 ## Usage
 

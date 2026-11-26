@@ -16,7 +16,7 @@ import re
 import time
 import uuid
 import traceback
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -423,6 +423,112 @@ def _validate_urls(urls: list[str]) -> list[str]:
     return normalized
 
 
+_CODEX_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+)
+_EXCLUDED_CODEX_MODEL_TOKENS = (
+    "image",
+    "embedding",
+    "tts",
+    "whisper",
+    "moderation",
+    "dall-e",
+    "audio",
+    "realtime",
+    "transcribe",
+    "sora",
+    "video",
+)
+
+
+def _pick_codex_model(payload: Any, *, exclude: set[str] | None = None) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return ""
+
+    excluded = exclude or set()
+    best: tuple[int, int, str] | None = None
+    for index, item in enumerate(data):
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id")
+        if not isinstance(model_id, str):
+            continue
+        model_id = model_id.strip()
+        if not model_id or model_id in excluded:
+            continue
+        lowered = model_id.lower()
+        if any(token in lowered for token in _EXCLUDED_CODEX_MODEL_TOKENS):
+            continue
+
+        owned_by = str(item.get("owned_by", "")).strip().lower()
+        is_openai = owned_by == "openai"
+        is_gpt_or_codex = "codex" in lowered or lowered.startswith("gpt-")
+        is_secondary = "oss" in lowered or "review" in lowered
+
+        if is_openai and is_gpt_or_codex and not is_secondary:
+            tier = 0
+        elif is_openai and not is_secondary:
+            tier = 1
+        elif is_gpt_or_codex and not is_secondary:
+            tier = 2
+        elif is_openai or is_gpt_or_codex:
+            tier = 3
+        else:
+            tier = 4
+
+        candidate = (tier, index, model_id)
+        if best is None or candidate < best:
+            best = candidate
+
+    return best[2] if best is not None else ""
+
+
+def _is_codex_model_error(response: httpx.Response) -> bool:
+    if response.status_code != 400:
+        return False
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        error = data.get("error")
+        if isinstance(error, dict):
+            if error.get("param") == "model":
+                return True
+            message = str(error.get("message", "")).lower()
+            if "model" in message and any(
+                hint in message for hint in ("invalid", "missing", "unknown", "not found")
+            ):
+                return True
+    text = response.text.lower()
+    return "model" in text and ("invalid" in text or "missing" in text)
+
+
+def _is_duckduckgo_error_text(text: str) -> bool:
+    lowered = text.strip().lower()
+    if not lowered or lowered.startswith("no results were found"):
+        return False
+    return (
+        lowered.startswith(("an error occurred", "error:"))
+        or "rate limit" in lowered
+        or "429" in lowered
+    )
+
+
+def _redact_secrets(text: str, secrets: Iterable[str]) -> str:
+    redacted = text
+    for secret in secrets:
+        if secret:
+            redacted = redacted.replace(secret, "[REDACTED]")
+    redacted = re.sub(r"(?i)(bearer\s+)[^\s\"']+", r"\1[REDACTED]", redacted)
+    redacted = re.sub(r"(?i)((?:api[_-]?key|token|key)=)[^&\s\"']+", r"\1[REDACTED]", redacted)
+    return redacted
+
+
 class SearchRouter:
     def __init__(
         self,
@@ -440,6 +546,8 @@ class SearchRouter:
         self._duckduckgo_gate = CooldownGate(config.duckduckgo_cooldown_seconds)
         self._next_provider_index = 0
         self._provider_lock = asyncio.Lock()
+        self._resolved_codex_model: str | None = None
+        self._codex_model_lock = asyncio.Lock()
         self._tavily_client_factory = tavily_client_factory
         self._brave_client_factory = brave_client_factory
         self._duckduckgo_client_factory = duckduckgo_client_factory
@@ -601,6 +709,10 @@ class SearchRouter:
                     )
                 )
             results = _normalize_duckduckgo_results(payload)
+            if not results:
+                text = _result_text(payload)
+                if text and _is_duckduckgo_error_text(text):
+                    raise DuckDuckGoUnavailable(text.strip()[:300])
             return results
         except Exception as error:
             await self._duckduckgo_gate.defer()
@@ -608,13 +720,114 @@ class SearchRouter:
                 raise
             raise DuckDuckGoUnavailable("DuckDuckGo search request failed") from error
 
+    async def _discover_codex_model(
+        self,
+        client: httpx.AsyncClient,
+        api_key: str,
+        *,
+        exclude: set[str] | None = None,
+    ) -> str:
+        get_fn = getattr(client, "get", None)
+        if not callable(get_fn):
+            return ""
+        endpoint = f"{self.config.codex_standalone_base_url.rstrip('/')}/models"
+        try:
+            response = await get_fn(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "User-Agent": _CODEX_USER_AGENT,
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except Exception:  # noqa: BLE001 - optional discovery endpoint
+            return ""
+        return _pick_codex_model(payload, exclude=exclude)
+
+    async def _resolve_codex_model(
+        self,
+        client: httpx.AsyncClient,
+        api_key: str,
+        *,
+        force_refresh: bool = False,
+        exclude: set[str] | None = None,
+    ) -> str:
+        excluded = exclude or set()
+        async with self._codex_model_lock:
+            if not force_refresh:
+                if self._resolved_codex_model and self._resolved_codex_model not in excluded:
+                    return self._resolved_codex_model
+                configured = self.config.codex_standalone_model
+                if configured and configured not in excluded:
+                    return configured
+            discovered = await self._discover_codex_model(client, api_key, exclude=excluded)
+            if discovered:
+                self._resolved_codex_model = discovered
+                return discovered
+            return ""
+
+    async def _codex_post(
+        self,
+        commands: dict[str, Any],
+        *,
+        session_id: str,
+        api_key: str,
+        client: httpx.AsyncClient,
+        command_label: str,
+    ) -> dict[str, Any]:
+        endpoint = f"{self.config.codex_standalone_base_url.rstrip('/')}/alpha/search"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": _CODEX_USER_AGENT,
+        }
+        model = await self._resolve_codex_model(client, api_key)
+        body: dict[str, Any] = {
+            "id": session_id,
+            "commands": commands,
+        }
+        if model:
+            body["model"] = model
+
+        response = await client.post(endpoint, headers=headers, json=body)
+        if response.status_code == 400 and _is_codex_model_error(response):
+            excluded = {model} if model else set()
+            alt_model = await self._resolve_codex_model(
+                client,
+                api_key,
+                force_refresh=True,
+                exclude=excluded,
+            )
+            if alt_model and alt_model != model:
+                body["model"] = alt_model
+                response = await client.post(endpoint, headers=headers, json=body)
+
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as err:
+            body_text = err.response.text[:500]
+            raise ProviderRequestError(
+                f"Codex command '{command_label}' failed ({err.response.status_code}): {body_text}"
+            ) from err
+
+        try:
+            payload = response.json()
+        except ValueError as err:
+            raise ProviderRequestError(
+                f"Codex command '{command_label}' returned invalid JSON"
+            ) from err
+        if not isinstance(payload, dict):
+            raise ProviderRequestError(
+                f"Codex command '{command_label}' returned unexpected payload type"
+            )
+        return payload
+
     async def _search_codex_standalone(
         self, query: str, max_results: int
     ) -> list[dict[str, str]]:
         if not self._codex_standalone_keys.configured:
             raise ConfigurationError("No Codex standalone API keys are configured")
 
-        endpoint = f"{self.config.codex_standalone_base_url.rstrip('/')}/alpha/search"
         last_error: Exception | None = None
         for _ in range(self._codex_standalone_keys.count):
             api_key = await self._codex_standalone_keys.next_key()
@@ -622,26 +835,19 @@ class SearchRouter:
                 async with self._codex_client_factory(
                     timeout=self.config.request_timeout_seconds
                 ) as client:
-                    response = await client.post(
-                        endpoint,
-                        headers={
-                            "Authorization": f"Bearer {api_key}",
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-                        },
-                        json={
-                            "id": str(uuid.uuid4()),
-                            "model": self.config.codex_standalone_model,
-                            "commands": {"search_query": [{"q": query}]},
-                        },
+                    payload = await self._codex_post(
+                        {"search_query": [{"q": query}]},
+                        session_id=str(uuid.uuid4()),
+                        api_key=api_key,
+                        client=client,
+                        command_label="search_query",
                     )
-                    response.raise_for_status()
-                    payload = response.json()
                 results = _normalize_search_results(
                     payload, url_field="url", snippet_field="snippet"
                 )[:max_results]
                 if results:
                     return results
-                if isinstance(payload, dict) and payload.get("results") == []:
+                if payload.get("results") == []:
                     return []
                 raise ProviderRequestError(
                     "Codex standalone search returned no usable results"
@@ -649,28 +855,22 @@ class SearchRouter:
             except Exception as error:  # noqa: BLE001
                 last_error = error
 
+        detail = f": {last_error}" if last_error else ""
         raise ProviderRequestError(
-            "Codex standalone search failed for every configured key"
+            f"Codex standalone search failed for every configured key{detail}"
         ) from last_error
+
     async def _fetch_single_codex(
         self, url: str, client: httpx.AsyncClient, api_key: str
     ) -> str | None:
-        endpoint = f"{self.config.codex_standalone_base_url.rstrip('/')}/alpha/search"
         try:
-            response = await client.post(
-                endpoint,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-                },
-                json={
-                    "id": self.session_id,
-                    "model": self.config.codex_standalone_model,
-                    "commands": {"open": [{"ref_id": url}]},
-                },
+            payload = await self._codex_post(
+                {"open": [{"ref_id": url}]},
+                session_id=self.session_id,
+                api_key=api_key,
+                client=client,
+                command_label="open",
             )
-            response.raise_for_status()
-            payload = response.json()
             raw_output = payload.get("output", "")
             if not raw_output:
                 return None
@@ -786,21 +986,27 @@ class SearchRouter:
         self,
         query: str,
         max_results: int,
-    ) -> list[dict[str, str]]:
-        async with self._provider_lock:
-            start_index = self._next_provider_index
-            self._next_provider_index = (start_index + 1) % len(SEARCH_PROVIDERS)
-
-        rotated = SEARCH_PROVIDERS[start_index:] + SEARCH_PROVIDERS[:start_index]
+    ) -> list[dict[str, str]] | str:
         configured = {
             "codex_standalone": self._codex_standalone_keys.configured,
             "brave": self._brave_keys.configured,
             "duckduckgo": self.config.duckduckgo_enabled,
             "tavily": self._tavily_keys.configured,
         }
-        providers = [provider for provider in rotated if configured[provider]]
+        configured_providers = [provider for provider in SEARCH_PROVIDERS if configured[provider]]
+        if not configured_providers:
+            raise ConfigurationError(
+                "No search providers are configured. Set Brave, Tavily, or Codex standalone keys, or enable DuckDuckGo."
+            )
+
+        async with self._provider_lock:
+            start_index = self._next_provider_index % len(configured_providers)
+            self._next_provider_index = (start_index + 1) % len(configured_providers)
+
+        providers = configured_providers[start_index:] + configured_providers[:start_index]
         failures: list[str] = []
-        any_provider_succeeded_empty = False
+        empty_providers: list[str] = []
+        secrets = (*self.config.brave_keys, *self.config.codex_standalone_keys, *self.config.tavily_keys)
         for provider in providers:
             try:
                 if provider == "duckduckgo":
@@ -813,30 +1019,18 @@ class SearchRouter:
                     results = await self._search_tavily(query, max_results)
                 if results:
                     return results
-                any_provider_succeeded_empty = True
-            except (
-                BraveCooldown,
-                ConfigurationError,
-                DuckDuckGoUnavailable,
-                ProviderRequestError,
-            ) as error:
+                empty_providers.append(provider)
+            except Exception as error:  # noqa: BLE001 - fail over across all providers
                 detail = "".join(traceback.format_exception(type(error), error, error.__traceback__))
-                for secret in (*self.config.brave_keys, *self.config.codex_standalone_keys, *self.config.tavily_keys):
-                    if secret:
-                        detail = detail.replace(secret, "[REDACTED]")
-                detail = re.sub(r"(?i)(bearer\s+)[^\s\"']+", r"\1[REDACTED]", detail)
-                detail = re.sub(r"(?i)((?:api[_-]?key|token|key)=)[^&\s\"']+", r"\1[REDACTED]", detail)
-                failures.append(f"[{provider}]\n{detail}")
+                failures.append(f"[{provider}]\n{_redact_secrets(detail, secrets)}")
         if failures:
+            if empty_providers:
+                failures.extend(f"[{provider}]\nReturned 0 results" for provider in empty_providers)
             raise ProviderRequestError(
                 "Search exhausted without results; provider errors (credentials redacted):\n" + "\n".join(failures) +
                 "\n\n[Next Step: Check network/API keys or query with duckduckgo / web_search tool directly]"
             ) from None
-        if any_provider_succeeded_empty:
-            return "No results found for query. Try broader keywords or removing specific operators."
-        raise ConfigurationError(
-            "No search providers are configured. Set Brave, Tavily, or Codex standalone keys, or enable DuckDuckGo."
-        )
+        return "No results found for query. Try broader keywords or removing specific operators."
 
     async def fetch_content(self, urls: list[str]) -> list[dict[str, str]]:
         """Fetch page content through Codex native open command, with DuckDuckGo failover.
@@ -901,29 +1095,27 @@ class SearchRouter:
                 "Codex standalone is not configured.\n"
                 "[Next Step: Configure codex_standalone_keys in config.toml or use standard web_search/fetch tools]"
             )
-        api_key = await self._codex_standalone_keys.next_key()
-        endpoint = f"{self.config.codex_standalone_base_url.rstrip('/')}/alpha/search"
-        async with self._codex_client_factory(
-            timeout=self.config.request_timeout_seconds
-        ) as client:
-            response = await client.post(
-                endpoint,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-                },
-                json={
-                    "id": self.session_id,
-                    "model": self.config.codex_standalone_model,
-                    "commands": {command_name: command_payload},
-                },
-            )
+        last_error: Exception | None = None
+        for _ in range(self._codex_standalone_keys.count):
+            api_key = await self._codex_standalone_keys.next_key()
             try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as err:
-                body = err.response.text[:500]
-                raise ProviderRequestError(f"Codex command '{command_name}' failed ({err.response.status_code}): {body}") from err
-            return response.json()
+                async with self._codex_client_factory(
+                    timeout=self.config.request_timeout_seconds
+                ) as client:
+                    return await self._codex_post(
+                        {command_name: command_payload},
+                        session_id=self.session_id,
+                        api_key=api_key,
+                        client=client,
+                        command_label=command_name,
+                    )
+            except Exception as error:  # noqa: BLE001
+                last_error = error
+        if isinstance(last_error, ProviderRequestError):
+            raise last_error
+        raise ProviderRequestError(
+            f"Codex command '{command_name}' failed: {last_error}"
+        ) from last_error
 
 
 

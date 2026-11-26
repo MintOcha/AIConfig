@@ -4,9 +4,9 @@ modelRoles:
   designer: v-rail/claude-opus-5
   web: openai-codex/gpt-5.6-luna
   tiny: v-rail/gpt-6-luna
-  task: v-rail/gpt-6.1-terra:auto
   advisor: v-rail/gpt-6.1-terra:minimal
-  default: v-rail/gpt-6.1-terra
+  default: v-rail/gpt-6.2-sol
+  task: v-rail/gpt-6.2-sol
 disabledProviders:
   - claude
 symbolPreset: unicode

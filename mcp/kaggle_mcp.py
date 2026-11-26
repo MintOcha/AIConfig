@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import argparse
+import contextlib
 import csv
+import io
 import json
 import os
 import re
@@ -367,17 +369,6 @@ def _default_owner() -> str | None:
     if env_owner and env_owner != "kaggle":
         return env_owner.strip()
 
-    try:
-        from kaggle.api.kaggle_api_extended import KaggleApi
-
-        api = KaggleApi()
-        api.authenticate()
-        user = api.get_config_value("username")
-        if user and user != "kaggle":
-            return str(user).strip()
-    except Exception:
-        pass
-
     kaggle_json = Path.home() / ".kaggle" / "kaggle.json"
     if kaggle_json.exists():
         try:
@@ -386,6 +377,18 @@ def _default_owner() -> str | None:
                 return str(user).strip()
         except Exception:
             pass
+
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            from kaggle.api.kaggle_api_extended import KaggleApi
+
+            api = KaggleApi()
+            api.authenticate()
+            user = api.get_config_value("username")
+        if user and user != "kaggle":
+            return str(user).strip()
+    except Exception:
+        pass
 
     return None
 
@@ -433,9 +436,29 @@ def _strip_cli_warnings(text: str) -> str:
     cleaned_lines = [
         line
         for line in (text or "").splitlines()
-        if not line.strip().startswith(("Warning: Looks like you're using an outdated `kaggle`", "Warning: Your Kaggle API key is readable by other users on this system!"))
+        if not line.strip().startswith((
+            "Warning: Looks like you're using an outdated `kaggle`",
+            "Warning: Your Kaggle API key is readable by other users on this system!",
+        ))
     ]
     return "\n".join(cleaned_lines)
+
+
+def _quiet_kaggle_script(body: str) -> str:
+    """Wrap an inline Kaggle SDK script so stray library stdout goes to stderr; use emit() for payload output."""
+    indented = "\n".join(f"    {line}" if line else "" for line in body.strip("\n").splitlines())
+    return (
+        "import sys as _kmcp_sys\n"
+        "_kmcp_out = _kmcp_sys.stdout\n"
+        "def emit(value):\n"
+        "    _kmcp_out.write(f'{value}\\n')\n"
+        "    _kmcp_out.flush()\n"
+        "_kmcp_sys.stdout = _kmcp_sys.stderr\n"
+        "try:\n"
+        f"{indented}\n"
+        "finally:\n"
+        "    _kmcp_sys.stdout = _kmcp_out\n"
+    )
 
 
 def _run_kaggle(args: list[str], timeout: int = 300, owner: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -497,7 +520,7 @@ async def preview_dataset(dataset: str, file_name: str, rows: int = 10) -> str:
     suffix = Path(file_name).suffix.lower()
     if suffix not in {".csv", ".tsv", ".jsonl", ".ndjson"}:
         raise ValueError("Preview supports uncompressed CSV, TSV, JSONL, and NDJSON only")
-    code = '''
+    code = _quiet_kaggle_script('''
 import csv, io, itertools, json, sys
 from kaggle.api.kaggle_api_extended import KaggleApi
 from kagglesdk.datasets.types.dataset_api_service import ApiDownloadDatasetRequest
@@ -527,8 +550,8 @@ if filename.lower().endswith(('.csv', '.tsv')):
 else:
     result = [json.loads(line) for line in itertools.islice((line for line in text.splitlines() if line.strip()), count)]
     columns = None
-print(json.dumps(dict(dataset=dataset, file=filename, columns=columns, rows=result, byte_limit_reached=bounded, sample='file prefix', max_bytes=1048576)))
-'''
+emit(json.dumps(dict(dataset=dataset, file=filename, columns=columns, rows=result, byte_limit_reached=bounded, sample='file prefix', max_bytes=1048576)))
+''')
     return await _query_process([sys.executable, "-c", code, dataset, file_name, str(rows)], owner=_account_owner(dataset))
 
 
@@ -601,7 +624,7 @@ async def read_metadata(reference: str, kind: str = "datasets") -> str:
         raise ValueError("kind must be datasets or models")
     if not re.fullmatch(r"[\w-]+/[\w.-]+", reference):
         raise ValueError("Expected owner/slug")
-    code = '''
+    code = _quiet_kaggle_script('''
 import sys, json
 from kaggle.api.kaggle_api_extended import KaggleApi
 from kagglesdk.datasets.types.dataset_api_service import ApiGetDatasetRequest
@@ -622,8 +645,8 @@ with api.build_kaggle_client() as client:
     if kind == 'datasets':
         metadata['isPrivate'] = result.is_private
         metadata['visibility'] = 'private' if result.is_private else 'public'
-    print(json.dumps(metadata))
-'''
+    emit(json.dumps(metadata))
+''')
     return await _query_process([sys.executable, "-c", code, kind, reference], owner=_account_owner(reference))
 
 
@@ -723,7 +746,7 @@ async def list_model_files(variation: str) -> str:
     """List files in a model variation (owner/model/framework/variation or owner/model/framework/variation/version)."""
     parts = variation.strip().strip("/").split("/")
     if len(parts) == 4:
-        code = '''
+        code = _quiet_kaggle_script('''
 import sys, json
 from kaggle.api.kaggle_api_extended import KaggleApi
 api = KaggleApi(); api.authenticate()
@@ -734,17 +757,17 @@ try:
 except Exception:
     ver = 1
 files_res = api.model_instance_version_files(f"{variation}/{ver}")
-print(files_res.to_json() if hasattr(files_res, "to_json") else json.dumps(files_res.to_dict()))
-'''
+emit(files_res.to_json() if hasattr(files_res, "to_json") else json.dumps(files_res.to_dict()))
+''')
         return await _query_process([sys.executable, "-c", code, variation], owner=_account_owner(variation))
     elif len(parts) == 5:
-        code = '''
+        code = _quiet_kaggle_script('''
 import sys, json
 from kaggle.api.kaggle_api_extended import KaggleApi
 api = KaggleApi(); api.authenticate()
 files_res = api.model_instance_version_files(sys.argv[1])
-print(files_res.to_json() if hasattr(files_res, "to_json") else json.dumps(files_res.to_dict()))
-'''
+emit(files_res.to_json() if hasattr(files_res, "to_json") else json.dumps(files_res.to_dict()))
+''')
         return await _query_process([sys.executable, "-c", code, variation], owner=_account_owner(variation))
     else:
         raise ValueError("Expected variation handle: owner/model/framework/variation or owner/model/framework/variation/version")
@@ -857,7 +880,7 @@ async def update_dataset_metadata(dataset: str, changes: dict[str, Any]) -> str:
         raise ValueError('isPrivate must be a boolean')
     if not re.fullmatch(r"[\w-]+/[\w.-]+", dataset):
         raise ValueError("Expected owner/slug")
-    code = '''
+    code = _quiet_kaggle_script('''
 import json, sys
 from kaggle.api.kaggle_api_extended import KaggleApi
 from kagglesdk.datasets.types.dataset_api_service import (
@@ -934,8 +957,8 @@ with api.build_kaggle_client() as client:
         report['version'] = detail.current_version_number
     except Exception as error:
         report['verification_error'] = str(error)
-    print(json.dumps(report))
-'''
+    emit(json.dumps(report))
+''')
     return await _query_process([sys.executable, "-c", code, dataset, json.dumps(changes)], owner=_account_owner(dataset))
 
 
@@ -976,7 +999,7 @@ async def update_notebook_presentation(notebook: str, title: str | None = None,
         if not source.is_absolute():
             source = get_workspace_root() / source
         markdown = source.read_text()
-    code = '''
+    code = _quiet_kaggle_script('''
 import sys, json
 from kaggle.api.kaggle_api_extended import KaggleApi
 from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelRequest, ApiSaveKernelRequest
@@ -1016,9 +1039,9 @@ with api.build_kaggle_client() as client:
     response = client.kernels.kernels_api_client.save_kernel(request)
     if response.error:
         raise RuntimeError(response.error)
-    print(json.dumps({'notebook': response.ref.strip('/').removeprefix('code/'), 'title': request.new_title,
+    emit(json.dumps({'notebook': response.ref.strip('/').removeprefix('code/'), 'title': request.new_title,
                       'execution_type': 'QUICK_SAVE', 'response': response.to_dict()}))
-'''
+''')
     result = json.loads(await _query_process([sys.executable, "-c", code,
                                              json.dumps([ref, title, markdown])], timeout=90, owner=_account_owner(ref)))
     for candidate in get_kaggle_root().iterdir():
@@ -1110,8 +1133,9 @@ def _lint_kernel_metadata(meta: dict[str, Any]) -> list[str]:
     this invokes the official KaggleApi validation methods directly to guarantee 100% parity
     with Kaggle Cloud enforcement without hardcoding or re-inventing checks.
     """
-    from kaggle.api.kaggle_api_extended import KaggleApi
-    api = KaggleApi()
+    with contextlib.redirect_stdout(sys.stderr):
+        from kaggle.api.kaggle_api_extended import KaggleApi
+        api = KaggleApi()
 
     errors: list[str] = []
 
@@ -1215,78 +1239,6 @@ def _check_accelerator_quota(acc: str, owner: str | None = None) -> tuple[bool, 
 
     return True, "Quota check ok"
 
-
-def _lint_kernel_metadata(meta: dict[str, Any]) -> list[str]:
-    """Strict validation of kernel-metadata.json fields reusing KaggleApi's native validators.
-
-    Per coding rules (Rule 4: Manual implementation rule - do not re-implement library functions),
-    this invokes the official KaggleApi validation methods directly to guarantee 100% parity
-    with Kaggle Cloud enforcement without hardcoding or re-inventing checks.
-    """
-    from kaggle.api.kaggle_api_extended import KaggleApi
-    api = KaggleApi()
-
-    errors: list[str] = []
-
-    # 1. Kernel slug & syntax validation
-    slug = meta.get("id")
-    if not slug:
-        errors.append("Missing required 'id' (slug) in kernel-metadata.json. Must be formatted as '{username}/{notebook-slug}'.")
-    else:
-        try:
-            api.validate_kernel_string(slug)
-            owner, kernel_slug, version = api.parse_kernel_string(slug)
-            if version is not None:
-                errors.append(f"Invalid 'id': '{slug}'. Do NOT include a version number in kernel-metadata.json 'id'.")
-            api._validate_slug_syntax(kernel_slug)
-        except ValueError as err:
-            errors.append(str(err))
-
-    # 2. Title validation (Kaggle rule: >= 5 chars)
-    title = meta.get("title")
-    if not title or len(str(title).strip()) < 5:
-        errors.append("Title must be at least five characters")
-
-    # 3. Code file validation
-    code_file = meta.get("code_file")
-    if not code_file:
-        errors.append("A source file must be specified in the metadata ('code_file')")
-
-    # 4. Language & Kernel type validation (KaggleApi native sets)
-    kernel_type = meta.get("kernel_type", "")
-    if kernel_type not in api.valid_push_kernel_types:
-        errors.append(
-            f"Invalid kernel_type: '{kernel_type}'. Valid options are {api.valid_push_kernel_types}"
-        )
-
-    language = meta.get("language", "")
-    if language not in api.valid_push_language_types:
-        errors.append(
-            f"Invalid language: '{language}'. Valid options are {api.valid_push_language_types}"
-        )
-
-    # 5. Dataset sources validation (native Kaggle validator)
-    for ds in meta.get("dataset_sources", []):
-        try:
-            api.validate_dataset_string(ds)
-        except ValueError as err:
-            errors.append(f"Invalid dataset_sources entry '{ds}': {err}")
-
-    # 6. Competition sources validation
-    for cs in meta.get("competition_sources", []):
-        if "/" in cs:
-            errors.append(
-                f"Invalid competition_sources entry '{cs}': Competition sources must be just the competition name (e.g. 'titanic'), NOT 'owner/competition'."
-            )
-
-    # 7. Model sources validation (native Kaggle validator)
-    for ms in meta.get("model_sources", []):
-        try:
-            api.validate_model_instance_version_string(ms)
-        except ValueError as err:
-            errors.append(f"Invalid model_sources entry '{ms}': {err}")
-
-    return errors
 
 def _read_notebook_accelerator(path: Path) -> str | None:
     if path.suffix != ".ipynb" or not path.exists():
@@ -2235,7 +2187,7 @@ def _notebook_ref(notebook: str) -> str:
 async def _discover_runs(ref: str, version: int | None = None) -> list[dict]:
     if version is not None:
         return [await _run_snapshot(ref, version)]
-    code = '''
+    code = _quiet_kaggle_script('''
 import sys, json, time
 from concurrent.futures import ThreadPoolExecutor
 from kaggle.api.kaggle_api_extended import KaggleApi
@@ -2259,7 +2211,7 @@ with api.build_kaggle_client() as client:
     metadata = api_call(client.kernels.kernels_api_client.get_kernel, request).metadata
 latest = metadata.current_version_number
 if latest < 1:
-    print(json.dumps([dict(version=None, status='NO_SAVED_VERSION', logs=[], logs_error=None)]))
+    emit(json.dumps([dict(version=None, status='NO_SAVED_VERSION', logs=[], logs_error=None)]))
 else:
     def inspect(version):
         with api.build_kaggle_client() as client:
@@ -2274,8 +2226,8 @@ else:
     with ThreadPoolExecutor(max_workers=min(4, max(1, latest))) as pool:
         runs = list(pool.map(inspect, range(latest, 0, -1)))
     active = {'RUNNING', 'QUEUED', 'PREPARING', 'PENDING', 'STARTING', 'CANCEL_REQUESTED'}
-    print(json.dumps([run for run in runs if run['status'] in active] or runs[:1]))
-'''
+    emit(json.dumps([run for run in runs if run['status'] in active] or runs[:1]))
+''')
     try:
         return json.loads(await _query_process([sys.executable, "-c", code, ref], timeout=60, owner=_account_owner(ref)))
     except asyncio.TimeoutError as error:
@@ -2683,7 +2635,7 @@ async def _run_snapshot(ref: str, version: int | None = None, logs: bool = False
                 status = record.get("status", "RUNNING")
                 return dict(version=version, status=status, hardware="NvidiaTeslaT4", logs=lines, logs_error=error, training_outcome="unknown")
     proc_timeout = max(35, log_timeout + 15)
-    code = '''
+    code = _quiet_kaggle_script('''
 import sys, json, threading, re, time
 from urllib.parse import urlparse
 from collections import deque
@@ -2765,24 +2717,15 @@ with api.build_kaggle_client() as client:
         result['logs'] = list(lines)
         if not result['logs'] and errors:
             result['logs_error'] = '; '.join(errors)
-    print(json.dumps(result), flush=True)
-'''
+    emit(json.dumps(result))
+''')
     try:
         payload = await _query_process([sys.executable, "-c", code, ref, str(version) if version else "", "1" if logs else "0", str(log_timeout)], timeout=proc_timeout, owner=_account_owner(ref))
         if not payload.strip():
             raise RuntimeError(f"Kaggle status returned empty response for {ref} v{version}; remote status was not observed")
         return json.loads(payload)
-    except (asyncio.TimeoutError, RuntimeError) as error:
-        if baseline is None:
-            if isinstance(error, asyncio.TimeoutError):
-                raise RuntimeError(f"Kaggle status request for {ref} timed out after {proc_timeout}s") from error
-            raise
-        baseline["logs_error"] = (
-            f"Log request timed out after {proc_timeout}s; showing status captured before log retrieval"
-            if isinstance(error, asyncio.TimeoutError)
-            else f"Log request failed; showing status captured before log retrieval: {error}"
-        )
-        return baseline
+    except asyncio.TimeoutError as error:
+        raise RuntimeError(f"Kaggle status request for {ref} timed out after {proc_timeout}s") from error
 
 
 
@@ -2832,7 +2775,7 @@ async def _download_run(
     pattern: str | None = None,
     timeout: int = 1800,
 ) -> int:
-    code = '''
+    code = _quiet_kaggle_script('''
 import sys, os, tempfile, fnmatch
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -2859,7 +2802,7 @@ with api.build_kaggle_client() as client:
     if pattern:
         files = [f for f in files if fnmatch.fnmatch(f.file_name, pattern)]
     if not files:
-        print(0)
+        emit(0)
         sys.exit(0)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=destination.parent) as temporary:
@@ -2886,8 +2829,8 @@ with api.build_kaggle_client() as client:
                 src_file = Path(root) / fn
                 dst_file = target_sub / fn
                 os.replace(src_file, dst_file)
-    print(len(files))
-'''
+    emit(len(files))
+''')
     proc_timeout = max(300, timeout)
     out = await _query_process(
         [sys.executable, "-c", code, ref, str(version), str(output_dir), pattern or ""],
@@ -2979,7 +2922,7 @@ async def cancel_run(notebook: str, version: int | None = None, label: str | Non
     if run.get("status") not in ACTIVE_RUN_STATUSES:
         return f"Version {target} of '{ref}' is not active (status: {run.get('status', 'unknown')}); no active run to cancel."
     _update_version_status(ref, target, run.get("status"))
-    code = '''
+    code = _quiet_kaggle_script('''
 import sys, json, re
 from urllib.parse import urlparse
 from kaggle.api.kaggle_api_extended import KaggleApi
@@ -3015,8 +2958,8 @@ with api.build_kaggle_client() as client:
             raise RuntimeError(cancelled.error_message)
         result['cancellation_sent'] = True
     result['dry_run'] = dry_run
-    print(json.dumps(result))
-'''
+    emit(json.dumps(result))
+''')
     return await _query_process([sys.executable, "-c", code, json.dumps([ref, target, dry_run])], timeout=60, owner=_account_owner(ref))
 
 
@@ -3032,10 +2975,11 @@ async def pull_notebook(notebook: str, fetch_latest_output: bool = False, versio
     if version is not None and version < 1:
         raise ValueError("version must be positive")
     owners = [_account_owner(notebook)] if '/' in notebook else list(_accounts())
-    rows = []
-    for owner in owners:
-        proc = _run_kaggle(["kernels", "list", "--mine", "--page-size", "100", "--sort-by", "dateRun", "--csv"], timeout=60, owner=owner)
-        rows.extend(_parse_kernel_csv(proc.stdout))
+    outputs = await asyncio.gather(*(
+        _query_kaggle(["kernels", "list", "--mine", "--page-size", "100", "--sort-by", "dateRun", "--csv"], timeout=60, owner=owner)
+        for owner in owners
+    ))
+    rows = [row for output in outputs for row in _parse_kernel_csv(output)]
     needle = notebook.strip().casefold()
 
     match: dict[str, str] | None = None
@@ -3062,7 +3006,7 @@ async def pull_notebook(notebook: str, fetch_latest_output: bool = False, versio
     (folder / "working").mkdir(parents=True, exist_ok=True)
     (folder / "runs").mkdir(parents=True, exist_ok=True)
 
-    code = '''
+    code = _quiet_kaggle_script('''
 import json, sys
 from kaggle.api.kaggle_api_extended import KaggleApi
 from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelRequest
@@ -3073,10 +3017,10 @@ with api.build_kaggle_client() as client:
     if sys.argv[2]:
         request.version_label = 'v' + sys.argv[2]
     response = client.kernels.kernels_api_client.get_kernel(request)
-    print(json.dumps(dict(version=response.metadata.current_version_number,
+    emit(json.dumps(dict(version=response.metadata.current_version_number,
                           source=response.blob.source, language=response.blob.language,
                           kernel_type=response.blob.kernel_type)))
-'''
+''')
     pulled = json.loads(await _query_process(
         [sys.executable, "-c", code, ref, str(version) if version is not None else ""], timeout=180, owner=_account_owner(ref)))
     source_version = pulled["version"]
@@ -3748,6 +3692,39 @@ def load_config(config_path: Path | None) -> None:
         sys.stderr.write(f"Warning: Failed to load config from {config_path}: {err}\n")
 
 
+def _serve_stdio() -> None:
+    """Serve MCP JSON-RPC on a dedicated duplicate of fd 1 so all stray stdout writes go to stderr."""
+    import anyio
+    import fastmcp.server.mixins.transport as fastmcp_transport
+    from mcp.server.stdio import stdio_server as mcp_stdio_server
+
+    sys.stdout.flush()
+    protocol_fd = os.dup(1)
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
+
+    protocol_raw = os.fdopen(protocol_fd, "wb", buffering=0)
+    protocol_text = io.TextIOWrapper(protocol_raw, encoding="utf-8", write_through=True)
+    protocol_stdout = anyio.wrap_file(protocol_text)
+
+    @contextlib.asynccontextmanager
+    async def isolated_stdio_server(stdin=None, stdout=None):
+        async with mcp_stdio_server(stdin=stdin, stdout=stdout or protocol_stdout) as streams:
+            yield streams
+
+    original_stdio_server = fastmcp_transport.stdio_server
+    fastmcp_transport.stdio_server = isolated_stdio_server
+    try:
+        app.run(transport="stdio", show_banner=False)
+    finally:
+        fastmcp_transport.stdio_server = original_stdio_server
+        try:
+            protocol_text.flush()
+        except Exception:
+            pass
+        protocol_text.close()
+
+
 def main() -> None:
     global WORKSPACE_ROOT
     args = parse_args()
@@ -3812,7 +3789,7 @@ def main() -> None:
         return
 
     # MCP server mode
-    app.run(transport="stdio", show_banner=False)
+    _serve_stdio()
 
 
 if __name__ == "__main__":

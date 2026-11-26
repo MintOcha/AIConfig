@@ -70,14 +70,17 @@ scripts/view-failure-logs.sh 120 10
 Synchronize model definitions from OpenCode and restart Docker Compose stacks.
 
 ```bash
-# Synchronize models and restart stacks:
+# Synchronize models and restart CLIProxyAPI stack (default leaves Dashboard untouched):
 python3 scripts/update-server.py
+
+# Also sync and update the Dashboard stack:
+python3 scripts/update-server.py --dash
 
 # Update config only without restarting Docker containers:
 python3 scripts/update-server.py --no-restart
 
 # Custom project or management dashboard directory:
-python3 scripts/update-server.py --project-dir ~/Projects/CLIProxyAPI --management-dir ~/Projects/Dashboard_CPA
+python3 scripts/update-server.py --project-dir ~/Projects/CLIProxyAPI --dashboard-dir ~/Projects/Dashboard_CPA
 ```
 
 ---

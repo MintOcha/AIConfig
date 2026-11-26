@@ -2,10 +2,13 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = ["fastmcp==3.4.5", "google-colab-cli==0.7.2"]
-# ///
 # [tool.uv]
 # override-dependencies = ["jupyter-kernel-client==0.9.0"]
+# ///
 """Manage Colab projects through Google's CLI. Login: colab --auth oauth2 sessions.
+
+For interactive work, create/reuse a named session, send short stdin cells with
+exec, and launch long jobs separately so their kernel stays responsive.
 
 A managed run is asynchronous. Runtimes are not kept alive beyond provider limits;
 training code must checkpoint periodically under /content for explicit retrieval.
@@ -20,38 +23,66 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from uuid import UUID, uuid4
 
 from fastmcp import FastMCP
 from colab_cli.auth import get_credentials
 from colab_cli.client import Client, Prod
 from colab_cli.state import SessionState, StateStore
 
-app = FastMCP("colab", instructions="Authenticate interactively with official `colab --auth oauth2 sessions`; use save, stage, push, status, logs, wait, pull, cancel. One managed run; TPU requested with --tpu v5e1/v6e1, verified by XLA forward/backward. Colab quota and runtime termination are provider-controlled. Run code must checkpoint under /content; retrieve it before releasing the VM.")
+app = FastMCP("colab", instructions=(
+    "Authenticate with official `colab --auth oauth2 sessions`. For interactive work, "
+    "use session_list, session_new, session_status, session_exec, and session_stop with explicit names. "
+    "Use session_launch for long commands and session_job_status/session_job_logs to inspect them "
+    "without tying up the kernel. For managed batch runs use save, stage, push, status, logs, wait, "
+    "pull, release, and cancel. One managed run; TPU is verified by XLA forward/backward. "
+    "Colab quota and termination are provider-controlled. Checkpoint under /content and retrieve "
+    "checkpoints before stopping the VM."
+))
 WORKSPACE = Path(os.environ.get("COLAB_MCP_WORKSPACE", Path.cwd())).resolve()
 ROOT = Path(os.environ.get("COLAB_MCP_ROOT", WORKSPACE / "colab")).resolve()
 STATE = Path.home() / ".config" / "colab-mcp"
 SESSION = os.environ.get("COLAB_MCP_SESSION", "managed-train")
-CLI = ["uvx", "--from", "google-colab-cli==0.7.2", "--overrides", str(Path(__file__).with_name("colab-kernel-overrides.txt")), "colab", "--auth", "oauth2"]
+CLI = [str(Path(sys.executable).with_name("colab")), "--auth", "oauth2"]
 CHUNK = 8 * 1024 * 1024
 REMOTE_ROOT = "/content/colab-managed"
+LIVE_ROOT = "/content/colab-live"
+ACCELERATORS = ("CPU", "T4", "L4", "G4", "A100", "H100", "V5E1", "V6E1")
 
-def _session() -> dict:
+
+def _norm_accel(value: str) -> str:
+    upper = value.upper()
+    return "CPU" if upper == "NONE" else upper
+
+
+def _session_arg(session: str) -> str:
+    if not session.strip() or any(char in session for char in ("/", "\\", "\0")):
+        raise ValueError("Provide an explicit Colab session name without path separators")
+    return f"--session={session}"
+
+
+def _session(session: str | None = None) -> dict:
     """Refresh a live assignment's short-lived proxy token before kernel calls."""
     store = StateStore()
-    saved = store.get(SESSION)
+    name = SESSION if session is None else session
+    saved = store.get(name)
+    if session is not None and saved is None:
+        raise RuntimeError(f"Unknown Colab session {session!r}; list sessions or create it first")
     client = Client(Prod(), get_credentials())
     assignments = client.list_assignments()
     if saved:
         matches = [assignment for assignment in assignments if assignment.endpoint == saved.endpoint]
     else:
         matches = [assignment for assignment in assignments if assignment.accelerator.value != "NONE"]
+        if len(assignments) == 1 and not matches:
+            matches = assignments
         if len(assignments) != 1 or len(matches) != 1:
             raise RuntimeError("Cannot adopt ambiguous or missing Colab assignment; inspect `colab sessions`")
     if len(matches) != 1:
-        raise RuntimeError("Named Colab assignment is not active on provider")
+        raise RuntimeError(f"Colab session {name!r} is not active on the provider")
     assignment = matches[0]
     if saved is None:
-        saved = SessionState(name=SESSION, token=assignment.runtime_proxy_info.token,
+        saved = SessionState(name=name, token=assignment.runtime_proxy_info.token,
                              url=assignment.runtime_proxy_info.url, endpoint=assignment.endpoint,
                              variant=assignment.variant.name, accelerator=assignment.accelerator.value,
                              machine_shape=assignment.machine_shape.name)
@@ -59,7 +90,7 @@ def _session() -> dict:
         saved.token = assignment.runtime_proxy_info.token
         saved.url = assignment.runtime_proxy_info.url
     store.add(saved)
-    return {"endpoint": assignment.endpoint, "accelerator": assignment.accelerator.value,
+    return {"endpoint": assignment.endpoint, "accelerator": _norm_accel(assignment.accelerator.value),
             "variant": assignment.variant.name}
 
 
@@ -100,7 +131,7 @@ def _source(folder: Path) -> tuple[Path, dict]:
     source = next((folder / name for name in ("train.py", "notebook.ipynb") if (folder / name).is_file()), None)
     if not source or not source.stat().st_size:
         raise ValueError("Expected nonempty train.py or notebook.ipynb")
-    if meta.get("accelerator") not in ("CPU", "T4", "L4", "G4", "A100", "H100", "V5E1", "V6E1"):
+    if meta.get("accelerator") not in ACCELERATORS:
         raise ValueError("Invalid accelerator")
     seconds = meta.get("max_seconds", 36000)
     if type(seconds) is not int or not 1 <= seconds <= 43200:
@@ -127,9 +158,10 @@ def _hash(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def _cli(args: list[str], *, timeout: int = 120, input: str | None = None) -> str:
+def _cli(args: list[str], *, timeout: int = 120, input: str | None = None,
+         session: str | None = None) -> str:
     if args[0] in ("exec", "upload", "download"):
-        _session()
+        _session(session)
     result = subprocess.run(CLI + args, input=input, text=True, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, timeout=timeout)
     if result.returncode:
@@ -137,17 +169,195 @@ def _cli(args: list[str], *, timeout: int = 120, input: str | None = None) -> st
     return result.stdout
 
 
-def _exec(code: str, timeout: int = 60) -> str:
-    return _cli(["exec", "-s", SESSION, "--timeout", str(timeout)], input=code,
-                timeout=timeout + 30)
+def _exec(code: str, timeout: int = 30, retries: int = 1, *, session: str | None = None) -> str:
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            target = f"--session={SESSION}" if session is None else _session_arg(session)
+            return _cli(["exec", target, "--timeout", str(timeout)], input=code,
+                        timeout=timeout + 15, session=session)
+        except (subprocess.TimeoutExpired, RuntimeError) as exc:
+            last_exc = exc
+            is_timeout = isinstance(exc, subprocess.TimeoutExpired) or "timed out" in str(exc).lower()
+            if attempt >= retries or not is_timeout:
+                raise
+    raise last_exc  # pragma: no cover
 
 
-def _remote_json(code: str) -> dict:
-    output = _exec(code)
+def _remote_json(code: str, timeout: int = 30, retries: int = 1, *, session: str | None = None) -> dict:
+    output = _exec(code, timeout=timeout, retries=retries, session=session)
     for line in reversed(output.splitlines()):
         if line.startswith("COLAB_JSON:"):
             return json.loads(line.removeprefix("COLAB_JSON:"))
     raise RuntimeError("Remote command did not return expected JSON: " + output[-500:])
+
+
+_JOB_RUNNER = """\
+import json, os, subprocess, sys, time
+
+status_path, cwd, *command = sys.argv[1:]
+def write_state(state):
+    temp = status_path + '.tmp'
+    with open(temp, 'w') as stream:
+        json.dump(state, stream)
+    os.replace(temp, status_path)
+
+write_state({'state': 'running', 'pid': os.getpid(), 'started': time.time()})
+try:
+    result = subprocess.run(command, cwd=cwd)
+except (OSError, ValueError) as exc:
+    print(f'{type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
+    final = {'state': 'error', 'error': str(exc)}
+else:
+    final = {'state': 'complete' if result.returncode == 0 else 'error',
+             'exit_code': result.returncode}
+write_state(final | {'finished': time.time()})
+"""
+
+
+def _cell(code: str, **inputs) -> str:
+    """Run an internal cell without overwriting the caller's kernel variables."""
+    return f"exec({code!r}, {inputs!r})"
+
+
+def _launch(root: str, command: list[str], *, cwd: str, log_name: str,
+            kernel_python: bool = False, session: str | None = None) -> dict:
+    code = _cell("""\
+import json, os, subprocess, sys, time
+from pathlib import Path
+
+root = Path(root)
+root.mkdir(parents=True, exist_ok=True)
+status_path = root / 'result.json'
+log_path = root / log_name
+args = [sys.executable, *command] if kernel_python else command
+env = dict(os.environ, PYTHONUNBUFFERED='1')
+with log_path.open('wb') as out:
+    proc = subprocess.Popen([sys.executable, '-c', runner, str(status_path), cwd, *args],
+                            stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                            start_new_session=True, env=env)
+deadline = time.monotonic() + 5.0
+while not status_path.is_file():
+    if proc.poll() is not None or time.monotonic() >= deadline:
+        raise RuntimeError(f'Job did not report startup (pid {proc.pid}); inspect {log_path}')
+    time.sleep(0.05)
+status = json.loads(status_path.read_text())
+status.update(pid=proc.pid, status_path=str(status_path), log_path=str(log_path))
+print('COLAB_JSON:' + json.dumps(status), flush=True)
+""", root=root, command=command, cwd=cwd, log_name=log_name, runner=_JOB_RUNNER,
+        kernel_python=kernel_python)
+    return _remote_json(code, retries=0, session=session)
+
+
+def _job_dir(job_id: str) -> str:
+    if UUID(job_id).hex != job_id:
+        raise ValueError("Expected the job_id returned by launch")
+    return f"{LIVE_ROOT}/{job_id}"
+
+
+def _new_args(session: str, accelerator: str, high_mem: bool = False) -> list[str]:
+    args = ["new", _session_arg(session)]
+    if accelerator.startswith("V"):
+        args += ["--tpu", accelerator.lower()]
+    elif accelerator != "CPU":
+        args += ["--gpu", accelerator]
+    if high_mem:
+        args.append("--high-mem")
+    return args
+
+
+@app.tool()
+def session_list() -> str:
+    """List active Colab runtimes and their official CLI session names."""
+    return _cli(["sessions"])
+
+
+@app.tool()
+def session_new(session: str, accelerator: str = "CPU", high_mem: bool = False) -> str:
+    """Create an explicitly named CPU, GPU, or TPU runtime for interactive work."""
+    accelerator = accelerator.upper()
+    if accelerator not in ACCELERATORS:
+        raise ValueError(f"Accelerator must be one of {', '.join(ACCELERATORS)}")
+    if StateStore().get(session) is not None:
+        raise ValueError(f"Colab session {session!r} is already named locally; list sessions before creating it")
+    return _cli(_new_args(session, accelerator, high_mem), timeout=240)
+
+
+@app.tool()
+def session_status(session: str) -> str:
+    """Show provider hardware and CLI kernel activity for a named session."""
+    return _cli(["status", _session_arg(session)])
+
+
+@app.tool()
+def session_stop(session: str) -> str:
+    """Stop the named session, losing its processes and uncollected files."""
+    return _cli(["stop", _session_arg(session)])
+
+
+@app.tool()
+def session_exec(session: str, code: str, timeout: int = 30) -> str:
+    """Run a short Python cell in the named session's existing kernel; use launch for long commands."""
+    if not code.strip() or timeout < 1:
+        raise ValueError("Provide nonempty Python code and a positive timeout in seconds")
+    return _exec(code, timeout=timeout, retries=0, session=session)
+
+
+@app.tool()
+def session_launch(session: str, command: list[str], cwd: str = "/content") -> dict:
+    """Detach an argv command on the VM and return its job ID, supervisor PID, and paths."""
+    if not command or not command[0]:
+        raise ValueError("Provide a program and any arguments as an argv list")
+    job_id = uuid4().hex
+    try:
+        result = _launch(_job_dir(job_id), command, cwd=cwd, log_name="output.log", session=session)
+    except (RuntimeError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"Could not confirm launch of Colab job {job_id}: {exc}") from exc
+    return result | {"session": session, "job_id": job_id}
+
+
+def _job_status(root: str, *, session: str | None = None) -> dict:
+    code = _cell("""\
+import json
+from pathlib import Path
+
+path = Path(root) / 'result.json'
+state = json.loads(path.read_text())
+if state['state'] == 'running':
+    try:
+        stat = Path(f"/proc/{state['pid']}/stat").read_text()
+        alive = stat.rsplit(')', 1)[1].split()[0] != 'Z'
+    except FileNotFoundError:
+        alive = False
+    if not alive:
+        state = json.loads(path.read_text())
+        if state['state'] == 'running':
+            state.update(state='error', error='Remote job exited without recording a result')
+print('COLAB_JSON:' + json.dumps(state), flush=True)
+""", root=root)
+    return _remote_json(code, retries=int(session is None), session=session)
+
+
+@app.tool()
+def session_job_status(session: str, job_id: str) -> dict:
+    """Read the detached job state or exit code on its named session."""
+    return _job_status(_job_dir(job_id), session=session) | {"session": session, "job_id": job_id}
+
+
+@app.tool()
+def session_job_logs(session: str, job_id: str, lines: int = 40) -> str:
+    """Read recent stdout/stderr from a detached job (at most 500 lines and 64 KiB)."""
+    code = _cell("""\
+import json
+from pathlib import Path
+
+with (Path(root) / 'output.log').open('rb') as stream:
+    stream.seek(0, 2)
+    stream.seek(max(0, stream.tell() - 65536))
+    tail = stream.read(65536).decode(errors='replace')
+print('COLAB_JSON:' + json.dumps({'output': ''.join(tail.splitlines(keepends=True)[-lines:])}), flush=True)
+""", root=_job_dir(job_id), lines=min(max(lines, 1), 500))
+    return _remote_json(code, retries=0, session=session)["output"]
 
 
 def _remote_file(path: str) -> dict:
@@ -162,10 +372,26 @@ def _transfer(local: Path, remote: str) -> dict:
         raise ValueError("Only regular files can be transferred")
     digest = _hash(local)
     size = local.stat().st_size
-    existing = _remote_file(remote)
+    parent = str(Path(remote).parent)
+    existing = _remote_json(
+        "import os,json,hashlib; p=" + repr(remote) + "; os.makedirs(" + repr(parent) + ",exist_ok=True); "
+        "print('COLAB_JSON:'+json.dumps({'exists':os.path.isfile(p),'size':os.path.getsize(p) if os.path.isfile(p) else None,"
+        "'sha256':hashlib.file_digest(open(p,'rb'),'sha256').hexdigest() if os.path.isfile(p) else None}),flush=True)"
+    )
     if existing["size"] == size and existing["sha256"] == digest:
         return {"path": remote, "size": size, "sha256": digest, "resumed": True}
-    _exec("import os; os.makedirs(" + repr(str(Path(remote).parent)) + ",exist_ok=True)")
+    if size <= CHUNK:
+        staging = f"{remote}.uploading"
+        _cli(["upload", "-s", SESSION, str(local), staging], timeout=180)
+        code = (
+            "import os,hashlib,json; src=" + repr(staging) + "; dst=" + repr(remote) + "; "
+            "ok=os.path.isfile(src) and hashlib.file_digest(open(src,'rb'),'sha256').hexdigest()==" + repr(digest) + "; "
+            "os.replace(src,dst) if ok else None; "
+            "print('COLAB_JSON:'+json.dumps({'verified':ok}),flush=True)"
+        )
+        if not _remote_json(code)["verified"]:
+            raise RuntimeError("Remote file failed SHA256 verification")
+        return {"path": remote, "size": size, "sha256": digest, "resumed": False}
     parts = []
     with local.open("rb") as stream:
         number = 0
@@ -243,46 +469,65 @@ def _probe(accelerator: str) -> str:
 def _worker(project: str, run: Path, reuse: bool) -> None:
     folder = _project(project)
     source, meta = _source(folder)
-    accelerator = meta["accelerator"]
+    accelerator = _norm_accel(meta["accelerator"])
+    step = "init"
     with (run / "worker.log").open("a", buffering=1) as log:
+        def mark(name: str, detail: str = "") -> None:
+            nonlocal step
+            step = name
+            log.write(f"[{time.strftime('%H:%M:%S')}] step={name}" + (f" {detail}" if detail else "") + "\n")
+
         try:
-            if not reuse:
-                args = ["new", "-s", SESSION]
-                if accelerator.startswith("V"):
-                    args += ["--tpu", accelerator.lower()]
-                elif accelerator != "CPU":
-                    args += ["--gpu", accelerator]
-                log.write(_cli(args, timeout=240))
-            session = _session()
+            session = None
+            if reuse:
+                mark("adopt_session")
+                try:
+                    session = _session()
+                except RuntimeError:
+                    if Client(Prod(), get_credentials()).list_assignments():
+                        raise
+            if session is None:
+                mark("provision", f"accelerator={accelerator}")
+                args = _new_args(SESSION, accelerator)
+                try:
+                    log.write(_cli(args, timeout=240))
+                except RuntimeError as exc:
+                    if "ReadTimeout" not in str(exc) and "timed out" not in str(exc).lower():
+                        raise
+                    mark("provision_adopt", "colab new timed out; checking provider for live assignment")
+                    deadline = time.monotonic() + 30.0
+                    while time.monotonic() < deadline:
+                        if Client(Prod(), get_credentials()).list_assignments():
+                            break
+                        time.sleep(3)
+                    else:
+                        raise
+                session = _session()
             if session["accelerator"] != accelerator:
-                raise RuntimeError("Live Colab accelerator does not match project metadata")
+                raise RuntimeError(f"Live Colab accelerator ({session['accelerator']}) does not match project metadata ({accelerator})")
+            mark("probe", f"endpoint={session['endpoint']} accelerator={accelerator}")
             probe = _probe(accelerator)
             log.write(probe + "\n")
             _save(run / "status.json", {"state": "staging", "accelerator": accelerator, "probe": probe, "started": time.time()})
             for item in meta.get("inputs", []):
+                mark("stage", item)
                 result = stage(project, item)
                 log.write(f"Staged {item}: {result['files']} files, {result['bytes']} bytes\n")
-            remote_source = f"{REMOTE_ROOT}/{project}/{source.name}"
+            remote = f"{REMOTE_ROOT}/{project}/{run.name}"
+            remote_source = f"{remote}/{source.name}"
+            mark("upload_source", remote_source)
             _transfer(source, remote_source)
-            remote = f"{REMOTE_ROOT}/{project}"
-            # Launch a detached subprocess; the short kernel call returns before training.
-            launcher = """import os,sys,json,subprocess,time
-root=ROOT; src=SOURCE
-os.makedirs(root,exist_ok=True)
-log=open(root+'/train.log','ab',buffering=0)
-state=root+'/result.json'
-script='import json,os,subprocess,sys,time\\nroot='+repr(root)+'\\np=subprocess.run([sys.executable,'+repr(src)+'],cwd="/content",stdout=open(root+"/train.log","ab",buffering=0),stderr=subprocess.STDOUT)\\njson.dump({"state":"complete" if p.returncode==0 else "error","exit_code":p.returncode,"finished":time.time()},open(root+"/result.json","w"))'
-proc=subprocess.Popen([sys.executable,'-c',script],stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=True)
-if not os.path.exists(state): json.dump({'state':'running','pid':proc.pid,'started':time.time()},open(state,'w'))
-print('COLAB_JSON:'+json.dumps({'pid':proc.pid,'state':'running'}),flush=True)
-""".replace("ROOT", repr(remote)).replace("SOURCE", repr(remote_source))
-            result = _remote_json(launcher)
+            mark("launch", remote)
+            # Launch a detached subprocess; the wrapper owns result.json transitions atomically.
+            result = _launch(remote, [remote_source], cwd="/content", log_name="train.log",
+                             kernel_python=True)
+            mark("running", f"pid={result['pid']}")
             _save(run / "status.json", {"state": "running", "accelerator": accelerator,
                                          "remote": remote, "pid": result["pid"], "started": time.time()})
         except Exception as exc:
-            message = f"{type(exc).__name__}: {str(exc)[-500:]}"
+            message = f"[{step}] {type(exc).__name__}: {str(exc)[-600:]}"
             log.write(message + "\n")
-            _save(run / "status.json", {"state": "error", "error": message, "finished": time.time()})
+            _save(run / "status.json", {"state": "error", "step": step, "error": message, "finished": time.time()})
 
 
 @app.tool()
@@ -312,10 +557,8 @@ def status(project: str) -> dict:
         return {"state": "not_started"}
     state = _load(run / "status.json")
     if state["state"] == "running":
-        remote = state["remote"]
-        code = "import os,json; p=" + repr(remote) + "; s=json.load(open(p+'/result.json')); pid=s.get('pid'); alive=pid and os.path.exists('/proc/'+str(pid)) and open('/proc/'+str(pid)+'/stat').read().split()[2]!='Z'; print('COLAB_JSON:'+json.dumps(s if s['state']!='running' or alive else {'state':'error','error':'Remote training process exited without result'}),flush=True)"
         try:
-            current = _remote_json(code)
+            current = _job_status(state["remote"])
             if current["state"] != "running":
                 state = {**state, **current}
                 _save(run / "status.json", state)
@@ -407,35 +650,90 @@ def cancel(project: str) -> dict:
     active = _active()
     if active["project"] != project:
         raise ValueError("Active run belongs to another project")
-    _cli(["stop", "-s", SESSION], timeout=120)
-    (STATE / "active.json").unlink()
+    stopped_remote = True
+    try:
+        _cli(["stop", "-s", SESSION], timeout=120)
+    except RuntimeError:
+        stopped_remote = False
+    (STATE / "active.json").unlink(missing_ok=True)
     run = Path(active["run"])
     previous = _load(run / "status.json")
     if previous["state"] not in ("complete", "error"):
         _save(run / "status.json", {**previous, "state": "cancelled", "finished": time.time()})
-    return {"released": True, "run": str(run)}
-
-
+    return {"released": True, "stopped_remote": stopped_remote, "run": str(run)}
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", nargs="?", default="serve", choices=("serve", "worker", "save", "stage", "push", "status", "logs", "wait", "pull", "release", "cancel"))
-    parser.add_argument("values", nargs="*")
-    args = parser.parse_args()
-    if args.command == "serve":
-        app.run()
-    elif args.command == "worker":
-        _worker(args.values[0], Path(args.values[1]), bool(int(args.values[2])))
-    elif args.command == "push":
-        output = push(args.values[0], reuse=args.values[1].lower() not in ("false", "0") if len(args.values) > 1 else True)
+    commands = parser.add_subparsers(metavar="COMMAND")
+    parser.set_defaults(handler=app.run)
+
+    def command(name, handler, description):
+        sub = commands.add_parser(name, help=description, description=description)
+        sub.set_defaults(handler=handler)
+        return sub
+
+    command("serve", app.run, "Start the MCP server (default)")
+    worker = command("worker", _worker, "Run the managed batch worker")
+    worker.add_argument("project")
+    worker.add_argument("run", type=Path)
+    worker.add_argument("reuse", type=lambda value: bool(int(value)))
+    for handler in (save, stage, push, status, logs, wait, pull, release, cancel):
+        sub = command(handler.__name__, handler, handler.__doc__)
+        sub.add_argument("project")
+        if handler is stage:
+            sub.add_argument("input_path")
+        elif handler is push:
+            sub.add_argument("reuse", nargs="?", default=True,
+                             type=lambda value: value.lower() not in ("false", "0"))
+        elif handler is logs:
+            sub.add_argument("lines", nargs="?", type=int, default=40)
+        elif handler is wait:
+            sub.add_argument("timeout", nargs="?", type=int, default=300)
+        elif handler is pull:
+            sub.add_argument("remote_path")
+            sub.add_argument("local_name")
+
+    command("sessions", session_list, "List active Colab sessions")
+    for name, handler in (
+        ("new", session_new), ("session-status", session_status), ("stop", session_stop),
+        ("exec", session_exec), ("launch", session_launch), ("job-status", session_job_status),
+        ("job-logs", session_job_logs),
+    ):
+        description = ("Read a short Python cell from stdin and run it in a named kernel"
+                       if handler is session_exec else handler.__doc__)
+        sub = command(name, handler, description)
+        sub.add_argument("-s", "--session", required=True, metavar="NAME")
+        if handler is session_new:
+            sub.add_argument("--accelerator", type=str.upper, choices=ACCELERATORS, default="CPU")
+            sub.add_argument("--high-mem", action="store_true")
+        elif handler is session_exec:
+            sub.add_argument("--timeout", type=int, default=30,
+                             help="Client wait in seconds; timing out does not stop the cell")
+        elif handler is session_launch:
+            sub.add_argument("--cwd", default="/content", help="Working directory on the Colab VM")
+            sub.add_argument("command", nargs=argparse.REMAINDER, metavar="PROGRAM [ARG ...]")
+        elif handler in (session_job_status, session_job_logs):
+            sub.add_argument("job_id")
+            if handler is session_job_logs:
+                sub.add_argument("--lines", type=int, default=40)
+
+    values = vars(parser.parse_args())
+    handler = values.pop("handler")
+    if handler is session_exec:
+        if sys.stdin.isatty():
+            parser.error("exec reads a Python cell from stdin; pipe or redirect it")
+        values["code"] = sys.stdin.read()
+    elif handler is session_launch:
+        if values["command"][:1] == ["--"]:
+            values["command"] = values["command"][1:]
+        if not values["command"]:
+            parser.error("launch requires a PROGRAM [ARG ...]")
+    output = handler(**values)
+    if isinstance(output, str):
+        print(output, end="" if output.endswith("\n") else "\n")
+    elif output is not None:
         print(json.dumps(output))
-    elif args.command in ("logs", "wait"):
-        output = globals()[args.command](args.values[0], int(args.values[1]) if len(args.values) > 1 else (40 if args.command == "logs" else 300))
-        print(json.dumps(output) if not isinstance(output, str) else output)
-    else:
-        output = globals()[args.command](*args.values)
-        print(json.dumps(output) if not isinstance(output, str) else output)
 
 
 if __name__ == "__main__":

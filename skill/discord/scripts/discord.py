@@ -8,60 +8,99 @@ import argparse
 import json
 import mimetypes
 import os
+import subprocess
 import sys
-import tomllib
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-
-def get_config():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    parent_dir = os.path.dirname(script_dir)
-    config_paths = [
-        os.path.join(parent_dir, "config.toml"),
-        os.path.join(script_dir, "config.toml"),
-        os.path.expanduser("~/.config/discord/config.toml"),
-    ]
-    for p in config_paths:
-        if os.path.exists(p):
-            with open(p, "rb") as f:
-                data = tomllib.load(f)
-                return data.get("discord", data)
-    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
-    if webhook_url:
-        return {"webhook_url": webhook_url}
-    raise FileNotFoundError(
-        f"config.toml not found in: {config_paths} and DISCORD_WEBHOOK_URL not set"
-    )
+DISCORD_MESSAGE_LIMIT = 2000
 
 
-def send_webhook(message=None, file_path=None, username=None, wait=False):
-    if not message and not file_path:
-        raise ValueError("Provide a message or --file to send.")
+def get_webhook_url():
+    entry = "aiconfig/discord/webhook-url"
+    try:
+        result = subprocess.run(["pass", "show", entry], check=True, capture_output=True, text=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        raise ValueError(f"Could not read pass entry {entry}.") from None
+    return result.stdout.partition("\n")[0].strip()
 
-    config = get_config()
-    webhook_url = config.get("webhook_url") or config.get("url")
-    if not webhook_url or "YOUR_WEBHOOK" in webhook_url:
-        raise ValueError("webhook_url missing in discord configuration.")
 
-    if wait:
-        parsed = urllib.parse.urlsplit(webhook_url)
-        q = urllib.parse.parse_qs(parsed.query)
-        q["wait"] = ["true"]
-        webhook_url = urllib.parse.urlunsplit(
-            parsed._replace(query=urllib.parse.urlencode(q, doseq=True))
-        )
+def _next_code_fence(text, open_fence):
+    fence = open_fence
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("```"):
+            fence = stripped[3:].strip() if fence is None else None
+    return fence
 
+
+def split_message(message, limit=DISCORD_MESSAGE_LIMIT):
+    if len(message) <= limit:
+        return [message]
+
+    chunks = []
+    remaining = message
+    open_fence = None
+
+    while remaining:
+        prefix = f"```{open_fence}\n" if open_fence is not None else ""
+        if len(prefix) >= limit - 8:
+            prefix = ""
+            open_fence = None
+
+        available = limit - len(prefix)
+        if len(remaining) <= available:
+            tail = (prefix + remaining).rstrip()
+            if tail:
+                chunks.append(tail)
+            break
+
+        needs_fence_reserve = open_fence is not None or "```" in remaining[:available]
+        max_body = available - 4 if needs_fence_reserve else available
+
+        cut = -1
+        delim_len = 0
+        min_preferred = max_body // 2
+        for start in (min_preferred, 1):
+            for delim in ("\n\n", "\n", " "):
+                pos = remaining.rfind(delim, start, max_body + len(delim))
+                if pos > 0:
+                    cut = pos
+                    delim_len = len(delim)
+                    break
+            if cut > 0:
+                break
+        if cut <= 0:
+            cut = max_body
+
+        piece = remaining[:cut]
+        rest = remaining[cut + delim_len :]
+
+        next_fence = _next_code_fence(piece, open_fence)
+        if next_fence is not None:
+            chunk = prefix + piece.rstrip("\n") + "\n```"
+        else:
+            chunk = (prefix + piece).rstrip()
+
+        if chunk:
+            chunks.append(chunk)
+
+        open_fence = next_fence
+        remaining = rest if open_fence is not None else rest.lstrip("\n")
+
+    return chunks
+
+
+def _post_webhook(webhook_url, message=None, file_path=None, username=None):
     payload = {}
     if message:
         payload["content"] = message
-    if username or config.get("username"):
-        payload["username"] = username or config.get("username")
+    if username:
+        payload["username"] = username
 
     if file_path:
-        if not os.path.isfile(file_path):
-            raise FileNotFoundError(f"File not found: {file_path}")
         filename = os.path.basename(file_path)
         mime_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
         with open(file_path, "rb") as f:
@@ -99,14 +138,54 @@ def send_webhook(message=None, file_path=None, username=None, wait=False):
         }
         data = json.dumps(payload).encode("utf-8")
 
-    req = urllib.request.Request(webhook_url, data=data, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw) if raw else {"status": resp.status}
-    except urllib.error.HTTPError as e:
-        err_msg = e.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"HTTP Error {e.code}: {err_msg}")
+    for attempt in range(2):
+        req = urllib.request.Request(webhook_url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8")
+                result = json.loads(raw) if raw else {"status": resp.status}
+                if resp.headers.get("X-RateLimit-Remaining") == "0":
+                    reset_after = float(resp.headers.get("X-RateLimit-Reset-After", "0") or 0)
+                    if reset_after > 0:
+                        time.sleep(reset_after)
+                return result
+        except urllib.error.HTTPError as e:
+            err_msg = e.read().decode("utf-8", errors="ignore")
+            if e.code == 429 and attempt == 0:
+                try:
+                    retry_after = float(json.loads(err_msg).get("retry_after", 1))
+                except (ValueError, TypeError):
+                    retry_after = 1.0
+                time.sleep(retry_after)
+                continue
+            raise RuntimeError(f"HTTP Error {e.code}: {err_msg}")
+
+
+def send_webhook(message=None, file_path=None, username=None, wait=False):
+    if not message and not file_path:
+        raise ValueError("Provide a message or --file to send.")
+    if file_path and not os.path.isfile(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    webhook_url = get_webhook_url()
+    if not webhook_url or "YOUR_WEBHOOK" in webhook_url:
+        raise ValueError("webhook_url missing in discord configuration.")
+
+    if wait:
+        parsed = urllib.parse.urlsplit(webhook_url)
+        q = urllib.parse.parse_qs(parsed.query)
+        q["wait"] = ["true"]
+        webhook_url = urllib.parse.urlunsplit(
+            parsed._replace(query=urllib.parse.urlencode(q, doseq=True))
+        )
+
+    chunks = split_message(message) if message else [None]
+    results = []
+    for idx, chunk in enumerate(chunks):
+        chunk_file = file_path if idx == len(chunks) - 1 else None
+        results.append(_post_webhook(webhook_url, chunk, chunk_file, username))
+
+    return results[0] if len(results) == 1 else results
 
 
 def main():
@@ -125,6 +204,8 @@ def main():
         res = send_webhook(msg or None, args.file, args.username, wait=args.json)
         if args.json:
             print(json.dumps(res, indent=2))
+        elif isinstance(res, list):
+            print(f"Sent {len(res)} messages to Discord webhook.")
         else:
             print("Sent to Discord webhook.")
     except Exception as e:
